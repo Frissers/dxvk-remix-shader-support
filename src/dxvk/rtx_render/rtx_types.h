@@ -46,6 +46,9 @@ class GraphInstance;
 struct D3D9FixedFunctionVS;
 struct D3D9FixedFunctionPS;
 struct ReplacementInstance;
+class D3D9VertexShader;
+class D3D9PixelShader;
+class D3D9VertexDecl;
 
 using RasterBuffer = GeometryBuffer<Raster>;
 using RaytraceBuffer = GeometryBuffer<Raytrace>;
@@ -638,6 +641,10 @@ struct DrawCallState {
   bool zWriteEnable = false;
   bool zEnable = false;
 
+  // Captured viewport/scissor state from the original draw call for shader re-execution
+  VkViewport originalViewport = {};
+  VkRect2D originalScissor = {};
+
   uint32_t drawCallID = 0;
 
   bool isDrawingToRaytracedRenderTarget = false;
@@ -719,6 +726,7 @@ private:
   friend class TerrainBaker;
   friend struct RemixAPIPrivateAccessor;
   friend class RtxParticleSystemManager;
+  friend class ShaderOutputCapturer;
 
   bool finalizeGeometryHashes();
   void finalizeGeometryBoundingBox();
@@ -743,6 +751,65 @@ private:
   FogState fogState;
 
   CategoryFlags categories = 0;
+
+  Rc<DxvkBuffer> originalVertexBuffer;
+  Rc<DxvkBuffer> originalIndexBuffer;
+  int32_t originalBaseVertex = 0;
+  uint32_t originalFirstIndex = 0;
+  uint32_t originalIndexMin = 0;
+  uint32_t originalIndexCount = 0;
+  uint32_t originalVertexStride = 0;
+  uint32_t originalVertexOffset = 0;
+  uint32_t originalIndexOffset = 0;
+  VkIndexType originalIndexType = VK_INDEX_TYPE_UINT16;
+  bool forceGeometryCopy = false;
+  bool forceShaderCapture = false;
+  std::vector<uint8_t> originalVertexData;
+  std::vector<uint8_t> originalIndexData;
+
+  struct CapturedVertexStream {
+    uint32_t streamIndex = 0;
+    uint32_t stride = 0;
+    std::vector<uint8_t> data;
+  };
+
+  struct CapturedVertexElement {
+    uint16_t stream = 0;
+    uint16_t offset = 0;
+    uint8_t type = 0;
+    uint8_t method = 0;
+    uint8_t usage = 0;
+    uint8_t usageIndex = 0;
+  };
+
+  std::vector<CapturedVertexStream> capturedVertexStreams;
+  std::vector<CapturedVertexElement> capturedVertexElements;
+
+  // Shader output capture: which texture slot to replace (-1 = none)
+  int renderTargetReplacementSlot = -1;
+
+  // Shader output capture: original render target texture hash (before replacement)
+  XXH64_hash_t originalRenderTargetHash = 0;
+
+  // Shader output capture: D3D9 shader objects for re-execution (raw pointers - no refcounting to avoid complete type requirement)
+  D3D9VertexShader* vertexShader = nullptr;
+  D3D9PixelShader* pixelShader = nullptr;
+  D3D9VertexDecl* vertexDecl = nullptr;
+
+  // Shader output capture: D3D9 shader constant data
+  std::vector<Vector4> vertexShaderConstantData;
+  std::vector<Vector4> pixelShaderConstantData;
+
+  // Shader output capture: D3D9 texture bindings captured from original draw call
+  // These are the ACTUAL textures the game was using, before RT replacement
+  struct CapturedD3D9Texture {
+    TextureRef texture;
+    uint32_t slot = 0;
+  };
+  std::vector<CapturedD3D9Texture> capturedD3D9Textures;
+
+  // Shader output capture: captured framebuffer output
+  Rc<DxvkImageView> capturedFramebufferOutput = nullptr;
 };
 
  // A BLAS and its data buffer that can be pooled and used for various geometries

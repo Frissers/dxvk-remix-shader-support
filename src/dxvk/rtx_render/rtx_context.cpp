@@ -384,6 +384,9 @@ namespace dxvk {
     getResourceManager().onFrameBegin(this, getCommonObjects()->getTextureManager(), getSceneManager(), downscaledExtent,
                                       upscaledExtent, m_resetHistory, mainCamera.isCameraCut());
 
+    // Call ShaderOutputCapturer::onFrameBegin to clear old viewport cache
+    getCommonObjects()->metaShaderOutputCapturer().onFrameBegin(this);
+
     // Force history reset on integrate indirect mode change to discard incompatible history 
     if (RtxOptions::integrateIndirectMode() != m_prevIntegrateIndirectMode) {
       m_resetHistory = true;
@@ -884,7 +887,59 @@ namespace dxvk {
       const MaterialData* overrideMaterialData = nullptr;
       bakeTerrain(params, drawCallState, &overrideMaterialData);
 
-    
+      Logger::info(str::format("[SHADER-REEXEC-DEBUG-PRE] override=", (overrideMaterialData != nullptr ? 1 : 0),
+                              " VS=", (drawCallState.vertexShader != nullptr ? 1 : 0),
+                              " PS=", (drawCallState.pixelShader != nullptr ? 1 : 0),
+                              " capturedStreams=", drawCallState.capturedVertexStreams.size(),
+                              " hasPositionBuffer=", drawCallState.geometryData.positionBuffer.defined() ? 1 : 0,
+                              " hasIndexBuffer=", drawCallState.geometryData.indexBuffer.defined() ? 1 : 0,
+                              " vertexCount=", drawCallState.geometryData.vertexCount));
+
+      // Check if shader re-execution is needed for captured buffers
+      // Skip re-execution for UI shaders (they should pass through without processing)
+      if (overrideMaterialData == nullptr &&
+          drawCallState.vertexShader != nullptr &&
+          drawCallState.pixelShader != nullptr &&
+          !drawCallState.capturedVertexStreams.empty()) {
+
+        Logger::info(str::format("[SHADER-REEXEC-DEBUG] Detected captured buffers: VS=", drawCallState.vertexShader,
+                                " PS=", drawCallState.pixelShader,
+                                " streams=", drawCallState.capturedVertexStreams.size()));
+
+        // UI shaders are detected via RtxGeometryStatus::Rasterized during PrepareDrawGeometryForRT
+        // If we have captured buffers here, it means the shader was marked for ray tracing (not UI)
+
+        // Access the shader output capturer
+        ShaderOutputCapturer& shaderCapturer = m_common->metaShaderOutputCapturer();
+
+        const bool shouldCapture = shaderCapturer.shouldCapture(drawCallState);
+        Logger::info(str::format("[SHADER-REEXEC-DEBUG] shouldCapture returned: ", shouldCapture));
+
+        if (shouldCapture) {
+          TextureRef capturedTexture;
+
+          // Re-execute the shaders with captured D3D9 state
+          const bool captured = shaderCapturer.captureDrawCall(
+            this,
+            m_rtState,
+            drawCallState,
+            params,
+            capturedTexture);
+
+          if (captured && capturedTexture.isValid()) {
+            Logger::info(str::format("[SHADER-REEXEC] Successfully re-executed shaders and captured output texture 0x",
+                                    std::hex, capturedTexture.getImageHash(), std::dec));
+
+            // Register the captured texture as a replacement
+            // This will be looked up later when the material is processed
+            XXH64_hash_t originalTextureHash = drawCallState.getMaterialData().getColorTexture().getImageHash();
+            shaderCapturer.registerTextureReplacement(originalTextureHash, capturedTexture);
+          } else {
+            Logger::warn("[SHADER-REEXEC] Failed to capture shader output");
+          }
+        }
+      }
+
       // An attempt to resolve cases where games pre-combine view and world matrices
       if (RtxOptions::resolvePreCombinedMatrices() &&
         isIdentityExact(drawCallState.getTransformData().worldToView)) {

@@ -667,21 +667,33 @@ namespace dxvk {
     constexpr uint32_t subresource = 0;
     const auto& buffer = source->m_buffers[subresource];
 
-    // Data may not be there yet
-    if (nullptr == buffer.ptr())
-      return;
+    // Generate hash from CPU buffer if available, otherwise use image properties
+    XXH64_hash_t imageHash = 0;
 
-    const bool useObsoleteHashMethod = NeedsUpload(subresource) &&
-      RtxOptions::useObsoleteHashOnTextureUpload();
+    if (buffer.ptr() != nullptr) {
+      // Buffer exists - hash the actual data
+      const bool useObsoleteHashMethod = NeedsUpload(subresource) &&
+        RtxOptions::useObsoleteHashOnTextureUpload();
 
-    // Generate hash from CPU buffer
-    XXH64_hash_t imageHash;
-
-    if (unlikely(useObsoleteHashMethod)) {
-      imageHash = XXH64(buffer->mapPtr(0), buffer->info().size, 0);
+      if (unlikely(useObsoleteHashMethod)) {
+        imageHash = XXH64(buffer->mapPtr(0), buffer->info().size, 0);
+      } else {
+        imageHash = XXH3_64bits(buffer->mapPtr(0), buffer->info().size);
+      }
     } else {
-      imageHash = XXH3_64bits(buffer->mapPtr(0), buffer->info().size);
+      // No buffer (DEFAULT pool texture) - generate hash from image properties
+      // This ensures DEFAULT pool textures still get valid hashes
+      XXH64_hash_t descriptorHash = m_desc.CalculateHash();
+
+      // Combine descriptor hash with image extent for uniqueness
+      imageHash = XXH3_64bits(&m_image->info().extent, sizeof(m_image->info().extent));
+      imageHash = XXH3_64bits_withSeed(&descriptorHash, sizeof(descriptorHash), imageHash);
+
+      // Add VkImage handle to ensure uniqueness across different image instances
+      VkImage vkImage = m_image->handle();
+      imageHash = XXH3_64bits_withSeed(&vkImage, sizeof(vkImage), imageHash);
     }
+
     // save hash to dxvkImage
     m_image->setHash(imageHash);
 

@@ -498,6 +498,8 @@ namespace dxvk {
         uintType, // baseVertex
         floatType,// jitterX
         floatType,// jitterY
+        floatType,// uvOffsetU - Camera motion UV neutralization offset U
+        floatType,// uvOffsetV - Camera motion UV neutralization offset V
         uintType  // padding
       };
 
@@ -529,6 +531,8 @@ namespace dxvk {
       SetMemberName("baseVertex", offsetof(D3D9RtxVertexCaptureData, baseVertex));
       SetMemberName("jitterX",  offsetof(D3D9RtxVertexCaptureData, jitterX));
       SetMemberName("jitterY", offsetof(D3D9RtxVertexCaptureData, jitterY));
+      SetMemberName("uvOffsetU", offsetof(D3D9RtxVertexCaptureData, uvOffsetU));
+      SetMemberName("uvOffsetV", offsetof(D3D9RtxVertexCaptureData, uvOffsetV));
       SetMemberName("padding", offsetof(D3D9RtxVertexCaptureData, padding));
 
       m_vs.vertexCaptureConstants = m_module.newVar(

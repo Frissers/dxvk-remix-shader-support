@@ -296,6 +296,7 @@ namespace dxvk {
                   "Defines which asset hashes we need to generate via the geometry processing engine.");
     RTX_OPTION("rtx", std::string, geometryAssetHashRuleString, "positions,indices,geometrydescriptor",
                   "Defines which hashes we need to include when sampling from replacements and doing USD capture.");
+    RTX_OPTION("rtx", fast_unordered_set, renderTargetReplacementTextures, {}, "DescriptorHashes for render target textures that should be replaced when bound as material textures.");
     RTX_OPTION("rtx", fast_unordered_set, raytracedRenderTargetTextures, {}, "DescriptorHashes for Render Targets. (Screens that should display the output of another camera).");
     RTX_OPTION("rtx", fast_unordered_set, particleEmitterTextures, {}, "Objects rendered with these textures will emit particles that inherit the material of the object itself.");
     

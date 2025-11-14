@@ -67,6 +67,8 @@ namespace dxvk {
     uint32_t baseVertex = 0;
     float jitterX;
     float jitterY;
+    float uvOffsetU;  // Camera motion UV neutralization offset U
+    float uvOffsetV;  // Camera motion UV neutralization offset V
     uint32_t padding;
   };
 
@@ -79,6 +81,8 @@ namespace dxvk {
     BaseVertex,
     JitterX,
     JitterY,
+    UvOffsetU,  // Camera motion UV neutralization
+    UvOffsetV,  // Camera motion UV neutralization
 
     MemberCount
   };

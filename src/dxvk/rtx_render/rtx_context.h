@@ -271,7 +271,19 @@ namespace dxvk {
     } m_objectPickingReadback {};
 
     std::vector<DrawCallState> m_delayedRayTracedSky;
-    
+
+    // Per-frame storage for override materials to prevent static storage leaking across draw calls
+    std::vector<MaterialData> m_overrideMaterialStorage;
+
+    // Per-frame cache to prevent creating duplicate material overrides for the same captured texture
+    // Key: captured texture hash, Value: index into m_overrideMaterialStorage
+    // CRITICAL: Store indices, NOT pointers! Pointers become invalid when vector reallocates.
+    std::unordered_map<XXH64_hash_t, size_t> m_materialOverrideCache;
+
+    // Per-frame set to track which DrawCallIDs have been submitted to prevent braille artifacts
+    // RT replacement draws are often called hundreds of times per frame, causing overlapping geometry
+    std::unordered_set<uint32_t> m_submittedDrawCallIDs;
+
     // Sky camera state tracking
     uint32_t m_lastSkyCameraFrame = 0;         // Frame when sky camera was last seen
     uint32_t m_skyGeometryQueuedFrame = 0;     // Frame when sky geometry was first queued

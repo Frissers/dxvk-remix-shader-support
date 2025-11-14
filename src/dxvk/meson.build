@@ -337,6 +337,9 @@ dxvk_src = files([
   'rtx_render/rtx_particle_system.cpp',
   'rtx_render/rtx_particle_system.h',
 
+  'rtx_render/rtx_shader_output_capturer.cpp',
+  'rtx_render/rtx_shader_output_capturer.h',
+
   'rtx_render/graph/rtx_component_list.h',
   'rtx_render/graph/rtx_graph_batch.cpp',
   'rtx_render/graph/rtx_graph_batch.h',

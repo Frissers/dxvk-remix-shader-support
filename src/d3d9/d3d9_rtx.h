@@ -211,6 +211,13 @@ namespace dxvk {
 
     fast_unordered_cache<Rc<DxvkSampler>> m_samplerCache;
 
+    // Framebuffer capture texture cache - keyed by hash of (format|width|height)
+    std::unordered_map<XXH64_hash_t, Rc<DxvkImageView>, XXH64_hash_passthrough> m_captureTextureCache;
+
+    // Shader output capture - D3D9 surface cache to keep surfaces alive
+    // Note: Using 'true' for standard COM (calls Release(), not ReleasePrivate())
+    std::unordered_map<XXH64_hash_t, Com<IDirect3DSurface9, true>, XXH64_hash_passthrough> m_shaderCaptureRTCache;
+
     // NOTE: to avoid calculating matrix inverse,
     //       m_seenCameraPositions doesn't contain the actual positions,
     //       but only relative values, see USE_TRUE_CAMERA_POSITION_FOR_COMPARISON
@@ -257,7 +264,6 @@ namespace dxvk {
 
     void triggerInjectRTX();
 
-
     struct DrawCallType {
       RtxGeometryStatus status;
       bool triggerRtxInjection;
@@ -275,5 +281,28 @@ namespace dxvk {
     Future<GeometryHashes> computeHash(const RasterGeometry& geoData, const uint32_t maxIndexValue);
 
     void submitActiveDrawCallState();
+
+    // Shader output capture helper - checks if we should capture this draw call's framebuffer
+    bool shouldCaptureFramebuffer() const;
+
+  public:
+    // Shader output capture - prepares capture texture and sets it in active draw call state
+    // Returns the capture texture to copy into, or nullptr if capture not needed
+    Rc<DxvkImageView> prepareFramebufferCapture(const Rc<DxvkImageView>& srcRenderTarget);
+
+    // Render target replacement - temporarily swap textures before draw execution
+    // Returns true if textures were swapped (caller must call restoreReplacedTextures after draw)
+    bool applyRenderTargetTextureReplacements();
+
+    // Render target replacement - restore original textures after draw execution
+    void restoreReplacedTextures();
+
+    // OPTION A: Capture original D3D9 vertex/index buffers for shader re-execution
+    // Must be called AFTER PrepareDraw() but BEFORE EmitCs() to capture the D3D9 state
+    void captureOriginalD3D9Buffers(const Direct3DState9& state);
+
+  private:
+    // Storage for original texture pointers during render target replacement
+    IDirect3DBaseTexture9* m_replacedTextures[16] = {};
   };
 }

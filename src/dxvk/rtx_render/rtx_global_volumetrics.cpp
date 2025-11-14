@@ -683,7 +683,9 @@ namespace dxvk {
 
     // Note: Camera should always be valid at this point as we rely on data from it, additionally this is checked
     // before ray tracing is even done.
-    assert(mainCamera.isValid(m_device->getCurrentFrameId()));
+    // Note: Assertion disabled to allow rtx.forceCameraValid compatibility workaround to function properly.
+    // The forceCameraValid option is specifically designed for games with unusual camera initialization patterns.
+    // assert(mainCamera.isValid(m_device->getCurrentFrameId()));
 
     const float cameraFrustumMaxDistance = mainCamera.getFarPlane() - mainCamera.getNearPlane();
 

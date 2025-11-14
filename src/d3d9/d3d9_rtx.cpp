@@ -13,7 +13,12 @@
 #include "../util/util_math.h"
 #include "d3d9_rtx_utils.h"
 #include "d3d9_texture.h"
+#include "d3d9_surface.h"
 #include "../dxvk/rtx_render/rtx_terrain_baker.h"
+#include "../dxvk/rtx_render/rtx_shader_output_capturer.h"
+#include <algorithm>
+#include <cstring>
+#include <unordered_map>
 
 namespace dxvk {
   // Forward declaration for global shader registry (defined in dxvk_imgui.cpp)
@@ -619,6 +624,16 @@ namespace dxvk {
   PrepareDrawFlags D3D9Rtx::internalPrepareDraw(const IndexContext& indexContext, const VertexContext vertexContext[caps::MaxStreams], const DrawContext& drawContext) {
     ScopedCpuProfileZone();
 
+    m_activeDrawCallState.forceShaderCapture = false;
+    m_activeDrawCallState.originalVertexData.clear();
+    m_activeDrawCallState.originalIndexData.clear();
+    m_activeDrawCallState.capturedVertexStreams.clear();
+    m_activeDrawCallState.capturedVertexElements.clear();
+
+    // Set draw context parameters needed for index buffer capture
+    m_activeDrawCallState.originalFirstIndex = drawContext.StartIndex;
+    m_activeDrawCallState.originalBaseVertex = drawContext.BaseVertexIndex;
+
     // RTX was injected => treat everything else as rasterized 
     if (m_rtxInjectTriggered) {
       return RtxOptions::skipDrawCallsPostRTXInjection()
@@ -626,7 +641,14 @@ namespace dxvk {
              : PrepareDrawFlag::PreserveDrawCallAndItsState;
     }
 
-    const auto [status, triggerRtxInjection] = makeDrawCallType(drawContext);
+    auto drawType = makeDrawCallType(drawContext);
+    auto status = drawType.status;
+    bool triggerRtxInjection = drawType.triggerRtxInjection;
+    const bool forceCaptureAll = ShaderOutputCapturer::captureAllDraws();
+    if (status == RtxGeometryStatus::Rasterized && forceCaptureAll) {
+      status = RtxGeometryStatus::RayTraced;
+      m_activeDrawCallState.forceShaderCapture = true;
+    }
 
     // When raytracing is enabled we want to completely remove the ignored drawcalls from further processing as early as possible
     const PrepareDrawFlags prepareFlagsForIgnoredDraws = RtxOptions::enableRaytracing()
@@ -669,6 +691,9 @@ namespace dxvk {
     if (indexContext.indexType != VK_INDEX_TYPE_NONE_KHR) {
       geoData.indexCount = GetVertexCount(drawContext.PrimitiveType, drawContext.PrimitiveCount);
 
+      // Store the original index count for buffer capture (BEFORE rebasing modifies it)
+      m_activeDrawCallState.originalIndexCount = geoData.indexCount;
+
       if (indexContext.indexType == VK_INDEX_TYPE_UINT16)
         geoData.indexBuffer = RasterBuffer(processIndexBuffer<uint16_t>(geoData.indexCount, drawContext.StartIndex, indexContext, minIndex, maxIndex), 0, 2, indexContext.indexType);
       else
@@ -710,6 +735,9 @@ namespace dxvk {
 
     m_activeDrawCallState.categories = 0;
     m_activeDrawCallState.materialData = {};
+    m_activeDrawCallState.capturedD3D9Textures.clear(); // Clear captured textures for new draw call
+    m_activeDrawCallState.renderTargetReplacementSlot = -1; // Reset render target replacement slot
+    m_activeDrawCallState.originalRenderTargetHash = 0; // Reset original RT hash
 
     // Fetch all the legacy state (colour modes, alpha test, etc...)
     setLegacyMaterialState(m_parent, m_parent->m_alphaSwizzleRTs & (1 << kRenderTargetIndex), m_activeDrawCallState.materialData);
@@ -758,6 +786,20 @@ namespace dxvk {
     m_activeDrawCallState.minZ = std::clamp(d3d9State().viewport.MinZ, 0.0f, 1.0f);
     m_activeDrawCallState.maxZ = std::clamp(d3d9State().viewport.MaxZ, 0.0f, 1.0f);
 
+    // Capture viewport and scissor state for shader re-execution
+    const auto& vp = d3d9State().viewport;
+    m_activeDrawCallState.originalViewport.x = static_cast<float>(vp.X);
+    m_activeDrawCallState.originalViewport.y = static_cast<float>(vp.Y);
+    m_activeDrawCallState.originalViewport.width = static_cast<float>(vp.Width);
+    m_activeDrawCallState.originalViewport.height = static_cast<float>(vp.Height);
+    m_activeDrawCallState.originalViewport.minDepth = vp.MinZ;
+    m_activeDrawCallState.originalViewport.maxDepth = vp.MaxZ;
+
+    m_activeDrawCallState.originalScissor.offset.x = vp.X;
+    m_activeDrawCallState.originalScissor.offset.y = vp.Y;
+    m_activeDrawCallState.originalScissor.extent.width = vp.Width;
+    m_activeDrawCallState.originalScissor.extent.height = vp.Height;
+
     m_activeDrawCallState.zWriteEnable = d3d9State().renderStates[D3DRS_ZWRITEENABLE];
     m_activeDrawCallState.zEnable = d3d9State().renderStates[D3DRS_ZENABLE] == D3DZB_TRUE;
     
@@ -805,7 +847,7 @@ namespace dxvk {
     params.firstIndex = drawContext.StartIndex;
     // DXVK overloads the vertexCount/indexCount in DrawInfo
     if (drawContext.Indexed) {
-      params.indexCount = drawInfo.vertexCount; 
+      params.indexCount = drawInfo.vertexCount;
     } else {
       params.vertexCount = drawInfo.vertexCount;
     }
@@ -816,18 +858,33 @@ namespace dxvk {
       assert(dynamic_cast<RtxContext*>(ctx));
       DrawCallState drawCallState;
       if (m_drawCallStateQueue.pop(drawCallState)) {
+        // DEBUG: Log index data size after queue pop
+        Logger::info(str::format("[INDEX-DEBUG-QUEUE-POP] originalIndexData size after queue pop: ",
+                                drawCallState.originalIndexData.size(),
+                                " hasIndexBuffer=", drawCallState.geometryData.indexBuffer.defined() ? 1 : 0,
+                                " materialHash=", drawCallState.getMaterialData().getHash()));
         static_cast<RtxContext*>(ctx)->commitGeometryToRT(params, drawCallState);
       }
     });
   }
 
   void D3D9Rtx::submitActiveDrawCallState() {
-    // We must be prepared for `push` failing here, this can happen, since we're pushing to a circular buffer, which 
+    // DEBUG: Log index data size before move
+    Logger::info(str::format("[INDEX-DEBUG-SUBMIT-BEFORE] originalIndexData size before move: ",
+                            m_activeDrawCallState.originalIndexData.size(),
+                            " materialHash=", m_activeDrawCallState.getMaterialData().getHash()));
+
+    // We must be prepared for `push` failing here, this can happen, since we're pushing to a circular buffer, which
     //  may not have room for new entries.  In such cases, we trust that the consumer thread will make space for us, and
     //  so we may just need to wait a little bit.
     while (!m_drawCallStateQueue.push(std::move(m_activeDrawCallState))) {
       Sleep(0);
     }
+
+    // DEBUG: Log after move (data should be empty now)
+    Logger::info(str::format("[INDEX-DEBUG-SUBMIT-AFTER] originalIndexData size after move: ",
+                            m_activeDrawCallState.originalIndexData.size(),
+                            " (should be 0 after move)"));
   }
 
   Future<SkinningData> D3D9Rtx::processSkinning(const RasterGeometry& geoData) {
@@ -1101,8 +1158,99 @@ namespace dxvk {
 
     // Find the ideal textures for raytracing, initialize the data to invalid (out of range) to unbind unused textures
     uint32_t firstStage = 0;
+
+    // RENDER TARGET REPLACEMENT: Check if slot 0 contains a render target and find alternative texture
+    int recommendedAlbedoSampler = -1;
+    if constexpr (!FixedFunction) {
+      auto isCategorizedRenderTarget = [](const D3D9CommonTexture* texture) {
+        if (texture == nullptr)
+          return false;
+        const auto& manualRenderTargets = RtxOptions::renderTargetReplacementTextures();
+
+        auto matchesManualTag = [&](XXH64_hash_t hash) -> bool {
+          return hash != 0 && lookupHash(manualRenderTargets, hash);
+        };
+
+        const XXH64_hash_t descriptorHash = texture->GetImage()->getDescriptorHash();
+        if (matchesManualTag(descriptorHash)) {
+          return true;
+        }
+
+        const XXH64_hash_t imageHash = texture->GetImage()->getHash();
+        if (matchesManualTag(imageHash)) {
+          return true;
+        }
+
+        if (const Rc<DxvkImageView> sampleView = texture->GetSampleView(true); sampleView != nullptr) {
+          const Rc<DxvkImage>& viewImage = sampleView->image();
+          if (viewImage != nullptr) {
+            if (matchesManualTag(viewImage->getDescriptorHash()) || matchesManualTag(viewImage->getHash())) {
+              return true;
+            }
+          }
+        }
+
+        return false;
+      };
+
+      // If slot 0 is categorized as render target, find alternative texture in other slots
+      if (d3d9State().textures[0] != nullptr) {
+        D3D9CommonTexture* tex0 = GetCommonTexture(d3d9State().textures[0]);
+        const bool isRT = isCategorizedRenderTarget(tex0);
+        // DEBUG: Log categorization check
+        static int logCount = 0;
+        if (++logCount <= 10 || (tex0 && tex0->GetImage()->getHash() == 0xc6702a5dbb13300c)) {
+          Logger::info(str::format("[RTX-RT-Check] tex0Hash=0x", std::hex, (tex0 ? tex0->GetImage()->getHash() : 0), std::dec,
+                                  " isRT=", isRT ? "YES" : "NO"));
+        }
+        if (tex0 && (tex0->GetType() == D3DRTYPE_TEXTURE || tex0->GetType() == D3DRTYPE_CUBETEXTURE) && isRT) {
+          // Try slots in order: s7, s8, s15, s5, s3, s2, s1, s6
+          const int candidateSlots[] = {7, 8, 15, 5, 3, 2, 1, 6};
+          for (int slot : candidateSlots) {
+            if (d3d9State().textures[slot] != nullptr) {
+              D3D9CommonTexture* tex = GetCommonTexture(d3d9State().textures[slot]);
+              if (tex && (tex->GetType() == D3DRTYPE_TEXTURE || tex->GetType() == D3DRTYPE_CUBETEXTURE)) {
+                const auto desc = tex->Desc();
+                const bool isDepthStencil = (desc->Usage & D3DUSAGE_DEPTHSTENCIL) != 0;
+                const bool isTinyTexture = (desc->Width <= 1 && desc->Height <= 1);
+                if (!isCategorizedRenderTarget(tex) && !isDepthStencil && !isTinyTexture) {
+                  recommendedAlbedoSampler = slot;
+                  // CRITICAL: Set renderTargetReplacementSlot so shader capturer knows this is a RT replacement
+                  m_activeDrawCallState.renderTargetReplacementSlot = slot;
+                  // Store the original render target hash so we can register a replacement later
+                  m_activeDrawCallState.originalRenderTargetHash = tex0->GetImage()->getHash();
+                  // DEBUG: Log replacement texture hash to verify it's different from render target
+                  if (tex0 && tex0->GetImage()->getHash() == 0xc6702a5dbb13300c) {
+                    Logger::info(str::format("[RTX-RenderTargetFix-Detailed] tex0=0x", std::hex, tex0->GetImage()->getHash(),
+                                            " replacementSlot=", std::dec, slot,
+                                            " replacementTexHash=0x", std::hex, tex->GetImage()->getHash(), std::dec));
+                  } else {
+                    Logger::info(str::format("[RTX-RenderTargetFix] Slot 0 is render target, using slot ", slot, " instead"));
+                  }
+                  break;
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+
     for (uint32_t idx = 0, textureID = 0; idx < NumTexcoordBins && textureID < LegacyMaterialData::kMaxSupportedTextures; idx++) {
-      const uint8_t stage = FixedFunction ? texcoordIndexToStage[idx] : textureID;
+      uint8_t stage;
+      if constexpr (FixedFunction) {
+        stage = texcoordIndexToStage[idx];
+      } else {
+        // Use recommended albedo sampler for first texture if render target was detected
+        if (textureID == 0 && recommendedAlbedoSampler >= 0) {
+          stage = recommendedAlbedoSampler;
+        } else {
+          stage = idx;
+          if (recommendedAlbedoSampler >= 0 && stage == recommendedAlbedoSampler) {
+            continue;  // Skip already-used albedo sampler
+          }
+        }
+      }
       if (stage == kInvalidStage || d3d9State().textures[stage] == nullptr)
         continue;
 
@@ -1114,8 +1262,17 @@ namespace dxvk {
         // ColorTexture2 is optional and currently only used as RayPortal material, the material type will be checked in the submitDrawState.
         // So we don't use it to check valid drawcall or not here.
         if (pTexInfo->GetImage()->getHash() == kEmptyHash) {
-          ONCE(Logger::info("[RTX-Compatibility-Info] Texture 0 without valid hash detected, skipping drawcall."));
-          return false;
+          // Allow draws with empty texture hash if shader output capture is enabled
+          // Shader capture will generate textures from pixel shader output for these draws
+          const bool allowForShaderCapture = ShaderOutputCapturer::enableShaderOutputCapture() &&
+                                             (ShaderOutputCapturer::captureAllDraws() ||
+                                              !ShaderOutputCapturer::captureEnabledHashes().empty());
+          if (!allowForShaderCapture) {
+            ONCE(Logger::info("[RTX-Compatibility-Info] Texture 0 without valid hash detected, skipping drawcall."));
+            return false;
+          } else {
+            Logger::info("[RTX-Compatibility-Info] Texture 0 without valid hash - allowing for shader output capture");
+          }
         }
 
         if (FixedFunction) {
@@ -1144,7 +1301,63 @@ namespace dxvk {
       auto shaderSampler = RemapStateSamplerShader(stage);
       m_activeDrawCallState.materialData.colorTextureSlot[textureID] = computeResourceSlotId(shaderSampler.first, DxsoBindingType::Image, uint32_t(shaderSampler.second));
 
+      // SHADER CAPTURE: Capture the D3D9 texture binding for shader re-execution
+      // This preserves the ORIGINAL game textures before RT replacement happens
+      DrawCallState::CapturedD3D9Texture capturedTex;
+      capturedTex.texture = TextureRef(pTexInfo->GetSampleView(srgb));
+      capturedTex.slot = m_activeDrawCallState.materialData.colorTextureSlot[textureID];
+      m_activeDrawCallState.capturedD3D9Textures.push_back(capturedTex);
+
+      // DEBUG: Log first texture capture to see if remapping worked
+      if (textureID == 0) {
+        const XXH64_hash_t capturedHash = pTexInfo->GetImage()->getHash();
+        if (capturedHash == 0xc6702a5dbb13300c) {
+          Logger::warn(str::format("[RTX-TextureCapture-PROBLEM] textureID=0 stage=", stage,
+                                  " textureHash=0x", std::hex, capturedHash, std::dec,
+                                  " recommendedAlbedoSampler=", recommendedAlbedoSampler,
+                                  " WARNING: Captured the RENDER TARGET itself!"));
+        } else {
+          Logger::info(str::format("[RTX-TextureCapture] textureID=0 stage=", stage,
+                                  " textureHash=0x", std::hex, capturedHash, std::dec,
+                                  " recommendedAlbedoSampler=", recommendedAlbedoSampler));
+        }
+      }
+
       ++textureID;
+    }
+
+    // SHADER CAPTURE FIX: Capture ALL remaining D3D9 texture stages that weren't included in material
+    // The pixel shader might reference texture stages beyond kMaxSupportedTextures
+    if constexpr (!FixedFunction) {
+      for (uint32_t stage = 0; stage < caps::MaxTexturesPS; stage++) {
+        if (d3d9State().textures[stage] == nullptr)
+          continue;
+
+        // Check if we already captured this stage
+        bool alreadyCaptured = false;
+        for (const auto& captured : m_activeDrawCallState.capturedD3D9Textures) {
+          auto shaderSampler = RemapStateSamplerShader(stage);
+          uint32_t stageSlot = computeResourceSlotId(shaderSampler.first, DxsoBindingType::Image, uint32_t(shaderSampler.second));
+          if (captured.slot == stageSlot) {
+            alreadyCaptured = true;
+            break;
+          }
+        }
+
+        if (!alreadyCaptured) {
+          D3D9CommonTexture* pTexInfo = GetCommonTexture(d3d9State().textures[stage]);
+          if (pTexInfo && (pTexInfo->GetType() == D3DRTYPE_TEXTURE || pTexInfo->GetType() == D3DRTYPE_CUBETEXTURE)) {
+            const bool srgb = d3d9State().samplerStates[stage][D3DSAMP_SRGBTEXTURE] & 0x1;
+            auto shaderSampler = RemapStateSamplerShader(stage);
+            uint32_t stageSlot = computeResourceSlotId(shaderSampler.first, DxsoBindingType::Image, uint32_t(shaderSampler.second));
+
+            DrawCallState::CapturedD3D9Texture capturedTex;
+            capturedTex.texture = TextureRef(pTexInfo->GetSampleView(srgb));
+            capturedTex.slot = stageSlot;
+            m_activeDrawCallState.capturedD3D9Textures.push_back(capturedTex);
+          }
+        }
+      }
     }
 
     // Update the drawcall state with texture stage info
@@ -1317,4 +1530,300 @@ namespace dxvk {
     // Inform backend of present
     m_parent->EmitCs([targetImage](DxvkContext* ctx) { static_cast<RtxContext*>(ctx)->onPresent(targetImage); });
   }
+
+  void D3D9Rtx::captureOriginalD3D9Buffers(const Direct3DState9& state) {
+    // Clear previous captures
+    m_activeDrawCallState.capturedVertexStreams.clear();
+    m_activeDrawCallState.capturedVertexElements.clear();
+
+    // Capture D3D9 shader objects for re-execution (extract raw pointers from Com smart pointers)
+    m_activeDrawCallState.vertexShader = state.vertexShader.ptr();
+    m_activeDrawCallState.pixelShader = state.pixelShader.ptr();
+    m_activeDrawCallState.vertexDecl = state.vertexDecl.ptr();
+
+    // Log capture for debugging (VERBOSE)
+    Logger::info(str::format("[OPTION-A-CAPTURE] Capturing D3D9 buffers - VS=", (void*)m_activeDrawCallState.vertexShader,
+                            " PS=", (void*)m_activeDrawCallState.pixelShader,
+                            " VDecl=", (void*)m_activeDrawCallState.vertexDecl,
+                            " vertexCount=", m_activeDrawCallState.geometryData.vertexCount));
+
+    // Capture shader constants
+    // Vertex shader constants (D3D9 supports up to 256 float4 constants for VS software, 256 for hardware)
+    if (state.vertexShader != nullptr) {
+      const uint32_t vsConstantCount = caps::MaxFloatConstantsVS; // 256 constants
+      m_activeDrawCallState.vertexShaderConstantData.resize(vsConstantCount);
+      // Copy from fConsts array (float constants)
+      memcpy(m_activeDrawCallState.vertexShaderConstantData.data(), state.vsConsts.fConsts, vsConstantCount * sizeof(Vector4));
+    } else {
+      m_activeDrawCallState.vertexShaderConstantData.clear();
+    }
+
+    // Pixel shader constants (D3D9 supports up to 224 float4 constants)
+    if (state.pixelShader != nullptr) {
+      const uint32_t psConstantCount = caps::MaxFloatConstantsPS; // 224 constants
+      m_activeDrawCallState.pixelShaderConstantData.resize(psConstantCount);
+      // Copy from fConsts array (float constants)
+      memcpy(m_activeDrawCallState.pixelShaderConstantData.data(), state.psConsts.fConsts, psConstantCount * sizeof(Vector4));
+    } else {
+      m_activeDrawCallState.pixelShaderConstantData.clear();
+    }
+
+    // Bail if no vertex declaration
+    if (state.vertexDecl == nullptr) {
+      return;
+    }
+
+    // Get the vertex elements from the declaration
+    const auto& elements = state.vertexDecl->GetElements();
+    if (elements.empty()) {
+      return;
+    }
+
+    // Track which streams we've already captured to avoid duplication
+    std::unordered_map<uint32_t, uint32_t> capturedStreams;
+
+    // Step 1: Copy the vertex element declarations
+    for (const auto& elem : elements) {
+      if (elem.Stream == 0xFF) break; // End marker
+
+      DrawCallState::CapturedVertexElement capturedElem;
+      capturedElem.stream = elem.Stream;
+      capturedElem.offset = elem.Offset;
+      capturedElem.type = elem.Type;
+      capturedElem.method = elem.Method;
+      capturedElem.usage = elem.Usage;
+      capturedElem.usageIndex = elem.UsageIndex;
+      m_activeDrawCallState.capturedVertexElements.push_back(capturedElem);
+
+      // Check if we've already captured this stream
+      if (capturedStreams.count(elem.Stream)) {
+        continue;
+      }
+
+      // Get the vertex buffer state for this stream
+      const auto& vbState = state.vertexBuffers[elem.Stream];
+      if (vbState.vertexBuffer == nullptr || vbState.stride == 0) {
+        continue;
+      }
+
+      // Get the common buffer
+      auto* common = GetCommonBuffer(vbState.vertexBuffer);
+      if (!common) {
+        continue;
+      }
+
+      // Calculate offset and size
+      VkDeviceSize offset = vbState.offset;
+      if (m_activeDrawCallState.originalBaseVertex > 0) {
+        offset += VkDeviceSize(m_activeDrawCallState.originalBaseVertex) * vbState.stride;
+      }
+
+      const uint32_t vertexCount = m_activeDrawCallState.geometryData.vertexCount;
+      VkDeviceSize bytes = VkDeviceSize(vertexCount) * vbState.stride;
+
+      // Validate bounds
+      if (offset >= common->Desc()->Size || bytes == 0) {
+        continue;
+      }
+      bytes = std::min(bytes, common->Desc()->Size - offset);
+
+      // Lock the buffer for reading
+      void* src = nullptr;
+      if (FAILED(common->Lock(uint32_t(offset), uint32_t(bytes), &src,
+                 D3DLOCK_READONLY | D3DLOCK_NOSYSLOCK)) || !src) {
+        if (src) common->Unlock();
+        continue;
+      }
+
+      // Copy the data into our captured stream
+      DrawCallState::CapturedVertexStream& captured =
+        m_activeDrawCallState.capturedVertexStreams.emplace_back();
+      captured.streamIndex = elem.Stream;
+      captured.stride = vbState.stride;
+      captured.data.assign(static_cast<uint8_t*>(src),
+                           static_cast<uint8_t*>(src) + size_t(bytes));
+
+      common->Unlock();
+      capturedStreams.emplace(elem.Stream,
+                             uint32_t(m_activeDrawCallState.capturedVertexStreams.size() - 1));
+
+      // Log successful capture
+      Logger::info(str::format("[OPTION-A-CAPTURE] Successfully captured stream ", elem.Stream,
+                              " - stride=", captured.stride,
+                              " bytes=", captured.data.size()));
+    }
+
+    // Capture index buffer if present AND the draw uses indices
+    if (state.indices != nullptr && m_activeDrawCallState.geometryData.indexCount > 0) {
+      auto* ibo = GetCommonBuffer(state.indices);
+      if (ibo != nullptr) {
+        // Get index type from the buffer description
+        const D3D9Format iboFormat = ibo->Desc()->Format;
+        const VkIndexType indexType = DecodeIndexType(iboFormat);
+        const uint32_t indexStride = (indexType == VK_INDEX_TYPE_UINT16) ? 2 : 4;
+
+        // Get index count from geometry data (already calculated by processIndexBuffer)
+        const uint32_t indexCount = m_activeDrawCallState.geometryData.indexCount;
+
+        // Calculate offset - we need to account for the start index from the draw call
+        // Note: originalFirstIndex should be set before this function is called
+        const uint32_t indexOffset = m_activeDrawCallState.originalFirstIndex * indexStride;
+        const uint32_t bytes = indexCount * indexStride;
+
+        // Validate bounds
+        if (indexOffset + bytes <= ibo->Desc()->Size) {
+          // Lock the index buffer for reading
+          void* src = nullptr;
+          if (SUCCEEDED(ibo->Lock(indexOffset, bytes, &src, D3DLOCK_READONLY | D3DLOCK_NOSYSLOCK)) && src) {
+            // Copy index data
+            m_activeDrawCallState.originalIndexData.assign(
+              static_cast<uint8_t*>(src),
+              static_cast<uint8_t*>(src) + bytes);
+
+            // Calculate min/max indices from captured data (needed for index rebasing)
+            uint32_t minIndex = 0;
+            uint32_t maxIndex = 0;
+            if (indexType == VK_INDEX_TYPE_UINT16) {
+              const uint16_t* indices = reinterpret_cast<const uint16_t*>(m_activeDrawCallState.originalIndexData.data());
+              fast::findMinMax<uint16_t>(indexCount, const_cast<uint16_t*>(indices), minIndex, maxIndex);
+            } else {
+              const uint32_t* indices = reinterpret_cast<const uint32_t*>(m_activeDrawCallState.originalIndexData.data());
+              fast::findMinMax<uint32_t>(indexCount, const_cast<uint32_t*>(indices), minIndex, maxIndex);
+            }
+
+            // Set all metadata fields required for shader re-execution
+            m_activeDrawCallState.originalIndexMin = minIndex;
+            m_activeDrawCallState.originalIndexCount = indexCount;
+            m_activeDrawCallState.originalIndexType = indexType;
+            m_activeDrawCallState.originalIndexOffset = indexOffset;
+
+            ibo->Unlock();
+
+            Logger::info(str::format("[OPTION-A-CAPTURE] Successfully captured index buffer - ",
+                                    "indexCount=", indexCount,
+                                    " bytes=", bytes,
+                                    " indexType=", (indexType == VK_INDEX_TYPE_UINT16 ? "UINT16" : "UINT32"),
+                                    " minIndex=", minIndex,
+                                    " maxIndex=", maxIndex));
+          } else {
+            if (src) ibo->Unlock();
+            Logger::warn("[OPTION-A-CAPTURE] Failed to lock index buffer for capture");
+          }
+        } else {
+          Logger::warn(str::format("[OPTION-A-CAPTURE] Index buffer bounds check failed - offset=", indexOffset,
+                                  " bytes=", bytes, " bufferSize=", ibo->Desc()->Size));
+        }
+      }
+    }
+
+    // FINAL SUMMARY LOG
+    Logger::info(str::format("[OPTION-A-CAPTURE] Capture complete: ",
+                            m_activeDrawCallState.capturedVertexStreams.size(), " streams, ",
+                            m_activeDrawCallState.capturedVertexElements.size(), " elements, ",
+                            "indexData=", m_activeDrawCallState.originalIndexData.size(), " bytes"));
+  }
+
+bool D3D9Rtx::shouldCaptureFramebuffer() const {
+    // Check if shader output capture is enabled (either all draws or specific hashes)
+    return ShaderOutputCapturer::captureAllDraws() || !ShaderOutputCapturer::captureEnabledHashes().empty();
+  }
+
+  Rc<DxvkImageView> D3D9Rtx::prepareFramebufferCapture(const Rc<DxvkImageView>& srcRenderTarget) {
+    if (!shouldCaptureFramebuffer() || srcRenderTarget == nullptr) {
+      return nullptr;
+    }
+
+    // Get render target properties
+    const auto& rtInfo = srcRenderTarget->imageInfo();
+    const VkFormat format = rtInfo.format;
+    const VkExtent3D extent = rtInfo.extent;
+
+    // Create a hash key for the cache based on format and dimensions
+    XXH64_hash_t cacheKey = XXH64(&format, sizeof(format), 0);
+    cacheKey = XXH64(&extent.width, sizeof(extent.width), cacheKey);
+    cacheKey = XXH64(&extent.height, sizeof(extent.height), cacheKey);
+
+    // Check if we have a cached texture for this configuration
+    auto it = m_captureTextureCache.find(cacheKey);
+    if (it != m_captureTextureCache.end()) {
+      m_activeDrawCallState.capturedFramebufferOutput = it->second;
+      return it->second;
+    }
+
+    // Create a new capture texture
+    DxvkImageCreateInfo imageInfo;
+    imageInfo.type = VK_IMAGE_TYPE_2D;
+    imageInfo.format = format;
+    imageInfo.flags = 0;
+    imageInfo.sampleCount = VK_SAMPLE_COUNT_1_BIT;
+    imageInfo.extent = extent;
+    imageInfo.numLayers = 1;
+    imageInfo.mipLevels = 1;
+    imageInfo.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    imageInfo.stages = VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+    imageInfo.access = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT;
+    imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+    imageInfo.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+    Rc<DxvkImage> captureImage = m_parent->GetDXVKDevice()->createImage(
+      imageInfo,
+      VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+      DxvkMemoryStats::Category::RTXRenderTarget,
+      "ShaderOutputCapture");
+
+    DxvkImageViewCreateInfo viewInfo;
+    viewInfo.type = VK_IMAGE_VIEW_TYPE_2D;
+    viewInfo.format = format;
+    viewInfo.usage = VK_IMAGE_USAGE_SAMPLED_BIT;
+    viewInfo.aspect = VK_IMAGE_ASPECT_COLOR_BIT;
+    viewInfo.minLevel = 0;
+    viewInfo.numLevels = 1;
+    viewInfo.minLayer = 0;
+    viewInfo.numLayers = 1;
+
+    Rc<DxvkImageView> captureView = m_parent->GetDXVKDevice()->createImageView(captureImage, viewInfo);
+
+    // Cache it
+    m_captureTextureCache[cacheKey] = captureView;
+    m_activeDrawCallState.capturedFramebufferOutput = captureView;
+
+    return captureView;
+  }
+
+  bool D3D9Rtx::applyRenderTargetTextureReplacements() {
+    // Check if we should do render target replacement for this draw call
+    const int slot = m_activeDrawCallState.renderTargetReplacementSlot;
+    if (slot < 0 || slot >= 16) {
+      return false; // No replacement needed
+    }
+
+    // Get the current D3D9 state
+    const auto& state = d3d9State();
+
+    // Save the original texture at this slot and replace it with the captured framebuffer output
+    m_replacedTextures[slot] = state.textures[slot];
+
+    // Get the captured framebuffer output from the active draw call state
+    if (m_activeDrawCallState.capturedFramebufferOutput != nullptr) {
+      // We need to create a D3D9 texture wrapper for the captured framebuffer
+      // For now, we'll just set it to nullptr to indicate replacement happened
+      // The actual texture binding will be handled by the ShaderOutputCapturer
+      m_parent->SetTexture(slot, nullptr);
+      return true;
+    }
+
+    return false;
+  }
+
+  void D3D9Rtx::restoreReplacedTextures() {
+    // Restore all replaced textures
+    for (uint32_t slot = 0; slot < 16; ++slot) {
+      if (m_replacedTextures[slot] != nullptr) {
+        m_parent->SetTexture(slot, m_replacedTextures[slot]);
+        m_replacedTextures[slot] = nullptr;
+      }
+    }
+  }
 }
+
+

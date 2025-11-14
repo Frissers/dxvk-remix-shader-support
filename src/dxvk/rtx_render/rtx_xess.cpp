@@ -37,9 +37,10 @@
 #include "../util/util_string.h"
 #include "../util/log/log.h"
 
-#if defined(_WIN32) && !defined(DXVK_NATIVE)
-#pragma comment(lib, "libxess.lib")
-#endif
+// XeSS library linking disabled - using stub headers instead
+//#if defined(_WIN32) && !defined(DXVK_NATIVE)
+//#pragma comment(lib, "libxess.lib")
+//#endif
 
 #include "../../../external/xess/inc/xess/xess.h"
 #include "../../../external/xess/inc/xess/xess_vk.h"

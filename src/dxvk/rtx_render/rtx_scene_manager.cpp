@@ -32,6 +32,7 @@
 #include "rtx_options.h"
 #include "rtx_terrain_baker.h"
 #include "rtx_texture_manager.h"
+#include "rtx_shader_output_capturer.h"
 
 #include <assert.h>
 
@@ -41,6 +42,7 @@
 #include "rtx_game_capturer.h"
 #include "rtx_matrix_helpers.h"
 #include "rtx_intersection_test.h"
+#include "rtx_materials.h"
 
 #include "dxvk_scoped_annotation.h"
 #include "rtx_lights_data.h"
@@ -62,18 +64,74 @@ namespace dxvk {
     , m_terrainBaker(new TerrainBaker())
     , m_cameraManager(device)
     , m_uniqueObjectSearchDistance(RtxOptions::uniqueObjectDistance()) {
+    Logger::info(str::format("[SceneManager-LIFECYCLE] Constructor started [", this, "]"));
+
     InstanceEventHandler instanceEvents(this);
     instanceEvents.onInstanceAddedCallback = [this](RtInstance& instance) { onInstanceAdded(instance); };
     instanceEvents.onInstanceUpdatedCallback = [this](RtInstance& instance, const DrawCallState& drawCall, const MaterialData& material, bool hasTransformChanged, bool hasVerticesChanged, bool isFirstUpdateThisFrame) { onInstanceUpdated(instance, drawCall, material, hasTransformChanged, hasVerticesChanged, isFirstUpdateThisFrame); };
     instanceEvents.onInstanceDestroyedCallback = [this](RtInstance& instance) { onInstanceDestroyed(instance); };
     m_instanceManager.addEventHandler(instanceEvents);
-    
+
     if (env::getEnvVar("DXVK_RTX_CAPTURE_ENABLE_ON_FRAME") != "") {
       m_beginUsdExportFrameNum = stoul(env::getEnvVar("DXVK_RTX_CAPTURE_ENABLE_ON_FRAME"));
     }
+
+    Logger::info(str::format("[SceneManager-LIFECYCLE] Constructor completed [", this, "]",
+                            " InstanceManager=[", &m_instanceManager, "]",
+                            " AccelManager=[", &m_accelManager, "]",
+                            " LightManager=[", &m_lightManager, "]",
+                            " GraphManager=[", &m_graphManager, "]",
+                            " RayPortalManager=[", &m_rayPortalManager, "]",
+                            " BindlessResourceManager=[", &m_bindlessResourceManager, "]",
+                            " CameraManager=[", &m_cameraManager, "]"));
   }
 
   SceneManager::~SceneManager() {
+    Logger::info(str::format("[SceneManager-LIFECYCLE] Destructor started [", this, "]"));
+
+    // CRITICAL: Call onDestroy to clean up circular references and GPU resources
+    // This MUST be called before the destructor completes to prevent memory leaks
+    Logger::info(str::format("[SceneManager-LIFECYCLE] Calling onDestroy() [", this, "]"));
+    onDestroy();
+
+    // Log buffer/material cache states
+    Logger::info(str::format("[SceneManager-LIFECYCLE] Clearing resource caches [", this, "]",
+                            " bufferCache=", m_bufferCache.getTotalCount(),
+                            " surfaceMaterials=", m_surfaceMaterialCache.getObjectTable().size(),
+                            " volumeMaterials=", m_volumeMaterialCache.getObjectTable().size(),
+                            " samplers=", m_samplerCache.getObjectTable().size()));
+
+    // Clear all resource caches explicitly
+    m_bufferCache.clear();
+    m_surfaceMaterialCache.clear();
+    m_surfaceMaterialExtensionCache.clear();
+    m_volumeMaterialCache.clear();
+    m_samplerCache.clear();
+    m_preCreationSurfaceMaterialMap.clear();
+
+    // Clear GPU resource buffers
+    Logger::info(str::format("[SceneManager-LIFECYCLE] Releasing GPU buffers [", this, "]"));
+    m_surfaceMaterialBuffer = nullptr;
+    m_surfaceMaterialExtensionBuffer = nullptr;
+    m_volumeMaterialBuffer = nullptr;
+
+    // Clear unique pointers explicitly with logging
+    if (m_opacityMicromapManager) {
+      Logger::info(str::format("[SceneManager-LIFECYCLE] Destroying OpacityMicromapManager [", m_opacityMicromapManager.get(), "]"));
+      m_opacityMicromapManager.reset();
+    }
+
+    if (m_pReplacer) {
+      Logger::info(str::format("[SceneManager-LIFECYCLE] Destroying AssetReplacer [", m_pReplacer.get(), "]"));
+      m_pReplacer.reset();
+    }
+
+    if (m_terrainBaker) {
+      Logger::info(str::format("[SceneManager-LIFECYCLE] Destroying TerrainBaker [", m_terrainBaker.get(), "]"));
+      m_terrainBaker.reset();
+    }
+
+    Logger::info(str::format("[SceneManager-LIFECYCLE] Destructor completed [", this, "]"));
   }
 
   bool SceneManager::areAllReplacementsLoaded() const {
@@ -304,10 +362,50 @@ namespace dxvk {
   }
 
   void SceneManager::onDestroy() {
-    m_accelManager.onDestroy();
-    if (m_opacityMicromapManager) {
-      m_opacityMicromapManager->onDestroy();
+    Logger::info(str::format("[SceneManager-LIFECYCLE] onDestroy() started [", this, "]"));
+
+    // Destroy all sub-managers in reverse order of construction
+    // This ensures proper cleanup of circular references and GPU resources
+
+    Logger::info(str::format("[SceneManager-LIFECYCLE] Destroying InstanceManager [", &m_instanceManager, "]"));
+    if (m_instanceManager.getInstanceTable().size() > 0) {
+      Logger::warn(str::format("[SceneManager-LIFECYCLE] InstanceManager has ", m_instanceManager.getInstanceTable().size(), " instances still alive!"));
     }
+    // InstanceManager doesn't have onDestroy, but we log its state
+
+    Logger::info(str::format("[SceneManager-LIFECYCLE] Destroying AccelManager [", &m_accelManager, "]"));
+    m_accelManager.onDestroy();
+
+    Logger::info(str::format("[SceneManager-LIFECYCLE] Destroying LightManager [", &m_lightManager, "]"));
+    // LightManager doesn't have onDestroy, but we log its state
+
+    Logger::info(str::format("[SceneManager-LIFECYCLE] Destroying GraphManager [", &m_graphManager, "]"));
+    // GraphManager doesn't have onDestroy, but we log its state
+
+    Logger::info(str::format("[SceneManager-LIFECYCLE] Destroying RayPortalManager [", &m_rayPortalManager, "]"));
+    // RayPortalManager doesn't have onDestroy, but we log its state
+
+    Logger::info(str::format("[SceneManager-LIFECYCLE] Destroying BindlessResourceManager [", &m_bindlessResourceManager, "]"));
+    // BindlessResourceManager doesn't have onDestroy, but we log its state
+
+    Logger::info(str::format("[SceneManager-LIFECYCLE] Destroying CameraManager [", &m_cameraManager, "]"));
+    // CameraManager doesn't have onDestroy, but we log its state
+
+    Logger::info(str::format("[SceneManager-LIFECYCLE] Destroying DrawCallCache [", &m_drawCallCache, "]"));
+    // DrawCallCache doesn't have onDestroy, but we log its state
+
+    if (m_opacityMicromapManager) {
+      Logger::info(str::format("[SceneManager-LIFECYCLE] Destroying OpacityMicromapManager [", m_opacityMicromapManager.get(), "]"));
+      m_opacityMicromapManager->onDestroy();
+    } else {
+      Logger::info("[SceneManager-LIFECYCLE] OpacityMicromapManager was never created (nullptr)");
+    }
+
+    // Clear fog states
+    Logger::info(str::format("[SceneManager-LIFECYCLE] Clearing fog states, count=", m_fogStates.size()));
+    m_fogStates.clear();
+
+    Logger::info(str::format("[SceneManager-LIFECYCLE] onDestroy() completed [", this, "]"));
   }
 
   template<bool isNew>
@@ -466,17 +564,32 @@ namespace dxvk {
   void SceneManager::onFrameEnd(Rc<DxvkContext> ctx) {
     ScopedCpuProfileZone();
 
+    static uint32_t frameEndCount = 0;
+    ++frameEndCount;
+    Logger::info(str::format("[SceneManager-FRAME-END] Frame #", frameEndCount, " ending [", this, "]",
+                            " instances=", m_instanceManager.getInstanceTable().size(),
+                            " buffers=", m_bufferCache.getActiveCount()));
+
+    Logger::info("[SceneManager-FRAME-END] Managing texture VRAM");
     manageTextureVram();
 
     if (m_enqueueDelayedClear || m_pReplacer->checkForChanges(ctx)) {
+      Logger::info(str::format("[SceneManager-FRAME-END] Clearing scene, enqueueDelayed=", m_enqueueDelayedClear,
+                              " replacerChanges=", m_pReplacer->checkForChanges(ctx)));
       clear(ctx, true);
       m_enqueueDelayedClear = false;
     }
 
+    Logger::info("[SceneManager-FRAME-END] Calling CameraManager::onFrameEnd");
     m_cameraManager.onFrameEnd();
-    m_instanceManager.onFrameEnd();
-    m_previousFrameSceneAvailable = RtxOptions::enablePreviousTLAS();
 
+    Logger::info("[SceneManager-FRAME-END] Calling InstanceManager::onFrameEnd");
+    m_instanceManager.onFrameEnd();
+
+    m_previousFrameSceneAvailable = RtxOptions::enablePreviousTLAS();
+    Logger::info(str::format("[SceneManager-FRAME-END] Previous frame available=", m_previousFrameSceneAvailable));
+
+    Logger::info(str::format("[SceneManager-FRAME-END] Clearing buffer cache, count=", m_bufferCache.getActiveCount()));
     m_bufferCache.clear();
     {
       std::lock_guard lock { m_drawCallMeta.mutex };
@@ -490,22 +603,27 @@ namespace dxvk {
       m_drawCallMeta.ticker = nextTick;
     }
 
+    Logger::info("[SceneManager-FRAME-END] Calling TerrainBaker::onFrameEnd");
     m_terrainBaker->onFrameEnd(ctx);
 
     if (m_opacityMicromapManager) {
+      Logger::info("[SceneManager-FRAME-END] Calling OpacityMicromapManager::onFrameEnd");
       m_opacityMicromapManager->onFrameEnd();
     }
-    
+
     m_activePOMCount = 0;
     m_startInMediumMaterialIndex = BINDING_INDEX_INVALID;
     m_startInMediumMaterialIndex_inCache = UINT32_MAX;
 
     if (m_uniqueObjectSearchDistance != RtxOptions::uniqueObjectDistance()) {
+      Logger::info(str::format("[SceneManager-FRAME-END] Unique object distance changed, rebuilding spatial maps: ",
+                              m_uniqueObjectSearchDistance, " -> ", RtxOptions::uniqueObjectDistance()));
       m_uniqueObjectSearchDistance = RtxOptions::uniqueObjectDistance();
       m_drawCallCache.rebuildSpatialMaps();
     }
 
     // Not currently safe to cache these across frames (due to texture indices and rtx options potentially changing)
+    Logger::info(str::format("[SceneManager-FRAME-END] Clearing pre-creation material map, size=", m_preCreationSurfaceMaterialMap.size()));
     m_preCreationSurfaceMaterialMap.clear();
 
     m_thinOpaqueMaterialExist = false;
@@ -513,7 +631,10 @@ namespace dxvk {
 
     // execute graph updates after all garbage collection is complete (to avoid updating graphs that will just be deleted)
     // RtxOptions will still be pending, so any changes to them will apply next frame.
+    Logger::info("[SceneManager-FRAME-END] Updating GraphManager");
     m_graphManager.update(ctx);
+
+    Logger::info(str::format("[SceneManager-FRAME-END] Frame #", frameEndCount, " complete"));
   }
 
   void SceneManager::onFrameEndNoRTX() {
@@ -526,10 +647,32 @@ namespace dxvk {
 
 
   void SceneManager::submitDrawState(Rc<DxvkContext> ctx, const DrawCallState& input, const MaterialData* overrideMaterialData) {
+    // Log IMMEDIATELY at function entry - before ANYTHING else
+    static uint32_t entryCount = 0;
+    ++entryCount;
+    Logger::err(str::format("[SceneManager-ENTRY-ERR] Function entered, call #", entryCount, " override=", overrideMaterialData != nullptr ? 1 : 0));
+
     ScopedCpuProfileZone();
+
+    // CRITICAL: Log ALL submissions with override material
+    static uint32_t submitWithOverrideCount = 0;
+    if (overrideMaterialData != nullptr && ++submitWithOverrideCount <= 50) {
+      Logger::info(str::format("[SceneManager-Enter] #", submitWithOverrideCount,
+                              " submitDrawState called with override material",
+                              " DrawCallID=", input.drawCallID,
+                              " rtSlot=", input.renderTargetReplacementSlot));
+    }
+
     if (m_bufferCache.getTotalCount() >= kBufferCacheLimit && m_bufferCache.getActiveCount() >= kBufferCacheLimit) {
       ONCE(Logger::info("[RTX-Compatibility-Info] This application is pushing more unique buffers than is currently supported - some objects may not raytrace."));
+      Logger::info("[SceneManager-BUFFER-LIMIT] Returning early due to buffer cache limit");
       return;
+    }
+
+    // TEST: Always log to verify this code is executing
+    static uint32_t testCounter = 0;
+    if (++testCounter <= 10) {
+      Logger::info(str::format("[SceneManager-TEST] submitDrawState executing, call #", testCounter));
     }
 
     if (input.getFogState().mode != D3DFOG_NONE) {
@@ -586,6 +729,19 @@ namespace dxvk {
 
     MaterialData renderMaterialData = determineMaterialData(overrideMaterialData, input);
 
+    // Log final material being used for RT replacements
+    static uint32_t submitLogCount = 0;
+    if (input.renderTargetReplacementSlot >= 0 && ++submitLogCount <= 50) {
+      const auto& opaqueMat = renderMaterialData.getOpaqueMaterialData();
+      const XXH64_hash_t albedoHash = opaqueMat.getAlbedoOpacityTexture().isValid() ?
+                                      opaqueMat.getAlbedoOpacityTexture().getImageHash() : 0;
+      Logger::info(str::format("[SceneManager-Submit] #", submitLogCount,
+                              " Final material for RT replacement",
+                              " albedoHash=0x", std::hex, albedoHash, std::dec,
+                              " hasOverride=", (overrideMaterialData != nullptr ? "YES" : "NO"),
+                              " DrawCallID=", input.drawCallID));
+    }
+
     if (pReplacements != nullptr) {
       drawReplacements(ctx, &input, pReplacements, renderMaterialData);
     } else {
@@ -596,6 +752,17 @@ namespace dxvk {
   MaterialData SceneManager::determineMaterialData(const MaterialData* overrideMaterialData, const DrawCallState& input) {
     // First see if we have an explicit override
     if (overrideMaterialData != nullptr) {
+      // Log override material usage for RT replacements
+      static uint32_t overrideLogCount = 0;
+      if (input.renderTargetReplacementSlot >= 0 && ++overrideLogCount <= 50) {
+        const auto& opaqueMat = overrideMaterialData->getOpaqueMaterialData();
+        const XXH64_hash_t albedoHash = opaqueMat.getAlbedoOpacityTexture().isValid() ?
+                                        opaqueMat.getAlbedoOpacityTexture().getImageHash() : 0;
+        Logger::err(str::format("[SceneManager-Override] #", overrideLogCount,
+                                " Using override material for RT replacement",
+                                " albedoHash=0x", std::hex, albedoHash, std::dec,
+                                " DrawCallID=", input.drawCallID));
+      }
       return *overrideMaterialData;
     } 
 
@@ -904,13 +1071,34 @@ namespace dxvk {
   }
 
   void SceneManager::onInstanceAdded(RtInstance& instance) {
+    static uint32_t addCount = 0;
+    if (++addCount <= 100) {
+      Logger::info(str::format("[SceneManager-INSTANCE-ADD] #", addCount,
+                              " Instance added [", &instance, "]",
+                              " ID=", instance.getId(),
+                              " hasBlas=", (instance.getBlas() != nullptr)));
+    }
+
     BlasEntry* pBlas = instance.getBlas();
     if (pBlas != nullptr) {
       pBlas->linkInstance(&instance);
+      if (addCount <= 100) {
+        Logger::info(str::format("[SceneManager-INSTANCE-ADD] Linked instance to BLAS [", pBlas, "]"));
+      }
     }
   }
 
   void SceneManager::onInstanceUpdated(RtInstance& instance, const DrawCallState& drawCall, const MaterialData& material, const bool hasTransformChanged, const bool hasVerticesChanged, const bool isFirstUpdateThisFrame) {
+    static uint32_t updateCount = 0;
+    if (++updateCount <= 100) {
+      Logger::info(str::format("[SceneManager-INSTANCE-UPDATE] #", updateCount,
+                              " Instance updated [", &instance, "]",
+                              " ID=", instance.getId(),
+                              " xformChanged=", hasTransformChanged,
+                              " vertsChanged=", hasVerticesChanged,
+                              " firstUpdateThisFrame=", isFirstUpdateThisFrame));
+    }
+
     auto capturer = m_device->getCommon()->capturer();
     if (hasTransformChanged) {
       capturer->setInstanceUpdateFlag(instance, GameCapturer::InstFlag::XformUpdate);
@@ -926,15 +1114,30 @@ namespace dxvk {
 
     if(isFirstUpdateThisFrame) {
       m_instanceManager.bindMaterial(instance, surfaceMaterial);
+      if (updateCount <= 100) {
+        Logger::info(str::format("[SceneManager-INSTANCE-UPDATE] Bound material, type=", (uint32_t)surfaceMaterial.getType()));
+      }
     }
 
     // Update portal
     if (surfaceMaterial.getType() == RtSurfaceMaterialType::RayPortal) {
       m_rayPortalManager.processRayPortalData(instance, surfaceMaterial);
+      if (updateCount <= 100) {
+        Logger::info("[SceneManager-INSTANCE-UPDATE] Processed RayPortal data");
+      }
     }
   }
 
   void SceneManager::onInstanceDestroyed(RtInstance& instance) {
+    static uint32_t destroyCount = 0;
+    if (++destroyCount <= 100) {
+      Logger::info(str::format("[SceneManager-INSTANCE-DESTROY] #", destroyCount,
+                              " Instance destroyed [", &instance, "]",
+                              " ID=", instance.getId(),
+                              " hasBlas=", (instance.getBlas() != nullptr),
+                              " isUnlinkedForGC=", instance.isUnlinkedForGC()));
+    }
+
     BlasEntry* pBlas = instance.getBlas();
     // Some BLAS were cleared in the SceneManager::garbageCollection().
     // When a BLAS is destroyed, all instances that linked to it will be automatically unlinked. In such case we don't need to
@@ -942,6 +1145,9 @@ namespace dxvk {
     // Note: This case often happens when BLAS are destroyed faster than instances. (e.g. numFramesToKeepGeometryData >= numFramesToKeepInstances)
     if (pBlas != nullptr && !instance.isUnlinkedForGC()) {
       pBlas->unlinkInstance(&instance);
+      if (destroyCount <= 100) {
+        Logger::info(str::format("[SceneManager-INSTANCE-DESTROY] Unlinked instance from BLAS [", pBlas, "]"));
+      }
     }
   }
 
@@ -957,27 +1163,135 @@ namespace dxvk {
       return;
     }
 
+    // OPTION-A: Check if this texture has a captured shader output replacement
+    TextureRef textureToUse = inputTexture;
+    if (inputTexture.isValid()) {
+      XXH64_hash_t originalHash = inputTexture.getImageHash();
+      ShaderOutputCapturer& shaderCapturer = m_device->getCommon()->metaShaderOutputCapturer();
+
+      Logger::info(str::format("[OPTION-A-TEXTURE-LOOKUP] Checking texture 0x", std::hex, originalHash, std::dec,
+                              " hasReplacement=", shaderCapturer.hasReplacementTexture(originalHash) ? "YES" : "NO"));
+
+      if (shaderCapturer.hasReplacementTexture(originalHash)) {
+        TextureRef replacementTexture = shaderCapturer.getReplacementTexture(originalHash);
+        if (replacementTexture.isValid()) {
+          textureToUse = replacementTexture;
+          Logger::info(str::format("[OPTION-A-TEXTURE-LOOKUP] REPLACING texture 0x", std::hex, originalHash,
+                                  " with captured output 0x", replacementTexture.getImageHash(), std::dec));
+        } else {
+          Logger::warn(str::format("[OPTION-A-TEXTURE-LOOKUP] Replacement texture for 0x", std::hex, originalHash, std::dec, " is INVALID!"));
+        }
+      }
+    }
+
     auto& textureManager = m_device->getCommon()->getTextureManager();
-    textureManager.addTexture(inputTexture, samplerFeedbackStamp, async, textureIndex);
+    textureManager.addTexture(textureToUse, samplerFeedbackStamp, async, textureIndex);
   }
 
   RtInstance* SceneManager::processDrawCallState(Rc<DxvkContext> ctx, const DrawCallState& drawCallState, MaterialData& renderMaterialData, RtInstance* existingInstance, const RtxParticleSystemDesc* pParticleSystemDesc) {
     ScopedCpuProfileZone();
 
+    // DEBUG: Log entry for hash=0
+    if (drawCallState.getMaterialData().getHash() == 0) {
+      Logger::info(str::format("[PROCESS-DEBUG] processDrawCallState entered for materialHash=0, renderTargetReplacementSlot=",
+                              drawCallState.renderTargetReplacementSlot));
+    }
+
     if (renderMaterialData.getIgnored()) {
       return nullptr;
+    }
+
+    // OPTION-A: Shader output capture - use captured textures as albedo
+    ShaderOutputCapturer& shaderCapturer = m_device->getCommon()->metaShaderOutputCapturer();
+
+    // Check if we should capture OR if we already have a captured texture
+    XXH64_hash_t matHash = drawCallState.getMaterialData().getHash();
+
+    // DEBUG: Log render target replacement status
+    static uint32_t rtReplacementLogCount = 0;
+    if (drawCallState.renderTargetReplacementSlot >= 0 && ++rtReplacementLogCount <= 20) {
+      Logger::info(str::format("[RT-REPLACEMENT-STATUS] Draw with renderTargetReplacementSlot=", drawCallState.renderTargetReplacementSlot,
+                              " matHash=0x", std::hex, matHash, std::dec,
+                              " originalRT=0x", std::hex, drawCallState.originalRenderTargetHash, std::dec));
+    }
+
+    bool shouldTryCapture = shaderCapturer.shouldCapture(drawCallState);
+    bool hasCachedCapture = shaderCapturer.hasCapturedTexture(matHash);
+
+    if (shouldTryCapture || hasCachedCapture) {
+      TextureRef capturedTexture;
+
+      // Try to capture if needed
+      if (shouldTryCapture) {
+        // DEBUG: Check if buffers are available
+        if (matHash == 0) {
+          Logger::info(str::format("[PROCESS-DEBUG-BUFFERS] originalIndexData.size=", drawCallState.originalIndexData.size(),
+                                  " originalVertexBuffer=", (void*)drawCallState.originalVertexBuffer.ptr(),
+                                  " capturedVertexStreams.size=", drawCallState.capturedVertexStreams.size()));
+        }
+
+        DrawParameters drawParams; // TODO: Fill this from drawCallState if needed
+        DxvkRaytracingInstanceState rtState; // TODO: Fill this if needed
+        Rc<RtxContext> rtxCtx = reinterpret_cast<Rc<RtxContext>&>(ctx);
+
+        shaderCapturer.captureDrawCall(rtxCtx, rtState, drawCallState, drawParams, capturedTexture);
+      }
+
+      // If we didn't capture this frame, get the cached texture
+      if (!capturedTexture.isValid()) {
+        capturedTexture = shaderCapturer.getCapturedTexture(matHash);
+        // DEBUG: Log cache lookup for RT replacements
+        if (drawCallState.renderTargetReplacementSlot >= 0) {
+          Logger::info(str::format("[SHADER-CAPTURE-LOOKUP] RT replacement material matHash=0x", std::hex, matHash, std::dec,
+                                  " hasCachedCapture=", hasCachedCapture ? "YES" : "NO",
+                                  " capturedTexture.isValid=", capturedTexture.isValid() ? "YES" : "NO"));
+        }
+      }
+
+      // Use the captured texture as albedo by modifying the material data
+      if (capturedTexture.isValid()) {
+        // CRITICAL FIX: Replace the albedo texture with the captured output
+        // The texture will be tracked later in createSurfaceMaterial() -> trackTexture()
+        if (renderMaterialData.getType() == MaterialDataType::Opaque) {
+          // Directly set the albedo texture - it will be tracked automatically later
+          renderMaterialData.getOpaqueMaterialData().getAlbedoOpacityTexture() = capturedTexture;
+
+          // Verify the assignment worked
+          const TextureRef& verifyTexture = renderMaterialData.getOpaqueMaterialData().getAlbedoOpacityTexture();
+          Logger::info(str::format("[OPTION-A-ALBEDO-REPLACE] Opaque: Set captured texture 0x",
+                                  std::hex, capturedTexture.getImageHash(),
+                                  " as albedo for material 0x", matHash,
+                                  " - verification: actualTexture=0x", verifyTexture.getImageHash(),
+                                  " isValid=", verifyTexture.isValid() ? 1 : 0, std::dec));
+        } else if (renderMaterialData.getType() == MaterialDataType::Translucent) {
+          // Translucent materials don't have albedo texture in the same way
+          Logger::info(str::format("[OPTION-A-ALBEDO-REPLACE] Translucent material 0x",
+                                  std::hex, matHash, std::dec, " - skipping albedo replacement"));
+        }
+      }
     }
 
     ObjectCacheState result = ObjectCacheState::kInvalid;
     BlasEntry* pBlas = nullptr;
     if (m_drawCallCache.get(drawCallState, &pBlas) == DrawCallCache::CacheState::kExisted) {
+      if (matHash == 0) {
+        Logger::info("[PROCESS-DEBUG-CACHE] materialHash=0 - cache EXISTED, calling onSceneObjectUpdated");
+      }
       result = onSceneObjectUpdated(ctx, drawCallState, pBlas);
     } else {
+      if (matHash == 0) {
+        Logger::info("[PROCESS-DEBUG-CACHE] materialHash=0 - cache MISS, calling onSceneObjectAdded");
+      }
       result = onSceneObjectAdded(ctx, drawCallState, pBlas);
     }
-    
+
     assert(pBlas != nullptr);
     assert(result != ObjectCacheState::kInvalid);
+
+    if (matHash == 0) {
+      Logger::info(str::format("[PROCESS-DEBUG-RESULT] materialHash=0 - result=", (int)result,
+                              " pBlas=", (void*)pBlas));
+    }
 
     // Update the input state, so we always have a reference to the original draw call state
     pBlas->frameLastTouched = m_device->getCurrentFrameId();

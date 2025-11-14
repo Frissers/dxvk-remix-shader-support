@@ -2606,16 +2606,44 @@ namespace dxvk {
     const D3D9Rtx::DrawContext drawContext { PrimitiveType, (INT) StartVertex, 0, 0, 0, PrimitiveCount, FALSE };
     const PrepareDrawFlags drawPrepare = m_rtx.PrepareDrawGeometryForRT(false, drawContext);
 
+    static uint32_t drawPrepareLogCount = 0;
+    if (++drawPrepareLogCount <= 10) {
+      Logger::info(str::format("[D3D9Device] DrawPrimitive drawPrepare=0x", std::hex, drawPrepare, std::dec,
+                              " ApplyDrawState=", (drawPrepare & PrepareDrawFlag::ApplyDrawState) ? 1 : 0,
+                              " OriginalDrawCall=", (drawPrepare & PrepareDrawFlag::OriginalDrawCall) ? 1 : 0));
+    }
+
     if ((drawPrepare & PrepareDrawFlag::ApplyDrawState) ||
         (drawPrepare & PrepareDrawFlag::OriginalDrawCall)) {
+      // Apply render target texture replacements BEFORE PrepareDraw binds textures
+      const bool didReplaceTextures = m_rtx.applyRenderTargetTextureReplacements();
+
       PrepareDraw(PrimitiveType);
+
+      // OPTION A: Capture original D3D9 buffers for shader re-execution
+      // This must be called AFTER PrepareDraw() while D3D9 state is still available
+      m_rtx.captureOriginalD3D9Buffers(m_state);
+
+      // Prepare framebuffer capture texture ONLY for rasterized draws (OriginalDrawCall).
+      // For raytraced-only draws, shader output capturer will re-execute the draw with replacement textures.
+      // If we set capturedFramebufferOutput for non-executing draws, it will be empty and break replacement.
+      Rc<DxvkImageView> captureView = nullptr;
+      const bool shouldCaptureFramebuffer = (drawPrepare & PrepareDrawFlag::OriginalDrawCall) && m_state.renderTargets[0] != nullptr;
+      if (drawPrepareLogCount <= 10) {
+        Logger::info(str::format("[D3D9Device] shouldCaptureFramebuffer=", shouldCaptureFramebuffer ? 1 : 0));
+      }
+      if (shouldCaptureFramebuffer) {
+        captureView = m_rtx.prepareFramebufferCapture(m_state.renderTargets[0]->GetImageView(false));
+      }
 
       EmitCs([this,
         cPrimType = PrimitiveType,
         cPrimCount = PrimitiveCount,
         cStartVertex = StartVertex,
         cInstanceCount = GetInstanceCount(),
-        cDrawCall = bool( drawPrepare & PrepareDrawFlag::OriginalDrawCall )
+        cDrawCall = bool( drawPrepare & PrepareDrawFlag::OriginalDrawCall ),
+        cCaptureView = captureView,
+        cDidReplaceTextures = didReplaceTextures
       ](DxvkContext* ctx) {
         auto drawInfo = GenerateDrawInfo(cPrimType, cPrimCount, cInstanceCount);
 
@@ -2626,8 +2654,32 @@ namespace dxvk {
           ctx->draw(
             drawInfo.vertexCount, drawInfo.instanceCount,
             cStartVertex, 0);
+
+          // Copy framebuffer to capture texture if needed
+          if (cCaptureView != nullptr) {
+            auto fbInfo = ctx->getFramebufferInfo();
+            const auto& colorTarget = fbInfo.getColorTarget(0);
+            if (colorTarget.view != nullptr) {
+              // Copy from framebuffer RT to capture texture
+              VkImageSubresourceLayers subresource;
+              subresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+              subresource.mipLevel = 0;
+              subresource.baseArrayLayer = 0;
+              subresource.layerCount = 1;
+
+              ctx->copyImage(
+                cCaptureView->image(), subresource, VkOffset3D{0, 0, 0},
+                colorTarget.view->image(), subresource, VkOffset3D{0, 0, 0},
+                cCaptureView->imageInfo().extent);
+            }
+          }
         }
       });
+
+      // Restore original textures after draw has been queued
+      if (didReplaceTextures) {
+        m_rtx.restoreReplacedTextures();
+      }
     }
 
     if (drawPrepare & PrepareDrawFlag::CommitToRayTracing) {
@@ -2662,7 +2714,22 @@ namespace dxvk {
 
     if ((drawPrepare & PrepareDrawFlag::ApplyDrawState) ||
         (drawPrepare & PrepareDrawFlag::OriginalDrawCall)) {
+      // Apply render target texture replacements BEFORE PrepareDraw binds textures
+      const bool didReplaceTextures = m_rtx.applyRenderTargetTextureReplacements();
+
       PrepareDraw(PrimitiveType);
+
+      // OPTION A: Capture original D3D9 buffers for shader re-execution
+      // This must be called AFTER PrepareDraw() while D3D9 state is still available
+      m_rtx.captureOriginalD3D9Buffers(m_state);
+
+      // Prepare framebuffer capture texture ONLY for rasterized draws (OriginalDrawCall).
+      // For raytraced-only draws, shader output capturer will re-execute the draw with replacement textures.
+      // If we set capturedFramebufferOutput for non-executing draws, it will be empty and break replacement.
+      Rc<DxvkImageView> captureView = nullptr;
+      if ((drawPrepare & PrepareDrawFlag::OriginalDrawCall) && m_state.renderTargets[0] != nullptr) {
+        captureView = m_rtx.prepareFramebufferCapture(m_state.renderTargets[0]->GetImageView(false));
+      }
 
       EmitCs([this,
         cPrimType = PrimitiveType,
@@ -2670,7 +2737,9 @@ namespace dxvk {
         cStartIndex = StartIndex,
         cBaseVertexIndex = BaseVertexIndex,
         cInstanceCount = GetInstanceCount(),
-        cDrawCall = bool( drawPrepare & PrepareDrawFlag::OriginalDrawCall )
+        cDrawCall = bool( drawPrepare & PrepareDrawFlag::OriginalDrawCall ),
+        cCaptureView = captureView,
+        cDidReplaceTextures = didReplaceTextures
       ](DxvkContext* ctx) {
         auto drawInfo = GenerateDrawInfo(cPrimType, cPrimCount, cInstanceCount);
 
@@ -2682,8 +2751,32 @@ namespace dxvk {
             drawInfo.vertexCount, drawInfo.instanceCount,
             cStartIndex,
             cBaseVertexIndex, 0);
+
+          // Copy framebuffer to capture texture if needed
+          if (cCaptureView != nullptr) {
+            auto fbInfo = ctx->getFramebufferInfo();
+            const auto& colorTarget = fbInfo.getColorTarget(0);
+            if (colorTarget.view != nullptr) {
+              // Copy from framebuffer RT to capture texture
+              VkImageSubresourceLayers subresource;
+              subresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+              subresource.mipLevel = 0;
+              subresource.baseArrayLayer = 0;
+              subresource.layerCount = 1;
+
+              ctx->copyImage(
+                cCaptureView->image(), subresource, VkOffset3D{0, 0, 0},
+                colorTarget.view->image(), subresource, VkOffset3D{0, 0, 0},
+                cCaptureView->imageInfo().extent);
+            }
+          }
         }
       });
+
+      // Restore original textures after draw has been queued
+      if (didReplaceTextures) {
+        m_rtx.restoreReplacedTextures();
+      }
     }
 
     if (drawPrepare & PrepareDrawFlag::CommitToRayTracing) {
@@ -2726,13 +2819,26 @@ namespace dxvk {
         (drawPrepare & PrepareDrawFlag::OriginalDrawCall)) {
       PrepareDraw(PrimitiveType);
 
+      // OPTION A: Capture original D3D9 buffers for shader re-execution
+      // This must be called AFTER PrepareDraw() while D3D9 state is still available
+      m_rtx.captureOriginalD3D9Buffers(m_state);
+
+      // Prepare framebuffer capture texture ONLY for rasterized draws (OriginalDrawCall).
+      // For raytraced-only draws, shader output capturer will re-execute the draw with replacement textures.
+      // If we set capturedFramebufferOutput for non-executing draws, it will be empty and break replacement.
+      Rc<DxvkImageView> captureView = nullptr;
+      if ((drawPrepare & PrepareDrawFlag::OriginalDrawCall) && m_state.renderTargets[0] != nullptr) {
+        captureView = m_rtx.prepareFramebufferCapture(m_state.renderTargets[0]->GetImageView(false));
+      }
+
       EmitCs([this,
         cBufferSlice = std::move(upSlice.slice),
         cPrimType = PrimitiveType,
         cPrimCount = PrimitiveCount,
         cInstanceCount = GetInstanceCount(),
         cStride = VertexStreamZeroStride,
-        cDrawCall = bool( drawPrepare & PrepareDrawFlag::OriginalDrawCall )
+        cDrawCall = bool( drawPrepare & PrepareDrawFlag::OriginalDrawCall ),
+        cCaptureView = captureView
       ](DxvkContext* ctx) {
         auto drawInfo = GenerateDrawInfo(cPrimType, cPrimCount, cInstanceCount);
 
@@ -2742,6 +2848,25 @@ namespace dxvk {
         ctx->bindVertexBuffer(0, cBufferSlice, cStride);
         if (cDrawCall) {
           ctx->draw(drawInfo.vertexCount, drawInfo.instanceCount, 0, 0);
+
+          // Copy framebuffer to capture texture if needed
+          if (cCaptureView != nullptr) {
+            auto fbInfo = ctx->getFramebufferInfo();
+            const auto& colorTarget = fbInfo.getColorTarget(0);
+            if (colorTarget.view != nullptr) {
+              // Copy from framebuffer RT to capture texture
+              VkImageSubresourceLayers subresource;
+              subresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+              subresource.mipLevel = 0;
+              subresource.baseArrayLayer = 0;
+              subresource.layerCount = 1;
+
+              ctx->copyImage(
+                cCaptureView->image(), subresource, VkOffset3D{0, 0, 0},
+                colorTarget.view->image(), subresource, VkOffset3D{0, 0, 0},
+                cCaptureView->imageInfo().extent);
+            }
+          }
         }
         ctx->bindVertexBuffer(0, DxvkBufferSlice(), 0);
       });
@@ -2802,6 +2927,18 @@ namespace dxvk {
         (drawPrepare & PrepareDrawFlag::OriginalDrawCall)) {
       PrepareDraw(PrimitiveType);
 
+      // OPTION A: Capture original D3D9 buffers for shader re-execution
+      // This must be called AFTER PrepareDraw() while D3D9 state is still available
+      m_rtx.captureOriginalD3D9Buffers(m_state);
+
+      // Prepare framebuffer capture texture ONLY for rasterized draws (OriginalDrawCall).
+      // For raytraced-only draws, shader output capturer will re-execute the draw with replacement textures.
+      // If we set capturedFramebufferOutput for non-executing draws, it will be empty and break replacement.
+      Rc<DxvkImageView> captureView = nullptr;
+      if ((drawPrepare & PrepareDrawFlag::OriginalDrawCall) && m_state.renderTargets[0] != nullptr) {
+        captureView = m_rtx.prepareFramebufferCapture(m_state.renderTargets[0]->GetImageView(false));
+      }
+
       EmitCs([this,
         cVertexSize = vertexBufferSize,
         cBufferSlice = std::move(upSlice.slice),
@@ -2810,7 +2947,8 @@ namespace dxvk {
         cStride = VertexStreamZeroStride,
         cInstanceCount = GetInstanceCount(),
         cIndexType = DecodeIndexType(static_cast<D3D9Format>(IndexDataFormat)),
-        cDrawCall = bool( drawPrepare & PrepareDrawFlag::OriginalDrawCall )
+        cDrawCall = bool( drawPrepare & PrepareDrawFlag::OriginalDrawCall ),
+        cCaptureView = captureView
       ](DxvkContext* ctx) {
         auto drawInfo = GenerateDrawInfo(cPrimType, cPrimCount, cInstanceCount);
 
@@ -2820,6 +2958,25 @@ namespace dxvk {
         ctx->bindIndexBuffer(cBufferSlice.subSlice(cVertexSize, cBufferSlice.length() - cVertexSize), cIndexType);
         if (cDrawCall) {
           ctx->drawIndexed(drawInfo.vertexCount, drawInfo.instanceCount, 0, 0, 0);
+
+          // Copy framebuffer to capture texture if needed
+          if (cCaptureView != nullptr) {
+            auto fbInfo = ctx->getFramebufferInfo();
+            const auto& colorTarget = fbInfo.getColorTarget(0);
+            if (colorTarget.view != nullptr) {
+              // Copy from framebuffer RT to capture texture
+              VkImageSubresourceLayers subresource;
+              subresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+              subresource.mipLevel = 0;
+              subresource.baseArrayLayer = 0;
+              subresource.layerCount = 1;
+
+              ctx->copyImage(
+                cCaptureView->image(), subresource, VkOffset3D{0, 0, 0},
+                colorTarget.view->image(), subresource, VkOffset3D{0, 0, 0},
+                cCaptureView->imageInfo().extent);
+            }
+          }
         }
         ctx->bindVertexBuffer(0, DxvkBufferSlice(), 0);
         ctx->bindIndexBuffer(DxvkBufferSlice(), VK_INDEX_TYPE_UINT32);
