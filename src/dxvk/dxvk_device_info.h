@@ -56,6 +56,7 @@ namespace dxvk {
   	VkPhysicalDeviceAccelerationStructureFeaturesKHR          khrAccelerationStructureFeatures;
     VkPhysicalDeviceShaderAtomicFloatFeaturesEXT              extShaderAtomicFloat;
     VkPhysicalDeviceDiagnosticsConfigFeaturesNV               nvDeviceDiagnosticsConfig;
+    VkPhysicalDeviceRayTracingValidationFeaturesNV            nvRayTracingValidation;
     VkPhysicalDeviceBufferDeviceAddressFeaturesKHR            khrBufferDeviceAddress;
 
     // NV-DXVK start: opacity micromap

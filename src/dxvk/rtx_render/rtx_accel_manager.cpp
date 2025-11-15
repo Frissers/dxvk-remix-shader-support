@@ -190,7 +190,10 @@ namespace dxvk {
       triangleData.indexType = blasEntry.modifiedGeometryData.indexBuffer.indexType();
       triangleData.vertexData.deviceAddress = blasEntry.modifiedGeometryData.positionBuffer.getDeviceAddress() + blasEntry.modifiedGeometryData.positionBuffer.offsetFromSlice();
       triangleData.vertexStride = blasEntry.modifiedGeometryData.positionBuffer.stride();
-      triangleData.vertexFormat = blasEntry.modifiedGeometryData.positionBuffer.vertexFormat();
+      // Acceleration structures only support R32G32B32_SFLOAT for vertices, not R32G32B32A32_SFLOAT
+      // Force to RGB even if buffer contains RGBA (W component is unused for ray tracing)
+      VkFormat posFormat = blasEntry.modifiedGeometryData.positionBuffer.vertexFormat();
+      triangleData.vertexFormat = (posFormat == VK_FORMAT_R32G32B32A32_SFLOAT) ? VK_FORMAT_R32G32B32_SFLOAT : posFormat;
       triangleData.maxVertex = blasEntry.modifiedGeometryData.vertexCount - 1;
 
       assert((blasEntry.modifiedGeometryData.calculatePrimitiveCount() & 1) == 0);
@@ -229,7 +232,10 @@ namespace dxvk {
 
       triangleData.vertexData.deviceAddress = blasEntry.modifiedGeometryData.positionBuffer.getDeviceAddress() + blasEntry.modifiedGeometryData.positionBuffer.offsetFromSlice();
       triangleData.vertexStride = blasEntry.modifiedGeometryData.positionBuffer.stride();
-      triangleData.vertexFormat = blasEntry.modifiedGeometryData.positionBuffer.vertexFormat();
+      // Acceleration structures only support R32G32B32_SFLOAT for vertices, not R32G32B32A32_SFLOAT
+      // Force to RGB even if buffer contains RGBA (W component is unused for ray tracing)
+      VkFormat posFormat = blasEntry.modifiedGeometryData.positionBuffer.vertexFormat();
+      triangleData.vertexFormat = (posFormat == VK_FORMAT_R32G32B32A32_SFLOAT) ? VK_FORMAT_R32G32B32_SFLOAT : posFormat;
       triangleData.maxVertex = blasEntry.modifiedGeometryData.vertexCount - 1;
 
       VkAccelerationStructureBuildRangeInfoKHR buildRange = {};

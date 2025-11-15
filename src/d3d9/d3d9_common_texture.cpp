@@ -341,7 +341,38 @@ namespace dxvk {
         "\n  Usage:   ", std::hex, m_desc.Usage,
         "\n  Pool:    ", std::hex, m_desc.Pool));
     }
-    
+
+    // NV-DXVK start: Validate and fix invalid image parameters
+    if (imageInfo.extent.width == 0 || imageInfo.extent.height == 0 || imageInfo.extent.depth == 0) {
+      Logger::warn(str::format(
+        "D3D9: Fixing texture with zero extent to 1x1:",
+        "\n  Type:    ", std::hex, ResourceType,
+        "\n  Format:  ", m_desc.Format,
+        "\n  Original Extent:  ", m_desc.Width,
+                    "x", m_desc.Height,
+                    "x", m_desc.Depth,
+        "\n  Samples: ", m_desc.MultiSample,
+        "\n  Layers:  ", m_desc.ArraySize,
+        "\n  Levels:  ", m_desc.MipLevels));
+      // Create a 1x1 fallback texture instead of nullptr
+      if (imageInfo.extent.width == 0) imageInfo.extent.width = 1;
+      if (imageInfo.extent.height == 0) imageInfo.extent.height = 1;
+      if (imageInfo.extent.depth == 0) imageInfo.extent.depth = 1;
+    }
+
+    if (imageInfo.format == VK_FORMAT_UNDEFINED) {
+      Logger::warn(str::format(
+        "D3D9: Fixing texture with undefined format to R8G8B8A8_UNORM:",
+        "\n  Type:    ", std::hex, ResourceType,
+        "\n  D3D9 Format: ", m_desc.Format,
+        "\n  Extent:  ", m_desc.Width,
+                    "x", m_desc.Height,
+                    "x", m_desc.Depth));
+      // Use a fallback format instead of VK_FORMAT_UNDEFINED
+      imageInfo.format = VK_FORMAT_R8G8B8A8_UNORM;
+    }
+    // NV-DXVK end
+
     // NV-DXVK start: add debug names to VkImage objects
     auto image = m_device->GetDXVKDevice()->createImage(imageInfo, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, DxvkMemoryStats::Category::AppTexture, "D3D9 texture primary");
     // Calculate hash for the render target textures

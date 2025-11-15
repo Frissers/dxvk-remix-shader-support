@@ -437,6 +437,17 @@ namespace dxvk {
     const auto isRaytracingEnabled = RtxOptions::enableRaytracing();
     const auto asyncShaderCompilationActive = RtxOptions::Shader::enableAsyncCompilation() && common->pipelineManager().remixShaderCompilationCount() > 0;
 
+    // NV-DXVK start: Debug logging for ray tracing pipeline
+    static bool s_loggedRtStatus = false;
+    if (!s_loggedRtStatus) {
+      Logger::info(str::format("[RTX-PIPELINE] Ray tracing status check:",
+                               "\n  m_rayTracingSupported=", m_rayTracingSupported,
+                               "\n  isRaytracingEnabled=", isRaytracingEnabled,
+                               "\n  asyncShaderCompilationActive=", asyncShaderCompilationActive));
+      s_loggedRtStatus = true;
+    }
+    // NV-DXVK end
+
     // Determine and set present throttle delay
     // Note: This must be done before the early out returns below which is why some logic here is redundant (e.g. checking if ray tracing is supported again)
     // just to ensure the present throttle delay is always being set properly.
@@ -469,13 +480,26 @@ namespace dxvk {
     }
 
     bool isCameraValid = getSceneManager().getCamera().isValid(m_device->getCurrentFrameId());
-    
+
+    // NV-DXVK start: Log camera validation status every frame for debugging
+    static uint32_t s_cameraLogCounter = 0;
+    if (s_cameraLogCounter++ < 10) {
+      const auto& camera = getSceneManager().getCamera();
+      Logger::info(str::format("[RTX-PIPELINE] Camera validation (frame ", s_cameraLogCounter, "):",
+                               "\n  isCameraValid=", isCameraValid,
+                               "\n  camera.getPosition()=", camera.getPosition(),
+                               "\n  camera.getFov()=", camera.getFov(),
+                               "\n  camera.getNearPlane()=", camera.getNearPlane(),
+                               "\n  camera.getFarPlane()=", camera.getFarPlane()));
+    }
+    // NV-DXVK end
+
     // Force camera validation bypass if requested
     if (RtxOptions::forceCameraValid() && !isCameraValid) {
       ONCE(Logger::warn("[RTX-Compatibility] Forcing camera validation to succeed. Camera may not be properly configured!"));
       isCameraValid = true;
     }
-    
+
     if (!isCameraValid) {
       ONCE(Logger::info(str::format("[RTX-Compatibility-Info] Trying to raytrace but not detecting a valid camera.")));
     }
@@ -504,8 +528,15 @@ namespace dxvk {
     // Note: Only engage ray tracing when it is enabled, the camera is valid and when no shaders are currently being compiled asynchronously (as
     // trying to render before shaders are done compiling will cause Remix to block).
     if (isRaytracingEnabled && isCameraValid && !asyncShaderCompilationActive) {
+      // NV-DXVK start: Log when ray tracing path is taken
+      static uint32_t s_rtEngagedCounter = 0;
+      if (s_rtEngagedCounter++ < 5) {
+        Logger::info(str::format("[RTX-PIPELINE] **RAY TRACING ENGAGED** (frame ", s_rtEngagedCounter, ")"));
+      }
+      // NV-DXVK end
+
       if (targetImage == nullptr) {
-        targetImage = m_state.om.renderTargets.color[0].view->image();  
+        targetImage = m_state.om.renderTargets.color[0].view->image();
       }
 
       const bool captureTestScreenshot = (m_screenshotFrameEnabled && m_device->getCurrentFrameId() == m_screenshotFrameNum);
@@ -1236,7 +1267,20 @@ namespace dxvk {
     constants.teleportationPortalIndex = cameraTeleportDirectionInfo ? cameraTeleportDirectionInfo->entryPortalInfo.portalIndex + 1 : 0;
 
     // Note: Use half of the vertical FoV for the main camera in radians divided by the vertical resolution to get the effective half angle of a single pixel.
-    constants.screenSpacePixelSpreadHalfAngle = getSceneManager().getCamera().getFov() / 2.0f / constants.camera.resolution.y;
+    // Guard against invalid camera data (zero or negative resolution, invalid FOV)
+    const float fov = getSceneManager().getCamera().getFov();
+    const float resolutionY = static_cast<float>(constants.camera.resolution.y);
+
+    if (resolutionY > 0.0f && fov > 0.0f && std::isfinite(fov)) {
+      constants.screenSpacePixelSpreadHalfAngle = fov / 2.0f / resolutionY;
+    } else {
+      // Fallback to a reasonable default value if camera data is invalid
+      // Use a typical 90 degree FOV and 1080p resolution as fallback
+      constants.screenSpacePixelSpreadHalfAngle = (90.0f * (3.14159265f / 180.0f)) / 2.0f / 1080.0f;
+      Logger::warn(str::format("Invalid camera data detected (FOV=", fov, ", resolution.y=", resolutionY,
+                               "). Using fallback screenSpacePixelSpreadHalfAngle=",
+                               constants.screenSpacePixelSpreadHalfAngle));
+    }
 
     // Note: This value is assumed to be positive (specifically not have the sign bit set) as otherwise it will break Ray Interaction encoding.
     assert(std::signbit(constants.screenSpacePixelSpreadHalfAngle) == false);
@@ -1705,29 +1749,51 @@ namespace dxvk {
     settings.useDLSS = shouldUseDLSS();
     settings.demodulateRoughness = m_common->metaDemodulate().demodulateRoughness();
     settings.roughnessDemodulationOffset = m_common->metaDemodulate().demodulateRoughnessOffset();
+
+    Logger::info(str::format("[COMPOSITE] Dispatching composite pass:",
+      " fogMode=", settings.fog.mode,
+      " NRD=", settings.isNRDPreCompositionDenoiserEnabled,
+      " upscaler=", settings.useUpscaler,
+      " DLSS=", settings.useDLSS,
+      " demodRough=", settings.demodulateRoughness));
+
+    Logger::info(str::format("[COMPOSITE] Final output: format=", rtOutput.m_finalOutput.imageInfo().format,
+      " size=", rtOutput.m_finalOutput.imageInfo().extent.width, "x", rtOutput.m_finalOutput.imageInfo().extent.height));
+
     m_common->metaComposite().dispatch(this,
       getSceneManager(),
       rtOutput, settings);
+
+    Logger::info("[COMPOSITE] Composite dispatch completed");
   }
 
   void RtxContext::dispatchToneMapping(const Resources::RaytracingOutput& rtOutput, bool performSRGBConversion) {
     ScopedCpuProfileZone();
 
+    Logger::info(str::format("[TONEMAPPING] Starting tone mapping, debugViewIdx=", m_common->metaDebugView().debugViewIdx(),
+      " performSRGBConversion=", performSRGBConversion));
+
     if (m_common->metaDebugView().debugViewIdx() == DEBUG_VIEW_PRE_TONEMAP_OUTPUT) {
+      Logger::info("[TONEMAPPING] Skipping tone mapping due to DEBUG_VIEW_PRE_TONEMAP_OUTPUT mode");
       return;
     }
 
-    // TODO: I think these are unnecessary, and/or should be automatically done within DXVK 
+    Logger::info(str::format("[TONEMAPPING] Input final output: format=", rtOutput.m_finalOutput.imageInfo().format,
+      " size=", rtOutput.m_finalOutput.imageInfo().extent.width, "x", rtOutput.m_finalOutput.imageInfo().extent.height));
+
+    // TODO: I think these are unnecessary, and/or should be automatically done within DXVK
     this->spillRenderPass(false);
     this->unbindComputePipeline();
 
-    DxvkAutoExposure& autoExposure = m_common->metaAutoExposure();    
-    autoExposure.dispatch(this, 
+    DxvkAutoExposure& autoExposure = m_common->metaAutoExposure();
+    Logger::info(str::format("[TONEMAPPING] Auto exposure enabled=", autoExposure.enabled()));
+    autoExposure.dispatch(this,
       getResourceManager().getSampler(VK_FILTER_LINEAR, VK_SAMPLER_MIPMAP_MODE_NEAREST, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER),
       rtOutput, GlobalTime::get().deltaTimeMs(), performSRGBConversion);
 
     // Check if HDR is enabled
     const bool hdrEnabled = isHDREnabled();
+    Logger::info(str::format("[TONEMAPPING] HDR enabled=", hdrEnabled));
     
     // We don't reset history for tonemapper on m_resetHistory for easier comparison when toggling raytracing modes.
     // The tone curve shouldn't be too different between raytracing modes, 
@@ -1737,8 +1803,9 @@ namespace dxvk {
     
     if (hdrEnabled) {
       // HDR Mode: Use native HDR processing (bypass SDR tone mapping entirely)
+      Logger::info("[TONEMAPPING] Using HDR processing mode");
       DxvkToneMapping& toneMapper = m_common->metaToneMapping();
-      
+
       // Apply HDR processing directly to the composite output
       toneMapper.dispatchHDRProcessing(this,
         getResourceManager().getSampler(VK_FILTER_LINEAR, VK_SAMPLER_MIPMAP_MODE_NEAREST, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER),
@@ -1747,26 +1814,34 @@ namespace dxvk {
         rtOutput.m_finalOutput.resource(Resources::AccessType::Write),
         GlobalTime::get().deltaTimeMs(),
         autoExposure.enabled());
+      Logger::info("[TONEMAPPING] HDR processing completed");
     } else {
       // SDR Mode: Apply the selected tonemapping mode
       if (RtxOptions::tonemappingMode() == TonemappingMode::Global) {
+        Logger::info("[TONEMAPPING] Using Global SDR tone mapping mode");
         DxvkToneMapping& toneMapper = m_common->metaToneMapping();
-        
-        toneMapper.dispatch(this, 
+
+        toneMapper.dispatch(this,
           getResourceManager().getSampler(VK_FILTER_LINEAR, VK_SAMPLER_MIPMAP_MODE_NEAREST, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER),
           autoExposure.getExposureTexture().view,
           rtOutput, GlobalTime::get().deltaTimeMs(), performSRGBConversion, autoExposure.enabled());
+        Logger::info("[TONEMAPPING] Global tone mapping completed");
       } else {
         // Local tonemapping mode
+        Logger::info("[TONEMAPPING] Using Local SDR tone mapping mode");
         DxvkLocalToneMapping& localTonemapper = m_common->metaLocalToneMapping();
         if (localTonemapper.isActive()) {
           localTonemapper.dispatch(this,
             getResourceManager().getSampler(VK_FILTER_LINEAR, VK_SAMPLER_MIPMAP_MODE_NEAREST, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE),
             autoExposure.getExposureTexture().view,
             rtOutput, GlobalTime::get().deltaTimeMs(), performSRGBConversion, autoExposure.enabled());
+          Logger::info("[TONEMAPPING] Local tone mapping completed");
+        } else {
+          Logger::info("[TONEMAPPING] Local tone mapping is NOT active, skipping");
         }
       }
     }
+    Logger::info("[TONEMAPPING] Tone mapping dispatch completed");
   }
 
   bool RtxContext::isHDREnabled() const {
@@ -1838,13 +1913,21 @@ namespace dxvk {
     }
 
     if (!debugView.isActive()) {
+      Logger::info("[DEBUG-VIEW] Debug view is NOT active, skipping");
       return;
     }
+
+    Logger::info(str::format("[DEBUG-VIEW] Dispatching debug view #", debugView.debugViewIdx(),
+      " srcImage: format=", srcImage->info().format,
+      " size=", srcImage->info().extent.width, "x", srcImage->info().extent.height,
+      " overlay=", debugView.getOverlayOnTopOfRenderOutput()));
 
     debugView.dispatch(this,
       getResourceManager().getSampler(VK_FILTER_NEAREST, VK_SAMPLER_MIPMAP_MODE_NEAREST, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE),
       getResourceManager().getSampler(VK_FILTER_LINEAR, VK_SAMPLER_MIPMAP_MODE_NEAREST, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE),
       srcImage, rtOutput, *m_common);
+
+    Logger::info("[DEBUG-VIEW] Debug view dispatch completed");
 
     if (captureScreenImage) {
       // For overlayed debug views, we preserve the post tonemapping naming since the post tonemapped image is a base image.

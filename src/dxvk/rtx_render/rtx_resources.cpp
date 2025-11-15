@@ -86,20 +86,43 @@ namespace dxvk {
     // max mip levels a texture can have based on its size:
     assert (mipLevels <= static_cast<uint32_t>(std::floor(std::log2(std::max(extent.width, extent.height)))) + 1);
 
+    // NV-DXVK start: Validate and fix invalid image parameters
+    VkExtent3D validExtent = extent;
+    if (validExtent.width == 0 || validExtent.height == 0 || validExtent.depth == 0) {
+      Logger::warn(str::format(
+        "RTX Resources: Fixing image with zero extent to 1x1:",
+        "\n  Name: ", name,
+        "\n  Original Extent: ", extent.width, "x", extent.height, "x", extent.depth));
+      if (validExtent.width == 0) validExtent.width = 1;
+      if (validExtent.height == 0) validExtent.height = 1;
+      if (validExtent.depth == 0) validExtent.depth = 1;
+    }
+
+    VkFormat validFormat = format;
+    if (validFormat == VK_FORMAT_UNDEFINED) {
+      Logger::warn(str::format(
+        "RTX Resources: Fixing image with undefined format to R8G8B8A8_UNORM:",
+        "\n  Name: ", name,
+        "\n  Extent: ", validExtent.width, "x", validExtent.height, "x", validExtent.depth));
+      validFormat = VK_FORMAT_R8G8B8A8_UNORM;
+    }
+    // NV-DXVK end
+
     DxvkImageCreateInfo desc;
     desc.type = imageType;
-    desc.flags = imageCreateFlags;
+    // NV-DXVK: Always add MUTABLE_FORMAT_BIT for RTX resources since they may need image views with different formats
+    desc.flags = imageCreateFlags | VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
     desc.sampleCount = VK_SAMPLE_COUNT_1_BIT;
-    desc.extent = extent;
+    desc.extent = validExtent;
     desc.numLayers = numLayers;
-    desc.mipLevels = mipLevels; 
+    desc.mipLevels = mipLevels;
     desc.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | extraUsageFlags;
     desc.stages = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
     desc.access = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
     desc.tiling = VK_IMAGE_TILING_OPTIMAL;
     desc.layout = VK_IMAGE_LAYOUT_UNDEFINED;
 
-    desc.format = format;
+    desc.format = validFormat;
 
     if (imageViewType == VK_IMAGE_VIEW_TYPE_CUBE) {
       desc.flags |= VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
@@ -107,7 +130,7 @@ namespace dxvk {
 
     Resource resource;
     resource.image = ctx->getDevice()->createImage(desc, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, DxvkMemoryStats::Category::RTXRenderTarget, name);
-    resource.view = createImageView(ctx, resource.image, format, numLayers, imageViewType, extraUsageFlags, mipLevels);
+    resource.view = createImageView(ctx, resource.image, validFormat, numLayers, imageViewType, extraUsageFlags, mipLevels);
     ctx->changeImageLayout(resource.image, VK_IMAGE_LAYOUT_GENERAL);
 
     VkImageSubresourceRange subRange = {};

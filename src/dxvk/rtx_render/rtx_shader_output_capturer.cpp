@@ -152,6 +152,25 @@ namespace dxvk {
       return true;
     }
 
+    // RT feedback cases (no replacement found but slot 0 was a render target)
+    // CRITICAL: Wait 60 frames before capturing RT feedback to let RTs accumulate content from game's normal rendering
+    // Otherwise we capture on first use when RTs are empty/black
+    if (drawCallState.originalRenderTargetHash != 0) {
+      constexpr uint32_t RT_FEEDBACK_DELAY_FRAMES = 60;
+      if (m_currentFrame < RT_FEEDBACK_DELAY_FRAMES) {
+        if (shouldLog) {
+          Logger::info(str::format("[ShaderCapture-RTFeedback] Delaying capture until frame ", RT_FEEDBACK_DELAY_FRAMES,
+                                  " (currentFrame=", m_currentFrame, ") to let RT accumulate content"));
+        }
+        return false;
+      }
+      if (shouldLog) {
+        Logger::info(str::format("[ShaderOutputCapturer] shouldCapture() returning TRUE - RT feedback case (cacheKey=0x",
+                                std::hex, cacheKey, std::dec, " originalRT=0x", drawCallState.originalRenderTargetHash, ")"));
+      }
+      return true;
+    }
+
     // For non-RT-replacement materials, check the whitelist
     XXH64_hash_t matHash = cacheKey; // Same as material hash for non-RT materials
 
@@ -395,6 +414,49 @@ namespace dxvk {
       Logger::info(str::format("  hash=0x", std::hex, renderTarget.image->getHash(), std::dec));
     }
 
+    // CRITICAL FIX: For render target feedback (game reads from RT it writes to),
+    // we need to preserve the ORIGINAL RT content and bind it as input texture
+    // Otherwise shader reads from empty/cleared RT and outputs black
+    TextureRef previousRTContent;
+    if (drawCallState.renderTargetReplacementSlot < 0 && drawCallState.originalRenderTargetHash != 0) {
+      // No replacement texture found, but slot 0 is a render target
+      // The shader will try to read from slot 0 (render target feedback)
+      // We need to provide the CURRENT RT content as input before we clear it
+      Logger::info(str::format("[ShaderCapture-RTFeedback] No replacement found, RT feedback detected!",
+                              " Preserving RT 0x", std::hex, drawCallState.originalRenderTargetHash, std::dec,
+                              " for shader input"));
+
+      // Find the original RT in captured textures
+      for (const auto& capturedTex : drawCallState.capturedD3D9Textures) {
+        if (capturedTex.texture.isValid() &&
+            capturedTex.texture.getImageHash() == drawCallState.originalRenderTargetHash) {
+          previousRTContent = capturedTex.texture;
+          Logger::info(str::format("[ShaderCapture-RTFeedback] Found original RT in slot ", capturedTex.slot,
+                                  " format=", capturedTex.texture.getImageView()->image()->info().format,
+                                  " size=", capturedTex.texture.getImageView()->image()->info().extent.width, "x",
+                                  capturedTex.texture.getImageView()->image()->info().extent.height,
+                                  " - will bind as shader input"));
+          break;
+        }
+      }
+
+      if (!previousRTContent.isValid()) {
+        Logger::warn(str::format("[ShaderCapture-RTFeedback] WARNING: Could not find RT 0x", std::hex,
+                                drawCallState.originalRenderTargetHash, std::dec,
+                                " in capturedD3D9Textures (size=", drawCallState.capturedD3D9Textures.size(), ")!",
+                                " Shader will read from empty/cleared RT and may output black!"));
+      }
+    }
+
+    // CRITICAL FIX: Transition render target TO COLOR_ATTACHMENT_OPTIMAL before binding
+    // If this RT was used before, it's in SHADER_READ_ONLY_OPTIMAL from the previous capture
+    // We need to transition it back so we can render to it again
+    ctx->changeImageLayout(renderTarget.image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+
+    Logger::info(str::format("[ShaderCapture-Layout] Transitioned render target 0x", std::hex,
+                            renderTarget.image->getHash(), std::dec,
+                            " to COLOR_ATTACHMENT_OPTIMAL for rendering"));
+
     // Bind offscreen render target
     DxvkRenderTargets captureRt;
     captureRt.color[0].view = renderTarget.view;
@@ -504,8 +566,12 @@ namespace dxvk {
                                      (stage == drawCallState.renderTargetReplacementSlot);
 
       // Check for self-reference against material hash
-      // EXCEPTION: Allow the replacement slot even if it has matHash (it's a previous capture, valid input)
-      const bool isMatHashSelfReference = (texHash == matHash) && !isReplacementSlot;
+      // EXCEPTION 1: Allow the replacement slot even if it has matHash (it's a previous capture, valid input)
+      // EXCEPTION 2: Allow RT feedback case - matHash==RT hash but we WANT to bind it for shader to read
+      const bool isRTFeedbackCase = (drawCallState.renderTargetReplacementSlot < 0) &&
+                                    (drawCallState.originalRenderTargetHash != 0) &&
+                                    (texHash == drawCallState.originalRenderTargetHash);
+      const bool isMatHashSelfReference = (texHash == matHash) && !isReplacementSlot && !isRTFeedbackCase;
 
       // ALSO skip the ORIGINAL render target for RT replacement draws (it's pink/invalid)
       const bool isOriginalRTSelfReference = (drawCallState.renderTargetReplacementSlot >= 0) &&
@@ -516,6 +582,13 @@ namespace dxvk {
                                 " textureHash=0x", std::hex, texHash, std::dec,
                                 (isOriginalRTSelfReference ? " == originalRT" : " == matHash")));
         continue; // Skip this texture - it's a self-reference!
+      }
+
+      // Log when we're binding RT for feedback
+      if (isRTFeedbackCase) {
+        Logger::info(str::format("[ShaderCapture-D3D9Tex] ✓ BINDING RT FEEDBACK: slot=", capturedTex.slot,
+                                " textureHash=0x", std::hex, texHash, std::dec,
+                                " (shader needs to read previous frame)"));
       }
 
       Rc<DxvkImageView> imageView = capturedTex.texture.getImageView();
@@ -561,6 +634,22 @@ namespace dxvk {
           break;
         }
       }
+    } else if (previousRTContent.isValid()) {
+      // No replacement found, but we have the previous RT content for feedback
+      // Bind it to slot 0 so the shader can read from it
+      const uint32_t slot0 = 1014; // PS sampler 0
+
+      // TextureRef already has an image view, use it directly
+      ctx->bindResourceView(slot0, previousRTContent.getImageView(), nullptr);
+
+      const Rc<DxvkSampler>& sampler = material.getSampler();
+      if (sampler != nullptr) {
+        ctx->bindResourceSampler(slot0, sampler);
+      }
+
+      Logger::info(str::format("[ShaderCapture-RTFeedback] ✓ BOUND previous RT content to slot 0",
+                              " hash=0x", std::hex, previousRTContent.getImageHash(), std::dec,
+                              " (shader can now read previous frame for feedback)"));
     }
 
     static uint32_t captureCount = 0;
@@ -1785,6 +1874,17 @@ namespace dxvk {
       // it means the capture is empty and we need to ensure shader state is preserved.
     }
 
+    // CRITICAL FIX: Transition render target from COLOR_ATTACHMENT_OPTIMAL to SHADER_READ_ONLY_OPTIMAL
+    // This allows the image to be:
+    // 1. Saved to disk correctly (fixes transparent/corrupt saved textures)
+    // 2. Used as a shader input texture in the raytracing pipeline
+    // Without this transition, Vulkan validation errors occur and textures appear black/transparent
+    ctx->changeImageLayout(renderTarget.image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+
+    Logger::info(str::format("[ShaderCapture-Layout] Transitioned render target 0x", std::hex,
+                            renderTarget.image->getHash(), std::dec,
+                            " from COLOR_ATTACHMENT_OPTIMAL to SHADER_READ_ONLY_OPTIMAL"));
+
     // Restore previous render target
     if (prevColorTarget != nullptr) {
       DxvkRenderTargets prevRt;
@@ -1793,8 +1893,24 @@ namespace dxvk {
       ctx->bindRenderTargets(prevRt);
     }
 
+    // DEBUG: Save captured RT feedback textures to disk for inspection
+    if (drawCallState.renderTargetReplacementSlot < 0 && drawCallState.originalRenderTargetHash != 0) {
+      // This is an RT feedback capture - save it to see what's in it
+      auto [cacheKey, isValidKey] = getCacheKey(drawCallState);
+      std::string filename = str::format("RT_", std::hex, cacheKey, std::dec, "_",
+                                        renderTarget.image->info().extent.width, "x",
+                                        renderTarget.image->info().extent.height, ".dds");
+      try {
+        auto& exporter = ctx->getCommonObjects()->metaExporter();
+        exporter.dumpImageToFile(ctx.ptr(), "C:/Program Files/Epic Games/LegoBatman2/captured/", filename, renderTarget.image);
+        Logger::info(str::format("[ShaderCapture-Save] Saved RT feedback texture to: ", filename));
+      } catch (...) {
+        Logger::warn(str::format("[ShaderCapture-Save] Failed to save texture: ", filename));
+      }
+    }
+
     // Store captured output
-    storeCapturedOutput(drawCallState, renderTarget, currentFrame);
+    storeCapturedOutput(ctx, drawCallState, renderTarget, currentFrame);
 
     // Return texture reference
     outputTexture = TextureRef(renderTarget.view);
@@ -1831,6 +1947,7 @@ namespace dxvk {
 
   void ShaderOutputCapturer::onFrameBegin(Rc<RtxContext> ctx) {
     m_capturesThisFrame = 0;
+    m_currentFrame++;
 
     // TEMPORARY: Clear ALL cached textures to force recapture with corrected logic
     // Previous code incorrectly skipped ALL materials thinking tex0Hash==matHash meant self-reference
@@ -1966,6 +2083,7 @@ namespace dxvk {
   }
 
   void ShaderOutputCapturer::storeCapturedOutput(
+      Rc<RtxContext> ctx,
       const DrawCallState& drawCallState,
       const Resources::Resource& texture,
       uint32_t currentFrame) {

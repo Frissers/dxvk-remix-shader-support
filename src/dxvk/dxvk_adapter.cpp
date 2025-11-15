@@ -439,6 +439,19 @@ namespace dxvk {
     }
     // NV-DXVK end
 
+    // NV-DXVK start: Enable ray tracing validation extension
+    if (RtxOptions::areValidationLayersEnabled()) {
+      std::array devValidationExtensions = {
+        &devExtensions.nvRayTracingValidation,
+      };
+
+      m_deviceExtensions.enableExtensions(
+        devValidationExtensions.size(),
+        devValidationExtensions.data(),
+        extensionsEnabled);
+    }
+    // NV-DXVK end
+
     // NV-DXVK start: DLFG integration
     // enable DLFG extensions if available
     std::array devDlfgExtensions = {
@@ -603,6 +616,14 @@ namespace dxvk {
       enabledFeatures.nvDeviceDiagnosticsConfig.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DIAGNOSTICS_CONFIG_FEATURES_NV;
       enabledFeatures.nvDeviceDiagnosticsConfig.pNext = std::exchange(enabledFeatures.core.pNext, &enabledFeatures.nvDeviceDiagnosticsConfig);
       enabledFeatures.nvDeviceDiagnosticsConfig.diagnosticsConfig = VK_TRUE;
+    }
+    // NV-DXVK end
+
+    // NV-DXVK start: Enable ray tracing validation feature
+    if (devExtensions.nvRayTracingValidation && RtxOptions::areValidationLayersEnabled()) {
+      enabledFeatures.nvRayTracingValidation.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_VALIDATION_FEATURES_NV;
+      enabledFeatures.nvRayTracingValidation.pNext = std::exchange(enabledFeatures.core.pNext, &enabledFeatures.nvRayTracingValidation);
+      enabledFeatures.nvRayTracingValidation.rayTracingValidation = VK_TRUE;
     }
     // NV-DXVK end
 

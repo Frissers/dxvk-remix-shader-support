@@ -49,6 +49,19 @@ namespace dxvk {
   }
 
   CameraType::Enum CameraManager::processCameraData(const DrawCallState& input) {
+    // NV-DXVK start: Debug camera processing
+    static uint32_t s_cameraProcessLogCount = 0;
+    if (s_cameraProcessLogCount++ < 10) {
+      const auto& vp = input.getTransformData().viewToProjection;
+      Logger::info(str::format("[CAMERA-PROCESS] Call #", s_cameraProcessLogCount,
+                               "\n  viewToProjection[0]=", vp[0],
+                               "\n  viewToProjection[1]=", vp[1],
+                               "\n  viewToProjection[2]=", vp[2],
+                               "\n  viewToProjection[3]=", vp[3],
+                               "\n  isIdentity=", isIdentityExact(vp)));
+    }
+    // NV-DXVK end
+
     // If theres no real camera data here - bail (unless forcing fake camera)
     if (isIdentityExact(input.getTransformData().viewToProjection)) {
       // Inject a fake camera if requested and no sky camera is present
@@ -250,6 +263,19 @@ namespace dxvk {
         }
       }
     } else {
+      // NV-DXVK start: Debug camera update
+      static uint32_t s_cameraUpdateLogCount = 0;
+      if (s_cameraUpdateLogCount++ < 10) {
+        Logger::info(str::format("[CAMERA-UPDATE] Calling camera.update #", s_cameraUpdateLogCount,
+                                 "\n  cameraType=", (int)cameraType,
+                                 "\n  frameId=", frameId,
+                                 "\n  fov=", decomposeProjectionParams.fov,
+                                 "\n  aspectRatio=", decomposeProjectionParams.aspectRatio,
+                                 "\n  nearPlane=", decomposeProjectionParams.nearPlane,
+                                 "\n  farPlane=", decomposeProjectionParams.farPlane));
+      }
+      // NV-DXVK end
+
       isCameraCut = camera.update(
         frameId,
         worldToView,
@@ -260,6 +286,14 @@ namespace dxvk {
         decomposeProjectionParams.farPlane,
         decomposeProjectionParams.isLHS
       );
+
+      // NV-DXVK start: Debug camera update result
+      if (s_cameraUpdateLogCount <= 10) {
+        Logger::info(str::format("[CAMERA-UPDATE-RESULT] Update #", s_cameraUpdateLogCount,
+                                 " isCameraCut=", isCameraCut,
+                                 " isValid=", camera.isValid(frameId)));
+      }
+      // NV-DXVK end
     }
 
 

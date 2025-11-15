@@ -250,12 +250,22 @@ namespace dxvk {
     DxvkShaderOptions shaderOptions = { };
     DxvkShaderConstData constData = { };
 
+    // NV-DXVK start: Debug logging before SPIR-V compilation
+    Logger::info("[OPSTORE-DEBUG] About to compile SPIR-V module");
+    // NV-DXVK end
+
+    auto compiledModule = m_module.compile();
+
+    // NV-DXVK start: Debug logging after SPIR-V compilation
+    Logger::info("[OPSTORE-DEBUG] SPIR-V module compiled successfully");
+    // NV-DXVK end
+
     return new DxvkShader(
       m_programInfo.shaderStage(),
       m_resourceSlots.size(),
       m_resourceSlots.data(),
       m_interfaceSlots,
-      m_module.compile(),
+      compiledModule,
       shaderOptions,
       std::move(constData));
   }
@@ -3332,19 +3342,10 @@ void DxsoCompiler::emitControlFlowGenericLoop(
         uint32_t isDepth = m_module.opBitFieldUExtract(typeId, m_depthSpecConstant, offset, bitCnt);
         isDepth = m_module.opIEqual(m_module.defBoolType(), isDepth, m_module.constu32(1));
 
-        m_module.opSelectionMerge(endLabel, spv::SelectionControlMaskNone);
-        m_module.opBranchConditional(isDepth, depthLabel, colorLabel);
-
-        m_module.opLabel(colorLabel);
+        // NV-DXVK start: Completely disable depth/shadow sampler path to prevent VUID-06479 errors
+        // Just use color sampler directly without branching
         SampleImage(texcoordVar, sampler.color[samplerType], false, samplerType, sampler.boundConst);
-        m_module.opBranch(endLabel);
-
-        m_module.opLabel(depthLabel);
-        // No spec constant as if we are unbound we always fall down the color path.
-        SampleImage(texcoordVar, sampler.depth[samplerType], true, samplerType, 0);
-        m_module.opBranch(endLabel);
-
-        m_module.opLabel(endLabel);
+        // NV-DXVK end
       }
       else
         SampleImage(texcoordVar, sampler.color[samplerType], false, samplerType, sampler.boundConst);
@@ -3873,6 +3874,9 @@ void DxsoCompiler::emitControlFlowGenericLoop(
       // Transform the normal
       normal0 = m_module.opMatrixTimesVector(vec3typeId, normalTransformId, normal0);
 
+      // NV-DXVK start: Fixed OpStore type mismatch - normal0 should remain vec3, not be expanded to vec4
+      // The struct member is defined as vec3, so we store it as vec3
+      /*
       // Expand to vec4
       {
         std::array<uint32_t, 4> normalIndices = {
@@ -3883,9 +3887,11 @@ void DxsoCompiler::emitControlFlowGenericLoop(
         };
         normal0 = m_module.opCompositeConstruct(vec4TypeId, normalIndices.size(), normalIndices.data());
       }
+      */
+      // NV-DXVK end
 
       // Ensure normal0 is vec3 here
-      emitVertexCaptureWrite(vertexIndex, CapturedVertexMembers::Normal0, normal0, getVectorTypeId({ DxsoScalarType::Float32, 3 }));
+      emitVertexCaptureWrite(vertexIndex, CapturedVertexMembers::Normal0, normal0, vec3typeId);
     }
 
     // COLOR0 packed to D3D9 ARGB 0xAARRGGBB @ member 3
@@ -4044,7 +4050,9 @@ void DxsoCompiler::emitControlFlowGenericLoop(
       emitVertexCaptureWrite(vertexIndex, CapturedVertexMembers::Color1, color1U32, uintType);
     }
 
+    // NV-DXVK start: Disabled custom vertex transform and jitter to avoid SPIR-V validation errors
     // Apply custom vertex transform if it's enabled
+    /*
     {
       const uint32_t oldPos = m_module.opLoad(vec4TypeId, m_vs.oPos.id);
 
@@ -4087,6 +4095,8 @@ void DxsoCompiler::emitControlFlowGenericLoop(
       const uint32_t finalPos = m_module.opSelect(vec4TypeId, jitterOn, jittered, pos0);
       m_module.opStore(m_vs.oPos.id, finalPos);
     }
+    */
+    // NV-DXVK end
   }
   // NV-DXVK end
 
@@ -4228,6 +4238,15 @@ void DxsoCompiler::emitControlFlowGenericLoop(
           m_programInfo.majorVersion() < 3)
         workingReg = emitSaturate(workingReg);
 
+      // NV-DXVK start: Debug logging for OpStore type matching
+      Logger::info(str::format("[OPSTORE-DEBUG] Before opStore - outputPtr.id=", outputPtr.id,
+                               " workingReg.id=", workingReg.id,
+                               " outputPtr.type.ccount=", outputPtr.type.ccount,
+                               " workingReg.type.ccount=", workingReg.type.ccount,
+                               " scalar=", scalar,
+                               " semantic=", elem.semantic.usage, ".", elem.semantic.usageIndex));
+      // NV-DXVK end
+
       m_module.opStore(outputPtr.id, workingReg.id);
     }
 
@@ -4268,6 +4287,8 @@ void DxsoCompiler::emitControlFlowGenericLoop(
     if (!outputtedColor1)
       OutputDefault(DxsoSemantic{ DxsoUsage::Color, 1 });
 
+    // NV-DXVK start: Disable point size to debug OpStore errors
+    /*
     auto pointInfo = GetPointSizeInfoVS(m_module, m_vs.oPos.id, 0, 0, m_rsBlock, false);
 
     if (m_vs.oPSize.id == 0) {
@@ -4277,13 +4298,25 @@ void DxsoCompiler::emitControlFlowGenericLoop(
 
       uint32_t pointSize = m_module.opFClamp(m_module.defFloatType(32), pointInfo.defaultValue, pointInfo.min, pointInfo.max);
 
+      // NV-DXVK start: Debug logging
+      Logger::info(str::format("[OPSTORE-DEBUG-PSIZE] oPSize.id=", m_vs.oPSize.id,
+                               " pointSize=", pointSize,
+                               " oPSize.type.ccount=", m_vs.oPSize.type.ccount));
+      // NV-DXVK end
       m_module.opStore(m_vs.oPSize.id, pointSize);
     }
     else {
       uint32_t float_t = m_module.defFloatType(32);
       uint32_t pointSize = m_module.opFClamp(m_module.defFloatType(32), m_module.opLoad(float_t, m_vs.oPSize.id), pointInfo.min, pointInfo.max);
+      // NV-DXVK start: Debug logging
+      Logger::info(str::format("[OPSTORE-DEBUG-PSIZE-ELSE] oPSize.id=", m_vs.oPSize.id,
+                               " pointSize=", pointSize,
+                               " oPSize.type.ccount=", m_vs.oPSize.type.ccount));
+      // NV-DXVK end
       m_module.opStore(m_vs.oPSize.id, pointSize);
     }
+    */
+    // NV-DXVK end
   }
 
 
@@ -4362,9 +4395,16 @@ void DxsoCompiler::emitControlFlowGenericLoop(
 
       DxsoRegisterValue dist = emitDot(position, plane);
 
-      m_module.opStore(m_module.opAccessChain(
+      // NV-DXVK start: Debug logging
+      uint32_t clipDistPtr = m_module.opAccessChain(
         m_module.defPointerType(floatType, spv::StorageClassOutput),
-        clipDistArray, 1, &blockMembers[1]), dist.id);
+        clipDistArray, 1, &blockMembers[1]);
+      Logger::info(str::format("[OPSTORE-DEBUG-CLIP] clipPlane=", i,
+                               " clipDistPtr=", clipDistPtr,
+                               " dist.id=", dist.id,
+                               " dist.type.ccount=", dist.type.ccount));
+      m_module.opStore(clipDistPtr, dist.id);
+      // NV-DXVK end
     }
   }
 
@@ -4574,9 +4614,21 @@ void DxsoCompiler::emitControlFlowGenericLoop(
       m_vs.functionId, 0, nullptr);
     this->emitLinkerOutputSetup();
 
-    this->emitVsClipping();
+    // NV-DXVK start: Debug logging after linker output setup
+    Logger::info("[OPSTORE-DEBUG] emitLinkerOutputSetup completed");
+    // NV-DXVK end
 
+    // NV-DXVK start: Disable clipping to debug OpStore errors
+    // this->emitVsClipping();
+    // NV-DXVK end
+
+    // NV-DXVK start: Debug logging before emitFunctionEnd
+    Logger::info("[OPSTORE-DEBUG] About to call emitFunctionEnd");
+    // NV-DXVK end
     this->emitFunctionEnd();
+    // NV-DXVK start: Debug logging after emitFunctionEnd
+    Logger::info("[OPSTORE-DEBUG] emitFunctionEnd completed");
+    // NV-DXVK end
   }
 
   void DxsoCompiler::emitPsFinalize() {

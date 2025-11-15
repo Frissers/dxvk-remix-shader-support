@@ -76,36 +76,40 @@ namespace dxvk::vk {
                                        ) {
     ScopedCpuProfileZone();
 
-    sync = m_semaphores.at(m_frameIndex);
-
     // NV-DXVK start: DLFG integration
     if (isDlfgPresenting) {
-      // DLFG manages swapchain images directly and can have more than one acquire outstanding at a time
+      // DLFG can have multiple acquires outstanding, need to acquire first to get image index
+      uint32_t acquiredIndex;
       m_acquireStatus = m_vkd->vkAcquireNextImageKHR(m_vkd->device(),
                                                      m_swapchain,
                                                      std::numeric_limits<uint64_t>::max(),
-                                                     sync.acquire,
+                                                     m_semaphores.at(m_frameIndex).acquire,
                                                      VK_NULL_HANDLE,
-                                                     &index);
+                                                     &acquiredIndex);
       assert(m_acquireStatus != VK_NOT_READY);
+
+      // Return the semaphore that was actually signaled by vkAcquireNextImageKHR
+      // This is indexed by m_frameIndex, NOT the acquired image index
+      sync = m_semaphores.at(m_frameIndex);
+      index = acquiredIndex;
     } else {
       // Don't acquire more than one image at a time
       if (m_acquireStatus == VK_NOT_READY) {
         m_acquireStatus = m_vkd->vkAcquireNextImageKHR(m_vkd->device(),
           m_swapchain, std::numeric_limits<uint64_t>::max(),
-          sync.acquire, VK_NULL_HANDLE, &m_imageIndex);
+          m_semaphores.at(m_frameIndex).acquire, VK_NULL_HANDLE, &m_imageIndex);
       }
+      // Return the semaphore that was actually signaled
+      sync = m_semaphores.at(m_frameIndex);
+      index = m_imageIndex;
     }
+    // NV-DXVK end
 
     if (m_acquireStatus == VK_ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT)
       acquireFullscreenExclusive();
 
     if (m_acquireStatus != VK_SUCCESS && m_acquireStatus != VK_SUBOPTIMAL_KHR)
       return m_acquireStatus;
-
-    if (!isDlfgPresenting) {
-      index = m_imageIndex;
-    }
 
     return m_acquireStatus;
   }
@@ -122,9 +126,10 @@ namespace dxvk::vk {
   ) {
     ScopedCpuProfileZone();
     // NV-DXVK start: DLFG integration
-    PresenterSync sync;
-    
-    sync = m_semaphores.at(m_frameIndex);
+    PresenterSync sync = m_semaphores.at(m_frameIndex);
+
+    // The present semaphore to wait on comes from submitCommandList which used the frame index
+    // But in future, should use per-image present semaphores to avoid reuse issues
     // NV-DXVK end
 
     VkPresentInfoKHR info;

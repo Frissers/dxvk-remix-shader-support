@@ -76,7 +76,21 @@ namespace dxvk {
         }
       } else if constexpr (Type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) {
         if (engineObject.defined()) {
-          descriptorInfos[idx] = engineObject.getDescriptor().buffer;
+          auto bufferInfo = engineObject.getDescriptor().buffer;
+
+          // NV-DXVK start: Align offset to minStorageBufferOffsetAlignment
+          // Vulkan spec requires storage buffer offsets to be aligned to minStorageBufferOffsetAlignment (typically 16 bytes)
+          const VkDeviceSize minAlignment = m_device->properties().core.properties.limits.minStorageBufferOffsetAlignment;
+          const VkDeviceSize originalOffset = bufferInfo.offset;
+          const VkDeviceSize alignedOffset = (originalOffset / minAlignment) * minAlignment;
+          const VkDeviceSize offsetDiff = originalOffset - alignedOffset;
+
+          // Adjust offset and range to maintain data validity
+          bufferInfo.offset = alignedOffset;
+          bufferInfo.range += offsetDiff;
+          // NV-DXVK end
+
+          descriptorInfos[idx] = bufferInfo;
           ctx->getCommandList()->trackResource<DxvkAccess::Read>(engineObject.buffer());
         }
       } else if constexpr (Type == VK_DESCRIPTOR_TYPE_SAMPLER) {
@@ -199,10 +213,12 @@ namespace dxvk {
 
   void BindlessResourceManager::createGlobalBindlessDescPool() {
     // Create bindless descriptor pool
-    static std::array<VkDescriptorPoolSize, Table::Count> pools = { {
+    // Note: Added UNIFORM_BUFFER to fix validation error when allocating descriptor sets
+    static std::array<VkDescriptorPoolSize, Table::Count + 1> pools = { {
         { VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,          kMaxBindlessResources * kMaxFramesInFlight },
         { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,         kMaxBindlessResources * kMaxFramesInFlight },
-        { VK_DESCRIPTOR_TYPE_SAMPLER,                kMaxBindlessResources * kMaxFramesInFlight }
+        { VK_DESCRIPTOR_TYPE_SAMPLER,                kMaxBindlessResources * kMaxFramesInFlight },
+        { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,         kMaxBindlessResources * kMaxFramesInFlight }
     } };
 
     VkDescriptorPoolCreateInfo info;

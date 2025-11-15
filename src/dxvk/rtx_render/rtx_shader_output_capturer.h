@@ -128,7 +128,7 @@ namespace dxvk {
 
   private:
     // Helper to get cache key for a draw call
-    // For RT replacements, use source texture hash; otherwise use material hash
+    // For RT replacements, use source texture hash; for RT feedback, use originalRT hash; otherwise use material hash
     // Returns a pair: (cacheKey, isValid)
     // isValid=false means the RT replacement texture is invalid and should be rejected
     std::pair<XXH64_hash_t, bool> getCacheKey(const DrawCallState& drawCallState) const {
@@ -138,6 +138,11 @@ namespace dxvk {
           return {replacementTexture.getImageHash(), true};
         }
         return {0, false}; // Invalid RT replacement
+      }
+      // Check for render target feedback case: no replacement found but slot 0 was a render target
+      // Use the originalRT hash as cache key to differentiate draws to different RTs
+      if (drawCallState.originalRenderTargetHash != 0) {
+        return {drawCallState.originalRenderTargetHash, true};
       }
       // For regular materials, hash can legitimately be 0, so it's always valid
       return {drawCallState.getMaterialData().getHash(), true};
@@ -162,6 +167,9 @@ namespace dxvk {
     // Per-frame capture counter
     uint32_t m_capturesThisFrame = 0;
 
+    // Frame counter for delaying RT feedback captures
+    uint32_t m_currentFrame = 0;
+
     // Create or get cached render target
     Resources::Resource getRenderTarget(
       Rc<RtxContext> ctx,
@@ -179,6 +187,7 @@ namespace dxvk {
 
     // Store captured output in cache
     void storeCapturedOutput(
+      Rc<RtxContext> ctx,
       const DrawCallState& drawCallState,
       const Resources::Resource& texture,
       uint32_t currentFrame);

@@ -4226,7 +4226,20 @@ namespace dxvk {
         if (newDepth)
           m_depthTextures |= 1u << StateSampler;
 
+        // NV-DXVK start: Debug logging for depth texture changes
+        Logger::info(str::format("[SAMPLER-DEBUG] SetTexture sampler=", StateSampler, " oldDepth=", oldDepth, " newDepth=", newDepth, " m_depthTextures=0x", std::hex, m_depthTextures, std::dec));
+        // NV-DXVK end
+
         m_dirtySamplerStates |= 1u << StateSampler;
+
+        // NV-DXVK start: Invalidate cached shadow sampler when switching between depth/color textures
+        // This ensures we don't use a cached shadow sampler with a color texture
+        if (!newDepth && oldDepth) {
+          D3D9SamplerKey oldKey = CreateSamplerKey(StateSampler);
+          m_samplers.erase(oldKey);
+          Logger::info(str::format("[SAMPLER-DEBUG] Erased cached sampler for slot ", StateSampler));
+        }
+        // NV-DXVK end
       }
 
       if (unlikely(m_fetch4Enabled & (1u << StateSampler) && !(m_fetch4 & (1u << StateSampler)))) {
@@ -4370,6 +4383,10 @@ namespace dxvk {
     key.MaxMipLevel = state[D3DSAMP_MAXMIPLEVEL];
     key.BorderColor = D3DCOLOR(state[D3DSAMP_BORDERCOLOR]);
     key.Depth = m_depthTextures & (1u << SamplerStage);
+
+    // NV-DXVK start: Debug logging for sampler creation
+    Logger::info(str::format("[SAMPLER-DEBUG] CreateSamplerKey sampler=", SamplerStage, " m_depthTextures=0x", std::hex, m_depthTextures, std::dec, " key.Depth=", key.Depth));
+    // NV-DXVK end
 
     if (m_d3d9Options.samplerAnisotropy != -1) {
       if (key.MagFilter == D3DTEXF_LINEAR)
@@ -6522,7 +6539,29 @@ namespace dxvk {
     ScopedCpuProfileZone();
     auto& state = m_state.samplerStates[Sampler];
 
-    const D3D9SamplerKey key = CreateSamplerKey(Sampler);
+    D3D9SamplerKey key = CreateSamplerKey(Sampler);
+
+    // NV-DXVK start: Disable depth comparison for non-depth/stencil formats
+    // Color formats don't support depth comparison sampling and will cause validation errors
+    if (key.Depth) {
+      D3D9CommonTexture* commonTex = GetCommonTexture(m_state.textures[Sampler]);
+      if (commonTex != nullptr) {
+        VkFormat format = commonTex->GetFormatMapping().FormatColor;
+        // Only depth/stencil formats support depth comparison
+        bool isDepthStencilFormat = (format >= VK_FORMAT_D16_UNORM && format <= VK_FORMAT_D32_SFLOAT_S8_UINT);
+
+        Logger::info(str::format("[SAMPLER-DEBUG] BindSampler sampler=", Sampler, " key.Depth=", key.Depth, " format=", format, " isDepthFormat=", isDepthStencilFormat));
+
+        if (!isDepthStencilFormat) {
+          // Disable depth comparison for color formats
+          Logger::info(str::format("[SAMPLER-DEBUG] Disabling depth comparison for sampler ", Sampler, " with color format"));
+          key.Depth = FALSE;
+        }
+      } else {
+        Logger::info(str::format("[SAMPLER-DEBUG] BindSampler sampler=", Sampler, " key.Depth=", key.Depth, " texture=NULL"));
+      }
+    }
+    // NV-DXVK end
 
     auto samplerInfo = RemapStateSamplerShader(Sampler);
 
@@ -6532,15 +6571,19 @@ namespace dxvk {
 
     EmitCs([this,
       cSlot = slot,
-      cKey  = key
+      cKey  = key,
+      cSamplerNum = Sampler
     ] (DxvkContext* ctx) {
       auto pair = m_samplers.find(cKey);
       if (pair != m_samplers.end()) {
+        Logger::info(str::format("[SAMPLER-DEBUG] Using cached sampler for slot ", cSamplerNum, " cKey.Depth=", cKey.Depth));
         ctx->bindResourceSampler(cSlot, pair->second);
         return;
       }
 
       DxvkSamplerCreateInfo info = DecodeSamplerKey(cKey);
+
+      Logger::info(str::format("[SAMPLER-DEBUG] Creating new sampler for slot ", cSamplerNum, " cKey.Depth=", cKey.Depth, " compareToDepth=", info.compareToDepth));
 
       try {
         auto sampler = m_dxvkDevice->createSampler(info);

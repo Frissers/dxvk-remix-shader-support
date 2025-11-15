@@ -398,6 +398,21 @@ namespace dxvk {
     transformData.viewToProjection = d3d9State().transforms[GetTransformIndex(D3DTS_PROJECTION)];
     transformData.objectToView = transformData.worldToView * transformData.objectToWorld;
 
+    // NV-DXVK start: Debug camera matrix capture
+    static uint32_t s_cameraMatrixLogCount = 0;
+    if (s_cameraMatrixLogCount++ < 5) {
+      Logger::info(str::format("[CAMERA-MATRIX-CAPTURE] Frame ", s_cameraMatrixLogCount,
+                               "\n  worldToView[0]=", transformData.worldToView[0],
+                               "\n  worldToView[1]=", transformData.worldToView[1],
+                               "\n  worldToView[2]=", transformData.worldToView[2],
+                               "\n  worldToView[3]=", transformData.worldToView[3],
+                               "\n  viewToProjection[0]=", transformData.viewToProjection[0],
+                               "\n  viewToProjection[1]=", transformData.viewToProjection[1],
+                               "\n  viewToProjection[2]=", transformData.viewToProjection[2],
+                               "\n  viewToProjection[3]=", transformData.viewToProjection[3]));
+    }
+    // NV-DXVK end
+
     // Some games pass invalid matrices which D3D9 apparently doesnt care about.
     // since we'll be doing inversions and other matrix operations, we need to 
     // sanitize those or there be nans.
@@ -1204,6 +1219,12 @@ namespace dxvk {
                                   " isRT=", isRT ? "YES" : "NO"));
         }
         if (tex0 && (tex0->GetType() == D3DRTYPE_TEXTURE || tex0->GetType() == D3DRTYPE_CUBETEXTURE) && isRT) {
+          // Store the original render target hash FIRST, before searching for replacements
+          // This is needed even when no replacement is found, for render target feedback detection
+          m_activeDrawCallState.originalRenderTargetHash = tex0->GetImage()->getHash();
+
+          Logger::info(str::format("[RT-SEARCH] Slot 0 is render target 0x", std::hex, tex0->GetImage()->getHash(), std::dec, ", searching alternatives..."));
+
           // Try slots in order: s7, s8, s15, s5, s3, s2, s1, s6
           const int candidateSlots[] = {7, 8, 15, 5, 3, 2, 1, 6};
           for (int slot : candidateSlots) {
@@ -1213,23 +1234,27 @@ namespace dxvk {
                 const auto desc = tex->Desc();
                 const bool isDepthStencil = (desc->Usage & D3DUSAGE_DEPTHSTENCIL) != 0;
                 const bool isTinyTexture = (desc->Width <= 1 && desc->Height <= 1);
-                if (!isCategorizedRenderTarget(tex) && !isDepthStencil && !isTinyTexture) {
+                const bool isRT = isCategorizedRenderTarget(tex);
+                const XXH64_hash_t texHash = tex->GetImage()->getHash();
+
+                Logger::info(str::format("[RT-SEARCH] Slot ", slot, ": hash=0x", std::hex, texHash, std::dec,
+                                        " size=", desc->Width, "x", desc->Height,
+                                        " isRT=", isRT, " isDepth=", isDepthStencil, " isTiny=", isTinyTexture));
+
+                if (!isRT && !isDepthStencil && !isTinyTexture) {
                   recommendedAlbedoSampler = slot;
                   // CRITICAL: Set renderTargetReplacementSlot so shader capturer knows this is a RT replacement
                   m_activeDrawCallState.renderTargetReplacementSlot = slot;
-                  // Store the original render target hash so we can register a replacement later
-                  m_activeDrawCallState.originalRenderTargetHash = tex0->GetImage()->getHash();
-                  // DEBUG: Log replacement texture hash to verify it's different from render target
-                  if (tex0 && tex0->GetImage()->getHash() == 0xc6702a5dbb13300c) {
-                    Logger::info(str::format("[RTX-RenderTargetFix-Detailed] tex0=0x", std::hex, tex0->GetImage()->getHash(),
-                                            " replacementSlot=", std::dec, slot,
-                                            " replacementTexHash=0x", std::hex, tex->GetImage()->getHash(), std::dec));
-                  } else {
-                    Logger::info(str::format("[RTX-RenderTargetFix] Slot 0 is render target, using slot ", slot, " instead"));
-                  }
+
+                  Logger::info(str::format("[RT-SEARCH] SELECTED slot ", slot, " hash=0x", std::hex, texHash, std::dec,
+                                          " to replace RT 0x", std::hex, tex0->GetImage()->getHash(), std::dec));
                   break;
+                } else {
+                  Logger::info(str::format("[RT-SEARCH] REJECTED slot ", slot, " - invalid candidate"));
                 }
               }
+            } else {
+              Logger::info(str::format("[RT-SEARCH] Slot ", slot, ": EMPTY"));
             }
           }
         }
@@ -1256,6 +1281,14 @@ namespace dxvk {
 
       D3D9CommonTexture* pTexInfo = GetCommonTexture(d3d9State().textures[stage]);
       assert(pTexInfo != nullptr);
+
+      // Log texture being added to material
+      static uint32_t texAddLogCount = 0;
+      if (++texAddLogCount <= 100) {
+        Logger::info(str::format("[TEX-ADD] textureID=", textureID, " stage=", stage,
+                                " hash=0x", std::hex, pTexInfo->GetImage()->getHash(), std::dec,
+                                " size=", pTexInfo->Desc()->Width, "x", pTexInfo->Desc()->Height));
+      }
 
       // Send the texture stage state for first texture slot (or 0th stage if no texture)
       if (textureID == 0) {
@@ -1396,6 +1429,14 @@ namespace dxvk {
 
     m_texcoordIndex = d3d9State().textureStages[firstStage][DXVK_TSS_TEXCOORDINDEX];
 
+    // Log final texture summary for this draw call
+    static uint32_t texSummaryCount = 0;
+    if (++texSummaryCount <= 100) {
+      Logger::info(str::format("[TEX-SUMMARY] DrawCall completed: firstStage=", firstStage,
+                              " renderTargetReplacementSlot=", m_activeDrawCallState.renderTargetReplacementSlot,
+                              " originalRT=0x", std::hex, m_activeDrawCallState.originalRenderTargetHash, std::dec));
+    }
+
     return true;
   }
 
@@ -1527,6 +1568,13 @@ namespace dxvk {
   }
 
   void D3D9Rtx::OnPresent(const Rc<DxvkImage>& targetImage) {
+    // NV-DXVK start: Debug logging for presented target
+    Logger::info(str::format("[RTX-PRESENT] Presenting to target: format=", targetImage->info().format,
+      " size=", targetImage->info().extent.width, "x", targetImage->info().extent.height,
+      " usage=", targetImage->info().usage,
+      " tiling=", targetImage->info().tiling));
+    // NV-DXVK end
+
     // Inform backend of present
     m_parent->EmitCs([targetImage](DxvkContext* ctx) { static_cast<RtxContext*>(ctx)->onPresent(targetImage); });
   }
@@ -1735,8 +1783,27 @@ bool D3D9Rtx::shouldCaptureFramebuffer() const {
 
     // Get render target properties
     const auto& rtInfo = srcRenderTarget->imageInfo();
-    const VkFormat format = rtInfo.format;
-    const VkExtent3D extent = rtInfo.extent;
+    VkFormat format = rtInfo.format;
+    VkExtent3D extent = rtInfo.extent;
+
+    // NV-DXVK start: Validate and fix invalid render target properties
+    if (extent.width == 0 || extent.height == 0 || extent.depth == 0) {
+      Logger::warn(str::format(
+        "D3D9Rtx: Fixing shader output capture texture with zero extent to 1x1:",
+        "\n  Original Extent: ", extent.width, "x", extent.height, "x", extent.depth,
+        "\n  Format: ", format));
+      if (extent.width == 0) extent.width = 1;
+      if (extent.height == 0) extent.height = 1;
+      if (extent.depth == 0) extent.depth = 1;
+    }
+
+    if (format == VK_FORMAT_UNDEFINED) {
+      Logger::warn(str::format(
+        "D3D9Rtx: Fixing shader output capture texture with undefined format to R8G8B8A8_UNORM:",
+        "\n  Extent: ", extent.width, "x", extent.height, "x", extent.depth));
+      format = VK_FORMAT_R8G8B8A8_UNORM;
+    }
+    // NV-DXVK end
 
     // Create a hash key for the cache based on format and dimensions
     XXH64_hash_t cacheKey = XXH64(&format, sizeof(format), 0);

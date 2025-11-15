@@ -59,7 +59,38 @@ namespace dxvk {
 
       formatList.pNext = &externalInfo;
     }
-    
+
+    // NV-DXVK start: Validate image parameters before creation
+    if (info.extent.width == 0 || info.extent.height == 0 || info.extent.depth == 0) {
+      throw DxvkError(str::format(
+        "DxvkImage: Invalid image extent (zero dimension):",
+        "\n  Type:            ", info.imageType,
+        "\n  Format:          ", info.format,
+        "\n  Extent:          ", "(", info.extent.width,
+                                 ",", info.extent.height,
+                                 ",", info.extent.depth, ")",
+        "\n  Mip levels:      ", info.mipLevels,
+        "\n  Array layers:    ", info.arrayLayers,
+        "\n  Samples:         ", info.samples,
+        "\n  Usage:           ", info.usage,
+        "\n  Tiling:          ", info.tiling));
+    }
+
+    if (info.format == VK_FORMAT_UNDEFINED) {
+      throw DxvkError(str::format(
+        "DxvkImage: Invalid format (VK_FORMAT_UNDEFINED):",
+        "\n  Type:            ", info.imageType,
+        "\n  Extent:          ", "(", info.extent.width,
+                                 ",", info.extent.height,
+                                 ",", info.extent.depth, ")",
+        "\n  Mip levels:      ", info.mipLevels,
+        "\n  Array layers:    ", info.arrayLayers,
+        "\n  Samples:         ", info.samples,
+        "\n  Usage:           ", info.usage,
+        "\n  Tiling:          ", info.tiling));
+    }
+    // NV-DXVK end
+
     if (m_vkd->vkCreateImage(m_vkd->device(),
           &info, nullptr, &m_image.image) != VK_SUCCESS) {
       throw DxvkError(str::format(

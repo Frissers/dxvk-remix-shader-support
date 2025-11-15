@@ -4775,10 +4775,24 @@ namespace dxvk {
         
         case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
           if (res.imageView != nullptr && res.imageView->handle(binding.view) != VK_NULL_HANDLE) {
+            bool isDepthStencil = res.imageView->info().aspect & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT);
+            const auto& imgInfo = res.imageView->imageInfo();
+            VkImageLayout requestedLayout = isDepthStencil ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL
+                                                           : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            VkImageLayout layout = res.imageView->image()->pickLayout(requestedLayout);
+
+            if (isDepthStencil) {
+              Logger::info(str::format("[LAYOUT] SAMPLED_IMAGE slot=", binding.slot,
+                                       " img=", res.imageView->image()->handle(),
+                                       " imgInfo.layout=", imgInfo.layout,
+                                       " requested=", requestedLayout,
+                                       " picked=", layout));
+            }
+
             descriptors[i].image.sampler     = VK_NULL_HANDLE;
             descriptors[i].image.imageView   = res.imageView->handle(binding.view);
-            descriptors[i].image.imageLayout = res.imageView->imageInfo().layout;
-            
+            descriptors[i].image.imageLayout = layout;
+
             if (m_rcTracked.set(binding.slot)) {
               m_cmd->trackResource<DxvkAccess::None>(res.imageView);
               m_cmd->trackResource<DxvkAccess::Read>(res.imageView->image());
@@ -4794,8 +4808,9 @@ namespace dxvk {
           if (res.imageView != nullptr && res.imageView->handle(binding.view) != VK_NULL_HANDLE) {
             descriptors[i].image.sampler     = VK_NULL_HANDLE;
             descriptors[i].image.imageView   = res.imageView->handle(binding.view);
-            descriptors[i].image.imageLayout = res.imageView->imageInfo().layout;
-            
+            // Storage images always use GENERAL layout
+            descriptors[i].image.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
             if (m_rcTracked.set(binding.slot)) {
               m_cmd->trackResource<DxvkAccess::None>(res.imageView);
               m_cmd->trackResource<DxvkAccess::Write>(res.imageView->image());
@@ -4810,10 +4825,24 @@ namespace dxvk {
         case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:
           if (res.sampler != nullptr && res.imageView != nullptr
            && res.imageView->handle(binding.view) != VK_NULL_HANDLE) {
+            bool isDepthStencil = res.imageView->info().aspect & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT);
+            const auto& imgInfo = res.imageView->imageInfo();
+            VkImageLayout requestedLayout = isDepthStencil ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL
+                                                           : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            VkImageLayout layout = res.imageView->image()->pickLayout(requestedLayout);
+
+            if (isDepthStencil) {
+              Logger::info(str::format("[LAYOUT] COMBINED_IMAGE_SAMPLER slot=", binding.slot,
+                                       " img=", res.imageView->image()->handle(),
+                                       " imgInfo.layout=", imgInfo.layout,
+                                       " requested=", requestedLayout,
+                                       " picked=", layout));
+            }
+
             descriptors[i].image.sampler     = res.sampler->handle();
             descriptors[i].image.imageView   = res.imageView->handle(binding.view);
-            descriptors[i].image.imageLayout = res.imageView->imageInfo().layout;
-            
+            descriptors[i].image.imageLayout = layout;
+
             if (m_rcTracked.set(binding.slot)) {
               m_cmd->trackResource<DxvkAccess::None>(res.sampler);
               m_cmd->trackResource<DxvkAccess::None>(res.imageView);
@@ -4824,7 +4853,7 @@ namespace dxvk {
             // NV-DXVK start: use null handles instead of dummy resources
             descriptors[i].image = m_common->dummyResources().samplerDescriptor();
             // NV-DXVK end
-          } 
+          }
           break;
         
         case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER:
@@ -4858,7 +4887,18 @@ namespace dxvk {
         case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
           if (res.bufferSlice.defined()) {
             descriptors[i] = res.bufferSlice.getDescriptor();
-            
+
+            // NV-DXVK start: Align offset to minUniformBufferOffsetAlignment
+            // Vulkan spec requires uniform buffer offsets to be aligned to minUniformBufferOffsetAlignment
+            const VkDeviceSize minAlignment = m_device->properties().core.properties.limits.minUniformBufferOffsetAlignment;
+            const VkDeviceSize originalOffset = descriptors[i].buffer.offset;
+            const VkDeviceSize alignedOffset = (originalOffset / minAlignment) * minAlignment;
+            const VkDeviceSize offsetDiff = originalOffset - alignedOffset;
+
+            descriptors[i].buffer.offset = alignedOffset;
+            descriptors[i].buffer.range += offsetDiff;
+            // NV-DXVK end
+
             if (m_rcTracked.set(binding.slot))
               m_cmd->trackResource<DxvkAccess::Read>(res.bufferSlice.buffer());
           } else {
@@ -4869,7 +4909,18 @@ namespace dxvk {
         case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
           if (res.bufferSlice.defined()) {
             descriptors[i] = res.bufferSlice.getDescriptor();
-            
+
+            // NV-DXVK start: Align offset to minStorageBufferOffsetAlignment
+            // Vulkan spec requires storage buffer offsets to be aligned to minStorageBufferOffsetAlignment
+            const VkDeviceSize minAlignment = m_device->properties().core.properties.limits.minStorageBufferOffsetAlignment;
+            const VkDeviceSize originalOffset = descriptors[i].buffer.offset;
+            const VkDeviceSize alignedOffset = (originalOffset / minAlignment) * minAlignment;
+            const VkDeviceSize offsetDiff = originalOffset - alignedOffset;
+
+            descriptors[i].buffer.offset = alignedOffset;
+            descriptors[i].buffer.range += offsetDiff;
+            // NV-DXVK end
+
             if (m_rcTracked.set(binding.slot))
               m_cmd->trackResource<DxvkAccess::Write>(res.bufferSlice.buffer());
           } else {

@@ -1205,6 +1205,14 @@ namespace dxvk {
     auto swapImage = m_backBuffers[0]->GetCommonTexture()->GetImage();
     auto swapImageView = m_backBuffers[0]->GetImageView(false);
 
+    // NV-DXVK start: Debug logging for present image
+    Logger::info(str::format("[PRESENT-DEBUG] Frame #", m_frameId,
+      " presenting image: format=", swapImage->info().format,
+      " size=", swapImage->info().extent.width, "x", swapImage->info().extent.height,
+      " mips=", swapImage->info().mipLevels,
+      " layers=", swapImage->info().numLayers));
+    // NV-DXVK end
+
     // Bump our frame id.
     ++m_frameId;
     SyncFrameLatency();
@@ -1250,7 +1258,16 @@ namespace dxvk {
       VkRect2D dstRect = {
         {  int32_t(m_dstRect.left),                    int32_t(m_dstRect.top)                    },
         { uint32_t(m_dstRect.right - m_dstRect.left), uint32_t(m_dstRect.bottom - m_dstRect.top) } };
-      
+
+      // NV-DXVK start: Debug logging for blit operation
+      Logger::info(str::format("[PRESENT-BLIT] srcRect=[", srcRect.offset.x, ",", srcRect.offset.y,
+        " ", srcRect.extent.width, "x", srcRect.extent.height, "]",
+        " dstRect=[", dstRect.offset.x, ",", dstRect.offset.y,
+        " ", dstRect.extent.width, "x", dstRect.extent.height, "]",
+        " swapchainImage=", imageIndex,
+        " swapchainFormat=", info.format.format,
+        " swapchainColorSpace=", info.format.colorSpace));
+      // NV-DXVK end
 
       m_blitter->presentImage(m_context.ptr(),
         m_imageViews.at(imageIndex), dstRect,
