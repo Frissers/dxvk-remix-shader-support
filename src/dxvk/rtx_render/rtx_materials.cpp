@@ -62,6 +62,7 @@ template<> OpaqueMaterialData LegacyMaterialData::as() const {
   if (LegacyMaterialDefaults::useAlbedoTextureIfPresent()) {
     opaqueMat.setAlbedoOpacityTexture(getColorTexture());
   }
+
   // Indicate that we have an exact sampler to use on this material, directly from game
   if (getSampler().ptr()) {
     opaqueMat.setSamplerOverride(getSampler());

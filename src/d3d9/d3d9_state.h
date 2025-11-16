@@ -333,10 +333,34 @@ namespace dxvk {
           size_t size = Count * sizeof(Vector4);
 
           std::memcpy(set.fConsts[StartRegister].data, pConstantData, size);
+
+          // DEBUG: Verify memcpy succeeded for transformation matrices
+          static uint32_t updateStateLogCount = 0;
+          if (updateStateLogCount < 10 && StartRegister <= 3 && (StartRegister + Count) > 0) {
+            updateStateLogCount++;
+            Logger::info(str::format("[UPDATE-STATE-CONSTS] #", updateStateLogCount, " AFTER memcpy - verifying data stored in set.fConsts:"));
+            for (UINT i = 0; i < Count && (StartRegister + i) < 4; i++) {
+              const Vector4& stored = set.fConsts[StartRegister + i];
+              Logger::info(str::format("[UPDATE-STATE-CONSTS]   set.fConsts[", StartRegister + i, "] = (",
+                                      stored.x, ", ", stored.y, ", ", stored.z, ", ", stored.w, ")"));
+            }
+          }
         }
         else {
           for (UINT i = 0; i < Count; i++)
             set.fConsts[StartRegister + i] = replaceNaN(Vector4{ pConstantData + (i * 4) });
+
+          // DEBUG: Verify data stored for transformation matrices
+          static uint32_t updateStateLogCountEmu = 0;
+          if (updateStateLogCountEmu < 10 && StartRegister <= 3 && (StartRegister + Count) > 0) {
+            updateStateLogCountEmu++;
+            Logger::info(str::format("[UPDATE-STATE-CONSTS-EMU] #", updateStateLogCountEmu, " AFTER replaceNaN - verifying data stored:"));
+            for (UINT i = 0; i < Count && (StartRegister + i) < 4; i++) {
+              const Vector4& stored = set.fConsts[StartRegister + i];
+              Logger::info(str::format("[UPDATE-STATE-CONSTS-EMU]   set.fConsts[", StartRegister + i, "] = (",
+                                      stored.x, ", ", stored.y, ", ", stored.z, ", ", stored.w, ")"));
+            }
+          }
         }
       }
       else if constexpr (ConstantType == D3D9ConstantType::Int) {

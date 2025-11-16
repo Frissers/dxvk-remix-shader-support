@@ -3315,6 +3315,21 @@ namespace dxvk {
     ScopedCpuProfileZone();
     D3D9DeviceLock lock = LockDevice();
 
+    // DEBUG: Log when game sets VS constants c[0]-c[3] (transformation matrices)
+    static uint32_t setVSConstLogCount = 0;
+    if (setVSConstLogCount < 10 && StartRegister <= 3 && (StartRegister + Vector4fCount) > 0 && pConstantData != nullptr) {
+      setVSConstLogCount++;
+      Logger::info(str::format("[SET-VS-CONST] #", setVSConstLogCount, " Game calling SetVertexShaderConstantF:"));
+      Logger::info(str::format("[SET-VS-CONST]   StartRegister=", StartRegister, " Vector4fCount=", Vector4fCount));
+
+      // Log the actual constant values being set
+      for (uint32_t i = 0; i < Vector4fCount && (StartRegister + i) < 4; i++) {
+        const float* vec = &pConstantData[i * 4];
+        Logger::info(str::format("[SET-VS-CONST]   c[", StartRegister + i, "] = (",
+                                vec[0], ", ", vec[1], ", ", vec[2], ", ", vec[3], ")"));
+      }
+    }
+
     return SetShaderConstants<
       DxsoProgramTypes::VertexShader,
       D3D9ConstantType::Float>(
@@ -3665,6 +3680,23 @@ namespace dxvk {
     UINT   Vector4fCount) {
     ScopedCpuProfileZone();
     D3D9DeviceLock lock = LockDevice();
+
+    // TARGETED DEBUG: Log first 10 SetPixelShaderConstantF calls to see if game sets PS constants
+    static uint32_t setCallCount = 0;
+    if (++setCallCount <= 10) {
+      Logger::info(str::format("[SET-PS-CONST] Call #", setCallCount,
+                              " StartReg=", StartRegister, " Count=", Vector4fCount));
+      if (pConstantData && Vector4fCount > 0) {
+        Logger::info(str::format("[SET-PS-CONST]   c[", StartRegister, "] = (",
+                                pConstantData[0], ", ", pConstantData[1], ", ",
+                                pConstantData[2], ", ", pConstantData[3], ")"));
+        if (Vector4fCount > 1) {
+          Logger::info(str::format("[SET-PS-CONST]   c[", StartRegister + 1, "] = (",
+                                  pConstantData[4], ", ", pConstantData[5], ", ",
+                                  pConstantData[6], ", ", pConstantData[7], ")"));
+        }
+      }
+    }
 
     return SetShaderConstants <
       DxsoProgramTypes::PixelShader,

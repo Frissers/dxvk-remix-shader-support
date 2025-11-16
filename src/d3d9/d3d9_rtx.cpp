@@ -854,7 +854,17 @@ namespace dxvk {
 
   void D3D9Rtx::CommitGeometryToRT(const DrawContext& drawContext) {
     ScopedCpuProfileZone();
-    auto drawInfo = m_parent->GenerateDrawInfo(drawContext.PrimitiveType, drawContext.PrimitiveCount, m_parent->GetInstanceCount());
+    const uint32_t d3d9InstanceCount = m_parent->GetInstanceCount();
+    auto drawInfo = m_parent->GenerateDrawInfo(drawContext.PrimitiveType, drawContext.PrimitiveCount, d3d9InstanceCount);
+
+    // CRITICAL DEBUG: Log instance counts
+    static uint32_t commitLogCount = 0;
+    if (++commitLogCount <= 20) {
+      Logger::info(str::format("[INSTANCE-DEBUG] CommitGeometryToRT #", commitLogCount,
+                              " d3d9InstanceCount=", d3d9InstanceCount,
+                              " drawInfo.instanceCount=", drawInfo.instanceCount,
+                              " indexed=", drawContext.Indexed));
+    }
 
     DrawParameters params;
     params.instanceCount = drawInfo.instanceCount;
@@ -1580,6 +1590,12 @@ namespace dxvk {
   }
 
   void D3D9Rtx::captureOriginalD3D9Buffers(const Direct3DState9& state) {
+    // DEBUG: Log timing to compare with SetVertexShaderConstantF calls
+    static uint32_t captureTimingLogCount = 0;
+    if (++captureTimingLogCount <= 10) {
+      Logger::info(str::format("[CAPTURE-TIMING] #", captureTimingLogCount, " captureOriginalD3D9Buffers CALLED - starting capture"));
+    }
+
     // Clear previous captures
     m_activeDrawCallState.capturedVertexStreams.clear();
     m_activeDrawCallState.capturedVertexElements.clear();
@@ -1600,8 +1616,36 @@ namespace dxvk {
     if (state.vertexShader != nullptr) {
       const uint32_t vsConstantCount = caps::MaxFloatConstantsVS; // 256 constants
       m_activeDrawCallState.vertexShaderConstantData.resize(vsConstantCount);
+
+      // DEBUG: Log VS constants BEFORE copy - check c[0]-c[15] where transformation matrices should be
+      static uint32_t vsConstLogCount = 0;
+      if (++vsConstLogCount <= 5) {
+        Logger::info(str::format("[VS-CONST-CAPTURE] #", vsConstLogCount, " BEFORE memcpy:"));
+        Logger::info(str::format("[VS-CONST-CAPTURE]   Transformation matrices (should be non-zero):"));
+        for (uint32_t i = 0; i < 16 && i < vsConstantCount; i++) {
+          Logger::info(str::format("[VS-CONST-CAPTURE]   state.vsConsts.fConsts[", i, "] = (",
+                                  state.vsConsts.fConsts[i].x, ", ", state.vsConsts.fConsts[i].y, ", ",
+                                  state.vsConsts.fConsts[i].z, ", ", state.vsConsts.fConsts[i].w, ")"));
+        }
+        Logger::info(str::format("[VS-CONST-CAPTURE]   vsConstantCount=", vsConstantCount));
+      }
+
       // Copy from fConsts array (float constants)
       memcpy(m_activeDrawCallState.vertexShaderConstantData.data(), state.vsConsts.fConsts, vsConstantCount * sizeof(Vector4));
+
+      // DEBUG: Log VS constants AFTER copy
+      if (vsConstLogCount <= 5) {
+        Logger::info(str::format("[VS-CONST-CAPTURE] #", vsConstLogCount, " AFTER memcpy:"));
+        Logger::info(str::format("[VS-CONST-CAPTURE]   Copied transformation matrices:"));
+        for (uint32_t i = 0; i < 16 && i < vsConstantCount; i++) {
+          Logger::info(str::format("[VS-CONST-CAPTURE]   vertexShaderConstantData[", i, "] = (",
+                                  m_activeDrawCallState.vertexShaderConstantData[i].x, ", ",
+                                  m_activeDrawCallState.vertexShaderConstantData[i].y, ", ",
+                                  m_activeDrawCallState.vertexShaderConstantData[i].z, ", ",
+                                  m_activeDrawCallState.vertexShaderConstantData[i].w, ")"));
+        }
+      }
+
     } else {
       m_activeDrawCallState.vertexShaderConstantData.clear();
     }
@@ -1610,10 +1654,48 @@ namespace dxvk {
     if (state.pixelShader != nullptr) {
       const uint32_t psConstantCount = caps::MaxFloatConstantsPS; // 224 constants
       m_activeDrawCallState.pixelShaderConstantData.resize(psConstantCount);
+
+      // TARGETED DEBUG: Log PS constants BEFORE copy - check c[30], c[150], c[180] where game sets values
+      static uint32_t psConstLogCount = 0;
+      if (++psConstLogCount <= 5) {
+        Logger::info(str::format("[PS-CONST-CAPTURE] #", psConstLogCount, " BEFORE memcpy:"));
+        Logger::info(str::format("[PS-CONST-CAPTURE]   state.psConsts.fConsts[30] = (",
+                                state.psConsts.fConsts[30].x, ", ", state.psConsts.fConsts[30].y, ", ",
+                                state.psConsts.fConsts[30].z, ", ", state.psConsts.fConsts[30].w, ")"));
+        Logger::info(str::format("[PS-CONST-CAPTURE]   state.psConsts.fConsts[150] = (",
+                                state.psConsts.fConsts[150].x, ", ", state.psConsts.fConsts[150].y, ", ",
+                                state.psConsts.fConsts[150].z, ", ", state.psConsts.fConsts[150].w, ")"));
+        Logger::info(str::format("[PS-CONST-CAPTURE]   state.psConsts.fConsts[180] = (",
+                                state.psConsts.fConsts[180].x, ", ", state.psConsts.fConsts[180].y, ", ",
+                                state.psConsts.fConsts[180].z, ", ", state.psConsts.fConsts[180].w, ")"));
+        Logger::info(str::format("[PS-CONST-CAPTURE]   psConstantCount=", psConstantCount));
+      }
+
       // Copy from fConsts array (float constants)
       memcpy(m_activeDrawCallState.pixelShaderConstantData.data(), state.psConsts.fConsts, psConstantCount * sizeof(Vector4));
+
+      // TARGETED DEBUG: Log PS constants AFTER copy
+      if (psConstLogCount <= 5) {
+        Logger::info(str::format("[PS-CONST-CAPTURE] #", psConstLogCount, " AFTER memcpy:"));
+        Logger::info(str::format("[PS-CONST-CAPTURE]   pixelShaderConstantData[30] = (",
+                                m_activeDrawCallState.pixelShaderConstantData[30].x, ", ",
+                                m_activeDrawCallState.pixelShaderConstantData[30].y, ", ",
+                                m_activeDrawCallState.pixelShaderConstantData[30].z, ", ",
+                                m_activeDrawCallState.pixelShaderConstantData[30].w, ")"));
+        Logger::info(str::format("[PS-CONST-CAPTURE]   pixelShaderConstantData[150] = (",
+                                m_activeDrawCallState.pixelShaderConstantData[150].x, ", ",
+                                m_activeDrawCallState.pixelShaderConstantData[150].y, ", ",
+                                m_activeDrawCallState.pixelShaderConstantData[150].z, ", ",
+                                m_activeDrawCallState.pixelShaderConstantData[150].w, ")"));
+        Logger::info(str::format("[PS-CONST-CAPTURE]   pixelShaderConstantData[180] = (",
+                                m_activeDrawCallState.pixelShaderConstantData[180].x, ", ",
+                                m_activeDrawCallState.pixelShaderConstantData[180].y, ", ",
+                                m_activeDrawCallState.pixelShaderConstantData[180].z, ", ",
+                                m_activeDrawCallState.pixelShaderConstantData[180].w, ")"));
+      }
     } else {
       m_activeDrawCallState.pixelShaderConstantData.clear();
+      Logger::info("[PS-CONST-CAPTURE] No pixel shader - constants cleared");
     }
 
     // Bail if no vertex declaration
@@ -1699,7 +1781,19 @@ namespace dxvk {
       Logger::info(str::format("[OPTION-A-CAPTURE] Successfully captured stream ", elem.Stream,
                               " - stride=", captured.stride,
                               " bytes=", captured.data.size()));
+
+      // CRITICAL FIX: Set originalVertexStride from first captured stream (stream 0)
+      // This is used by shader re-execution (Option C) to replay vertex buffers
+      if (elem.Stream == 0 && m_activeDrawCallState.originalVertexStride == 0) {
+        m_activeDrawCallState.originalVertexStride = captured.stride;
+        Logger::info(str::format("[OPTION-A-CAPTURE] Set originalVertexStride=", captured.stride,
+                                " from stream 0 (CRITICAL for shader re-execution)"));
+      }
     }
+
+    // Log final originalVertexStride value after all streams captured
+    Logger::info(str::format("[OPTION-A-CAPTURE] FINAL originalVertexStride=", m_activeDrawCallState.originalVertexStride,
+                            " (captured ", m_activeDrawCallState.capturedVertexStreams.size(), " streams)"));
 
     // Capture index buffer if present AND the draw uses indices
     if (state.indices != nullptr && m_activeDrawCallState.geometryData.indexCount > 0) {
@@ -1762,6 +1856,17 @@ namespace dxvk {
                                   " bytes=", bytes, " bufferSize=", ibo->Desc()->Size));
         }
       }
+    }
+
+    // CRITICAL FIX: Validate VS constants AFTER vertex buffer capture completes
+    // If matrices are invalid (all zeros), clear ALL captured data to mark it as invalid
+    // But DON'T return early - we've already done the capture work
+    if (!ShaderOutputCapturer::shouldCaptureStatic(m_activeDrawCallState)) {
+      Logger::warn("[OPTION-A-CAPTURE] ⚠️ VS constants validation FAILED after capture - clearing all data");
+      m_activeDrawCallState.vertexShaderConstantData.clear();
+      m_activeDrawCallState.capturedVertexStreams.clear();
+      m_activeDrawCallState.capturedVertexElements.clear();
+      m_activeDrawCallState.originalIndexData.clear();
     }
 
     // FINAL SUMMARY LOG

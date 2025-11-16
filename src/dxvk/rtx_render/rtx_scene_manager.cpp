@@ -1230,7 +1230,15 @@ namespace dxvk {
                                   " capturedVertexStreams.size=", drawCallState.capturedVertexStreams.size()));
         }
 
-        DrawParameters drawParams; // TODO: Fill this from drawCallState if needed
+        DrawParameters drawParams;
+        // CRITICAL FIX: Fill basic draw parameters from geometry data
+        // Non-instanced draws must have instanceCount=1 (not 0!)
+        drawParams.vertexCount = drawCallState.geometryData.vertexCount;
+        drawParams.indexCount = drawCallState.geometryData.indexCount;
+        drawParams.instanceCount = 1; // Non-instanced draw
+        drawParams.firstIndex = 0;
+        drawParams.vertexOffset = 0;
+
         DxvkRaytracingInstanceState rtState; // TODO: Fill this if needed
         Rc<RtxContext> rtxCtx = reinterpret_cast<Rc<RtxContext>&>(ctx);
 
