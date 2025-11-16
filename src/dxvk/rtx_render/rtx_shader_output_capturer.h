@@ -153,16 +153,115 @@ namespace dxvk {
       XXH64_hash_t geometryHash;
       XXH64_hash_t materialHash;
       uint32_t lastCaptureFrame;
+      uint32_t captureSubmittedFrame;  // Frame when capture was submitted to GPU
       bool isDynamic;
+      bool isPending;                   // True if GPU hasn't finished capture yet
       VkExtent2D resolution;
     };
 
-    // Storage for captured outputs
-    fast_unordered_cache<CapturedShaderOutput> m_capturedOutputs;
+    // Storage for captured outputs (mutable to allow updating isPending flag from const functions)
+    mutable fast_unordered_cache<CapturedShaderOutput> m_capturedOutputs;
 
     // PROPER TEXTURE REPLACEMENT: Map from original RT texture hash to captured replacement texture
     // When the game references originalTextureHash, we return replacementTexture instead
     std::unordered_map<XXH64_hash_t, TextureRef> m_textureReplacements;
+
+    // ======== GPU-DRIVEN MULTI-INDIRECT CAPTURE SYSTEM (MegaGeometry-style) ========
+
+    // GPU Capture Request - SELF-CONTAINED (no pointers, all data copied)
+    // This struct owns all the data needed for capture, avoiding dangling pointer issues
+    struct GpuCaptureRequest {
+      XXH64_hash_t materialHash;      // Material to capture
+      XXH64_hash_t geometryHash;      // Geometry hash
+      XXH64_hash_t textureHash;       // Primary texture hash
+      uint32_t drawCallIndex;         // Index into draw call data
+      uint32_t renderTargetIndex;     // Index into RT pool
+      uint32_t vertexOffset;          // Vertex buffer offset
+      uint32_t vertexCount;           // Number of vertices
+      uint32_t indexOffset;           // Index buffer offset  (if indexed)
+      uint32_t indexCount;            // Number of indices (if indexed)
+      VkExtent2D resolution;          // Capture resolution
+      uint32_t flags;                 // Capture flags (indexed, dynamic, etc.)
+      bool isDynamic = false;         // Is this a dynamic material?
+
+      // GEOMETRY DATA (Rc-counted, safe to copy)
+      DxvkBufferSlice vertexBuffer;   // Position buffer
+      DxvkBufferSlice indexBuffer;    // Index buffer (if indexed)
+      DxvkBufferSlice texcoordBuffer; // UV buffer
+      DxvkBufferSlice normalBuffer;   // Normal buffer
+      uint32_t vertexStride = 0;      // Vertex buffer stride
+      uint32_t texcoordStride = 0;    // Texcoord buffer stride
+      VkIndexType indexType = VK_INDEX_TYPE_NONE_KHR;  // Index type
+
+      // TEXTURE DATA (Rc-counted, safe to copy)
+      TextureRef colorTexture;        // Primary color texture
+
+      // VIEWPORT/SCISSOR STATE
+      VkViewport viewport;
+      VkRect2D scissor;
+
+      // REPLACEMENT BUFFER SUPPORT (optional)
+      DxvkBufferSlice replacementVertexBuffer;
+      DxvkBufferSlice replacementTexcoordBuffer;
+      DxvkBufferSlice replacementNormalBuffer;
+      DxvkBufferSlice replacementIndexBuffer;
+      uint32_t replacementVertexStride = 0;
+      uint32_t replacementTexcoordStride = 0;
+      VkIndexType replacementIndexType = VK_INDEX_TYPE_NONE_KHR;
+    };
+
+    // Indirect Draw Args - filled by GPU compute shader
+    struct IndirectDrawArgs {
+      uint32_t vertexCount;
+      uint32_t instanceCount;
+      uint32_t firstVertex;
+      uint32_t firstInstance;
+    };
+
+    // Indirect Indexed Draw Args - for indexed draws
+    struct IndirectIndexedDrawArgs {
+      uint32_t indexCount;
+      uint32_t instanceCount;
+      uint32_t firstIndex;
+      int32_t  vertexOffset;
+      uint32_t firstInstance;
+    };
+
+    // GPU Counters - atomic counters for GPU work tracking
+    struct GpuCaptureCounters {
+      uint32_t totalCaptureRequests;    // Total requests queued
+      uint32_t processedCaptures;       // Captures executed
+      uint32_t skippedCaptures;         // Captures skipped (already cached)
+      uint32_t failedCaptures;          // Captures that failed
+      uint32_t padding[12];             // Align to cache line
+    };
+
+    // Persistent render target pool (pre-allocated, MegaGeometry-style)
+    static constexpr uint32_t kMaxRenderTargetPoolSize = 2048;
+    std::vector<Resources::Resource> m_renderTargetPool;
+    uint32_t m_renderTargetPoolSize = 0;
+    uint32_t m_nextRenderTargetIndex = 0;
+
+    // GPU buffers for multi-indirect dispatch
+    DxvkBufferSlice m_captureRequestsBuffer;      // GpuCaptureRequest array
+    DxvkBufferSlice m_indirectDrawArgsBuffer;     // IndirectDrawArgs array (GPU fills this)
+    DxvkBufferSlice m_indirectIndexedDrawArgsBuffer; // IndirectIndexedDrawArgs array
+    DxvkBufferSlice m_captureCountersBuffer;      // GpuCaptureCounters (GPU atomics)
+
+    // CPU-side request queue (built during frame, uploaded to GPU)
+    std::vector<GpuCaptureRequest> m_pendingCaptureRequests;
+
+    // GPU-driven capture pipeline
+    void initializeGpuCaptureSystem(Rc<RtxContext> ctx);
+    void shutdownGpuCaptureSystem();
+    void allocateRenderTargetPool(Rc<RtxContext> ctx);
+    void buildGpuCaptureList(Rc<RtxContext> ctx);
+    void executeMultiIndirectCaptures(Rc<RtxContext> ctx);
+    Resources::Resource allocateRenderTargetFromPool(Rc<RtxContext> ctx, VkExtent2D resolution, VkFormat format);
+
+    // Helper functions for maximum performance batching
+    void setCommonPipelineState(Rc<RtxContext> ctx, const GpuCaptureRequest& request);
+    void bindGeometryBuffers(Rc<RtxContext> ctx, const GpuCaptureRequest& request);
 
     // Per-frame capture counter
     uint32_t m_capturesThisFrame = 0;

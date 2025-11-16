@@ -359,7 +359,7 @@ namespace dxvk {
     DxvkExt khrExternalSemaphore              = { VK_KHR_EXTERNAL_SEMAPHORE_EXTENSION_NAME,                 DxvkExtMode::Optional };
     DxvkExt khrExternalSemaphoreWin32         = { VK_KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION_NAME,           DxvkExtMode::Optional };
     DxvkExt extBufferDeviceAddress            = { VK_EXT_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME,              DxvkExtMode::Optional };
-    DxvkExt nvPresentMetering                 = { VK_NV_PRESENT_METERING_EXTENSION_NAME,                    DxvkExtMode::Optional };
+    DxvkExt nvPresentMetering                 = { VK_NV_PRESENT_METERING_EXTENSION_NAME,                    DxvkExtMode::Disabled };  // TEMP: Disabled for Nsight debugging - change back to Optional when done
     // NV-DXVK end
 
     // NV-DXVK start:
