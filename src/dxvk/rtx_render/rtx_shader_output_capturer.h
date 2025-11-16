@@ -272,6 +272,13 @@ namespace dxvk {
       VkFormat format,
       XXH64_hash_t materialHash);
 
+    // Create texture array render target for layered rendering
+    Resources::Resource getRenderTargetArray(
+      Rc<RtxContext> ctx,
+      VkExtent2D resolution,
+      VkFormat format,
+      uint32_t layerCount);
+
     // Calculate appropriate capture resolution for a draw call
     VkExtent2D calculateCaptureResolution(
       const DrawCallState& drawCallState) const;

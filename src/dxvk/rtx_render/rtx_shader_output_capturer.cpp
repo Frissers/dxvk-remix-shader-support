@@ -274,7 +274,10 @@ namespace dxvk {
 
     auto tFunctionStart = std::chrono::high_resolution_clock::now();
 
+    Logger::info(str::format("========== [DEBUG] executeMultiIndirectCaptures() CALLED - pendingRequests=", m_pendingCaptureRequests.size(), " =========="));
+
     if (m_pendingCaptureRequests.empty()) {
+      Logger::info("[DEBUG] executeMultiIndirectCaptures() - NO PENDING REQUESTS, returning early");
       return;
     }
 
@@ -309,10 +312,10 @@ namespace dxvk {
       // All data is self-contained in the request - no pointer dereferencing needed!
       XXH64_hash_t texHash = request.textureHash;
 
-      // Group key: RT resolution + texture hash
-      uint64_t key = (uint64_t(request.resolution.width) << 48) |
-                     (uint64_t(request.resolution.height) << 32) |
-                     (texHash & 0xFFFFFFFF);
+      // Group key: RT resolution ONLY (for texture array layered rendering)
+      // All captures with same resolution go into ONE batch with texture array
+      uint64_t key = (uint64_t(request.resolution.width) << 32) |
+                     uint64_t(request.resolution.height);
 
       auto it = groupHash.find(key);
       if (it == groupHash.end()) {
@@ -350,10 +353,13 @@ namespace dxvk {
       const uint32_t groupSize = static_cast<uint32_t>(group.requestIndices.size());
       if (groupSize == 0) continue;
 
-      // Allocate RT on-demand with caching (no pre-allocated pool = saves VRAM!)
+      // Allocate TEXTURE ARRAY RT for layered rendering (one layer per capture)
       auto tRTAllocStart = std::chrono::high_resolution_clock::now();
       const auto& firstRequest = m_pendingCaptureRequests[group.requestIndices[0]];
-      group.renderTarget = getRenderTarget(ctx, group.resolution, VK_FORMAT_R8G8B8A8_UNORM, firstRequest.materialHash);
+
+      // Use texture array for layered rendering - each draw writes to a different layer
+      group.renderTarget = getRenderTargetArray(ctx, group.resolution, VK_FORMAT_R8G8B8A8_UNORM, groupSize);
+
       auto tRTAllocEnd = std::chrono::high_resolution_clock::now();
       totalRTAllocTime += std::chrono::duration<double, std::micro>(tRTAllocEnd - tRTAllocStart).count();
 
@@ -362,36 +368,81 @@ namespace dxvk {
         continue;
       }
 
-      // Bind RT once for entire group
+      // Prepare texture array for layered rendering
       auto tBindingStart = std::chrono::high_resolution_clock::now();
 
       ctx->changeImageLayout(group.renderTarget.image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
-      DxvkRenderTargets captureRt;
-      captureRt.color[0].view = group.renderTarget.view;
-      captureRt.color[0].layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-      ctx->bindRenderTargets(captureRt);
+
+      // NOTE: For now, we'll render to each layer individually in a loop
+      // TODO: Implement proper layered rendering with multiview or shader modifications
+      // to render all layers in one multi-draw-indirect call
 
       VkClearValue clearValue = {};
       ctx->clearRenderTarget(group.renderTarget.view, VK_IMAGE_ASPECT_COLOR_BIT, clearValue);
 
-      // Bind texture once for entire group (KEY OPTIMIZATION!)
-      // Data is self-contained in request - no pointer dereferencing!
-      if (group.textureHash != 0 && firstRequest.colorTexture.isValid()) {
-        TextureRef replacementTexture = getReplacementTexture(group.textureHash);
-        const TextureRef& texToUse = replacementTexture.isValid()
-          ? replacementTexture
-          : firstRequest.colorTexture;
-
-        if (texToUse.getImageView()) {
-          Rc<DxvkImageView> imageView = texToUse.getImageView();
-          ctx->bindResourceView(0, imageView, nullptr);
-        }
-      }
-
       auto tBindingEnd = std::chrono::high_resolution_clock::now();
       totalBindingTime += std::chrono::duration<double, std::micro>(tBindingEnd - tBindingStart).count();
 
-      // If group has multiple draws with same texture, use multi-draw-indirect!
+      // Render each capture to its own layer in the texture array
+      auto tLayeredRenderStart = std::chrono::high_resolution_clock::now();
+
+      for (uint32_t layerIdx = 0; layerIdx < groupSize; layerIdx++) {
+        const auto& request = m_pendingCaptureRequests[group.requestIndices[layerIdx]];
+
+        // Create view to specific layer of texture array
+        DxvkImageViewCreateInfo layerViewInfo;
+        layerViewInfo.type = VK_IMAGE_VIEW_TYPE_2D;
+        layerViewInfo.format = group.renderTarget.image->info().format;
+        layerViewInfo.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+        layerViewInfo.aspect = VK_IMAGE_ASPECT_COLOR_BIT;
+        layerViewInfo.minLevel = 0;
+        layerViewInfo.numLevels = 1;
+        layerViewInfo.minLayer = layerIdx; // THIS LAYER
+        layerViewInfo.numLayers = 1;
+
+        Rc<DxvkImageView> layerView = ctx->getDevice()->createImageView(group.renderTarget.image, layerViewInfo);
+
+        // Bind this specific layer as render target
+        DxvkRenderTargets captureRt;
+        captureRt.color[0].view = layerView;
+        captureRt.color[0].layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        ctx->bindRenderTargets(captureRt);
+
+        // Clear this layer
+        VkClearValue clearValue = {};
+        ctx->clearRenderTarget(layerView, VK_IMAGE_ASPECT_COLOR_BIT, clearValue);
+
+        // Bind input texture for this capture
+        if (request.colorTexture.isValid()) {
+          TextureRef replacementTexture = getReplacementTexture(request.textureHash);
+          const TextureRef& texToUse = replacementTexture.isValid()
+            ? replacementTexture
+            : request.colorTexture;
+
+          if (texToUse.getImageView()) {
+            Rc<DxvkImageView> imageView = texToUse.getImageView();
+            ctx->bindResourceView(0, imageView, nullptr);
+          }
+        }
+
+        // Set pipeline state and draw
+        setCommonPipelineState(ctx, request);
+        bindGeometryBuffers(ctx, request);
+
+        if (request.indexCount > 0) {
+          ctx->drawIndexed(request.indexCount, 1, request.indexOffset, request.vertexOffset, 0);
+        } else {
+          ctx->draw(request.vertexCount, 1, request.vertexOffset, 0);
+        }
+
+        successCount++;
+      }
+
+      auto tLayeredRenderEnd = std::chrono::high_resolution_clock::now();
+      totalMultiDrawTime += std::chrono::duration<double, std::micro>(tLayeredRenderEnd - tLayeredRenderStart).count();
+
+      // OBSOLETE: Old multi-draw-indirect code replaced with layered rendering
+      if (false) {
       if (groupSize > 1) {
         auto tMultiDrawStart = std::chrono::high_resolution_clock::now();
 
@@ -652,6 +703,11 @@ namespace dxvk {
     static uint32_t callCount = 0;
     ++callCount;
     const bool shouldLog = (callCount <= 20) || (callCount % 1000 == 0);
+
+    // AGGRESSIVE LOGGING: Always log first 5 calls to confirm function is being invoked
+    if (callCount <= 5) {
+      Logger::info(str::format("========== [DEBUG] shouldCapture() CALLED (call #", callCount, ") =========="));
+    }
 
     if (!enableShaderOutputCapture()) {
       if (shouldLog) {
@@ -3092,6 +3148,11 @@ namespace dxvk {
   }
 
   void ShaderOutputCapturer::onFrameEnd() {
+    static uint32_t frameEndCallCount = 0;
+    ++frameEndCallCount;
+
+    Logger::info(str::format("========== [DEBUG] onFrameEnd() CALLED (call #", frameEndCallCount, ") pendingRequests=", m_pendingCaptureRequests.size(), " =========="));
+
     // Execute any remaining captures at end of frame (before frame boundary)
     // GpuCaptureRequest is self-contained with no pointers, so this is safe!
     if (!m_pendingCaptureRequests.empty()) {
@@ -3152,6 +3213,37 @@ namespace dxvk {
 
     // Cache it
     m_renderTargetCache[cacheKey] = resource;
+
+    return resource;
+  }
+
+  Resources::Resource ShaderOutputCapturer::getRenderTargetArray(
+      Rc<RtxContext> ctx,
+      VkExtent2D resolution,
+      VkFormat format,
+      uint32_t layerCount) {
+
+    // Create texture array for layered rendering - NO caching since layer count varies
+    VkExtent3D extent = { resolution.width, resolution.height, 1 };
+
+    Rc<DxvkContext> dxvkCtx = ctx;
+    Resources::Resource resource = Resources::createImageResource(
+      dxvkCtx,
+      "shader capture texture array",
+      extent,
+      format,
+      layerCount, // TEXTURE ARRAY with N layers
+      VK_IMAGE_TYPE_2D,
+      VK_IMAGE_VIEW_TYPE_2D_ARRAY, // ARRAY view type
+      0, // image create flags
+      VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
+
+    if (resource.image != nullptr) {
+      Logger::info(str::format("[ShaderOutputCapturer] Created texture array render target: ",
+                               resolution.width, "x", resolution.height,
+                               " layers=", layerCount,
+                               " format=", format));
+    }
 
     return resource;
   }
