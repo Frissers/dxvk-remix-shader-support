@@ -31,6 +31,8 @@ dxvk_shaders = files([
   'shaders/dxvk_fullscreen_vert.vert',
   'shaders/dxvk_fullscreen_layer_vert.vert',
 
+  'shaders/rtx/pass/shader_capture/shader_capture_layer_vert.vert',
+
   'shaders/dxvk_pack_d24s8.comp',
   'shaders/dxvk_pack_d32s8.comp',
 

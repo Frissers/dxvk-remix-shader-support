@@ -508,6 +508,10 @@ namespace dxvk {
     enabledFeatures.vulkan12Features.uniformAndStorageBuffer8BitAccess = VK_TRUE;
     enabledFeatures.vulkan12Features.timelineSemaphore = VK_TRUE;
 
+    // Enable shader output layer for instanced multi-draw-indirect to texture arrays
+    enabledFeatures.vulkan12Features.shaderOutputLayer = VK_TRUE;
+    enabledFeatures.vulkan12Features.shaderOutputViewportIndex = VK_TRUE;
+
     // NV-DXVK start: RTXIO
 #ifdef WITH_RTXIO
     if (RtxIo::enabled()) {

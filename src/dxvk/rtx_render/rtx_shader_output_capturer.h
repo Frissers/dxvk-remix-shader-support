@@ -300,6 +300,10 @@ namespace dxvk {
     // Cache of render targets by resolution
     std::unordered_map<uint64_t, Resources::Resource> m_renderTargetCache;
 
+    // Vertex shader for gl_Layer output (instanced multi-draw-indirect)
+    Rc<DxvkShader> m_layerRoutingVertexShader;
+    void initializeLayerRoutingShader(Rc<DxvkDevice> device);
+
     // Helper to compute UV bounds from geometry
     void computeUVBounds(
       const RasterGeometry& geom,

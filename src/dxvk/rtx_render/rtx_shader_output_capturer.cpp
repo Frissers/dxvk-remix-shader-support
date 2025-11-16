@@ -42,6 +42,7 @@
 
 #include <rtx_shaders/shader_capture_prepare.h>
 #include "rtx/pass/shader_capture/shader_capture.h"
+#include <shader_capture_layer_vert.h>
 
 namespace dxvk {
 
@@ -173,6 +174,26 @@ namespace dxvk {
     m_indirectIndexedDrawArgsBuffer = DxvkBufferSlice();
     m_captureCountersBuffer = DxvkBufferSlice();
     // Render target cache (m_renderTargetCache) is cleaned up automatically
+  }
+
+  void ShaderOutputCapturer::initializeLayerRoutingShader(Rc<DxvkDevice> device) {
+    if (m_layerRoutingVertexShader != nullptr)
+      return;  // Already initialized
+
+    // Create vertex shader from compiled SPIR-V
+    SpirvCodeBuffer spirvCode(shader_capture_layer_vert);
+
+    DxvkShaderConstData constData;
+    m_layerRoutingVertexShader = new DxvkShader(
+      VK_SHADER_STAGE_VERTEX_BIT,
+      0,  // No resource slots
+      nullptr,
+      { 0u, 1u, 0u, 64u },  // Interface slots: 0 in, 1 out (texcoord), 0 reserved, 64 bytes push constants (mat4)
+      spirvCode,
+      DxvkShaderOptions(),
+      std::move(constData));
+
+    Logger::info("[ShaderCapture-GPU] Layer routing vertex shader initialized");
   }
 
   // DELETED: allocateRenderTargetPool() - pre-allocation wasted ~8GB VRAM!
@@ -373,77 +394,220 @@ namespace dxvk {
 
       ctx->changeImageLayout(group.renderTarget.image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
 
-      // NOTE: For now, we'll render to each layer individually in a loop
-      // TODO: Implement proper layered rendering with multiview or shader modifications
-      // to render all layers in one multi-draw-indirect call
+      // Bind texture array as render target (layered rendering)
+      DxvkRenderTargets captureRt;
+      captureRt.color[0].view = group.renderTarget.view;
+      captureRt.color[0].layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+      ctx->bindRenderTargets(captureRt);
 
       VkClearValue clearValue = {};
       ctx->clearRenderTarget(group.renderTarget.view, VK_IMAGE_ASPECT_COLOR_BIT, clearValue);
 
+      // Initialize vertex shader on first use
+      initializeLayerRoutingShader(ctx->getDevice());
+
+      // Bind vertex shader for gl_Layer = gl_InstanceIndex routing
+      ctx->bindShader(VK_SHADER_STAGE_VERTEX_BIT, m_layerRoutingVertexShader);
+
       auto tBindingEnd = std::chrono::high_resolution_clock::now();
       totalBindingTime += std::chrono::duration<double, std::micro>(tBindingEnd - tBindingStart).count();
 
-      // Render each capture to its own layer in the texture array
-      auto tLayeredRenderStart = std::chrono::high_resolution_clock::now();
+      // ===== TRUE INSTANCED MULTI-DRAW-INDIRECT WITH GL_LAYER ROUTING =====
+      // ONE draw call renders ALL captures in this group to texture array layers
+      auto tRenderStart = std::chrono::high_resolution_clock::now();
+
+      // Check if this group uses indexed or non-indexed draws (use firstRequest from line 379)
+      bool useIndexed = (firstRequest.indexCount > 0);
+
+      // Build indirect draw buffer with firstInstance = layer index
+      auto tBuildCmdStart = std::chrono::high_resolution_clock::now();
+      std::vector<VkDrawIndexedIndirectCommand> indirectIndexedDraws;
+      std::vector<VkDrawIndirectCommand> indirectDraws;
 
       for (uint32_t layerIdx = 0; layerIdx < groupSize; layerIdx++) {
         const auto& request = m_pendingCaptureRequests[group.requestIndices[layerIdx]];
 
-        // Create view to specific layer of texture array
-        DxvkImageViewCreateInfo layerViewInfo;
-        layerViewInfo.type = VK_IMAGE_VIEW_TYPE_2D;
-        layerViewInfo.format = group.renderTarget.image->info().format;
-        layerViewInfo.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
-        layerViewInfo.aspect = VK_IMAGE_ASPECT_COLOR_BIT;
-        layerViewInfo.minLevel = 0;
-        layerViewInfo.numLevels = 1;
-        layerViewInfo.minLayer = layerIdx; // THIS LAYER
-        layerViewInfo.numLayers = 1;
+        if (request.indexCount > 0) {
+          VkDrawIndexedIndirectCommand cmd = {};
+          cmd.indexCount = request.indexCount;
+          cmd.instanceCount = 1;
+          cmd.firstIndex = request.indexOffset;
+          cmd.vertexOffset = request.vertexOffset;
+          cmd.firstInstance = layerIdx;  // KEY: gl_InstanceIndex = layer index!
+          indirectIndexedDraws.push_back(cmd);
+        } else {
+          VkDrawIndirectCommand cmd = {};
+          cmd.vertexCount = request.vertexCount;
+          cmd.instanceCount = 1;
+          cmd.firstVertex = request.vertexOffset;
+          cmd.firstInstance = layerIdx;  // KEY: gl_InstanceIndex = layer index!
+          indirectDraws.push_back(cmd);
+        }
 
-        Rc<DxvkImageView> layerView = ctx->getDevice()->createImageView(group.renderTarget.image, layerViewInfo);
-
-        // Bind this specific layer as render target
-        DxvkRenderTargets captureRt;
-        captureRt.color[0].view = layerView;
-        captureRt.color[0].layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-        ctx->bindRenderTargets(captureRt);
-
-        // Clear this layer
-        VkClearValue clearValue = {};
-        ctx->clearRenderTarget(layerView, VK_IMAGE_ASPECT_COLOR_BIT, clearValue);
-
-        // Bind input texture for this capture
+        // Bind input texture (TODO: batch by texture for even more perf)
         if (request.colorTexture.isValid()) {
           TextureRef replacementTexture = getReplacementTexture(request.textureHash);
-          const TextureRef& texToUse = replacementTexture.isValid()
-            ? replacementTexture
-            : request.colorTexture;
+          const TextureRef& texToUse = replacementTexture.isValid() ? replacementTexture : request.colorTexture;
 
           if (texToUse.getImageView()) {
-            Rc<DxvkImageView> imageView = texToUse.getImageView();
-            ctx->bindResourceView(0, imageView, nullptr);
+            ctx->bindResourceView(0, texToUse.getImageView(), nullptr);
           }
         }
+      }
+      auto tBuildCmdEnd = std::chrono::high_resolution_clock::now();
+      Logger::info(str::format("[PERF] Build indirect commands: ",
+        std::chrono::duration<double, std::micro>(tBuildCmdEnd - tBuildCmdStart).count(), " us"));
 
-        // Set pipeline state and draw
-        setCommonPipelineState(ctx, request);
-        bindGeometryBuffers(ctx, request);
+      // Upload indirect args to GPU and execute single multi-draw-indirect call
+      if (useIndexed && !indirectIndexedDraws.empty()) {
+        auto tBufCreateStart = std::chrono::high_resolution_clock::now();
+        DxvkBufferCreateInfo bufInfo = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+        bufInfo.size = indirectIndexedDraws.size() * sizeof(VkDrawIndexedIndirectCommand);
+        bufInfo.usage = VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        bufInfo.stages = VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
+        bufInfo.access = VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
 
-        if (request.indexCount > 0) {
-          ctx->drawIndexed(request.indexCount, 1, request.indexOffset, request.vertexOffset, 0);
-        } else {
-          ctx->draw(request.vertexCount, 1, request.vertexOffset, 0);
-        }
+        Rc<DxvkBuffer> indirectBuffer = ctx->getDevice()->createBuffer(bufInfo,
+          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+          DxvkMemoryStats::Category::RTXBuffer, "Shader Capture Indirect Buffer");
+        DxvkBufferSlice indirectBuf(indirectBuffer, 0, bufInfo.size);
+        memcpy(indirectBuf.mapPtr(0), indirectIndexedDraws.data(), bufInfo.size);
+        auto tBufCreateEnd = std::chrono::high_resolution_clock::now();
+        Logger::info(str::format("[PERF] Create+upload indirect buffer: ",
+          std::chrono::duration<double, std::micro>(tBufCreateEnd - tBufCreateStart).count(), " us"));
 
-        successCount++;
+        // Set pipeline state once
+        auto tPipelineStart = std::chrono::high_resolution_clock::now();
+        setCommonPipelineState(ctx, firstRequest);
+        auto tPipelineEnd = std::chrono::high_resolution_clock::now();
+        Logger::info(str::format("[PERF] setCommonPipelineState: ",
+          std::chrono::duration<double, std::micro>(tPipelineEnd - tPipelineStart).count(), " us"));
+
+        auto tBindGeomStart = std::chrono::high_resolution_clock::now();
+        bindGeometryBuffers(ctx, firstRequest);
+        auto tBindGeomEnd = std::chrono::high_resolution_clock::now();
+        Logger::info(str::format("[PERF] bindGeometryBuffers: ",
+          std::chrono::duration<double, std::micro>(tBindGeomEnd - tBindGeomStart).count(), " us"));
+
+        // ONE MULTI-DRAW-INDIRECT CALL! Maximum performance!
+        auto tDrawStart = std::chrono::high_resolution_clock::now();
+        ctx->bindDrawBuffers(indirectBuf, DxvkBufferSlice());
+        ctx->drawIndexedIndirect(0, static_cast<uint32_t>(indirectIndexedDraws.size()),
+                                sizeof(VkDrawIndexedIndirectCommand));
+        auto tDrawEnd = std::chrono::high_resolution_clock::now();
+        Logger::info(str::format("[PERF] drawIndexedIndirect call: ",
+          std::chrono::duration<double, std::micro>(tDrawEnd - tDrawStart).count(), " us"));
+
+        successCount += static_cast<uint32_t>(indirectIndexedDraws.size());
+        multiDrawCount++;
+
+        Logger::info(str::format("[ShaderCapture-GPU] TRUE INSTANCED MULTI-DRAW-INDIRECT: ",
+                                groupSize, " draws in 1 call (indexed)"));
+      } else if (!indirectDraws.empty()) {
+        auto tBufCreateStart = std::chrono::high_resolution_clock::now();
+        DxvkBufferCreateInfo bufInfo = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+        bufInfo.size = indirectDraws.size() * sizeof(VkDrawIndirectCommand);
+        bufInfo.usage = VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        bufInfo.stages = VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
+        bufInfo.access = VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+
+        Rc<DxvkBuffer> indirectBuffer = ctx->getDevice()->createBuffer(bufInfo,
+          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+          DxvkMemoryStats::Category::RTXBuffer, "Shader Capture Indirect Buffer");
+        DxvkBufferSlice indirectBuf(indirectBuffer, 0, bufInfo.size);
+        memcpy(indirectBuf.mapPtr(0), indirectDraws.data(), bufInfo.size);
+        auto tBufCreateEnd = std::chrono::high_resolution_clock::now();
+        Logger::info(str::format("[PERF] Create+upload indirect buffer: ",
+          std::chrono::duration<double, std::micro>(tBufCreateEnd - tBufCreateStart).count(), " us"));
+
+        auto tPipelineStart = std::chrono::high_resolution_clock::now();
+        setCommonPipelineState(ctx, firstRequest);
+        auto tPipelineEnd = std::chrono::high_resolution_clock::now();
+        Logger::info(str::format("[PERF] setCommonPipelineState: ",
+          std::chrono::duration<double, std::micro>(tPipelineEnd - tPipelineStart).count(), " us"));
+
+        auto tBindGeomStart = std::chrono::high_resolution_clock::now();
+        bindGeometryBuffers(ctx, firstRequest);
+        auto tBindGeomEnd = std::chrono::high_resolution_clock::now();
+        Logger::info(str::format("[PERF] bindGeometryBuffers: ",
+          std::chrono::duration<double, std::micro>(tBindGeomEnd - tBindGeomStart).count(), " us"));
+
+        auto tDrawStart = std::chrono::high_resolution_clock::now();
+        ctx->bindDrawBuffers(indirectBuf, DxvkBufferSlice());
+        ctx->drawIndirect(0, static_cast<uint32_t>(indirectDraws.size()),
+                         sizeof(VkDrawIndirectCommand));
+        auto tDrawEnd = std::chrono::high_resolution_clock::now();
+        Logger::info(str::format("[PERF] drawIndirect call: ",
+          std::chrono::duration<double, std::micro>(tDrawEnd - tDrawStart).count(), " us"));
+
+        successCount += static_cast<uint32_t>(indirectDraws.size());
+        multiDrawCount++;
+
+        Logger::info(str::format("[ShaderCapture-GPU] TRUE INSTANCED MULTI-DRAW-INDIRECT: ",
+                                groupSize, " draws in 1 call (non-indexed)"));
       }
 
-      auto tLayeredRenderEnd = std::chrono::high_resolution_clock::now();
-      totalMultiDrawTime += std::chrono::duration<double, std::micro>(tLayeredRenderEnd - tLayeredRenderStart).count();
+      auto tRenderEnd = std::chrono::high_resolution_clock::now();
+      totalMultiDrawTime += std::chrono::duration<double, std::micro>(tRenderEnd - tRenderStart).count();
 
-      // OBSOLETE: Old multi-draw-indirect code replaced with layered rendering
+      // Allocate individual output textures and copy from texture array layers
+      auto tDistributeStart = std::chrono::high_resolution_clock::now();
+
+      std::vector<Resources::Resource> individualOutputs;
+      individualOutputs.reserve(groupSize);
+
+      double totalAllocTime = 0.0;
+      double totalCopyTime = 0.0;
+
+      for (uint32_t layerIdx = 0; layerIdx < groupSize; layerIdx++) {
+        const auto& request = m_pendingCaptureRequests[group.requestIndices[layerIdx]];
+
+        // Create individual 2D output texture
+        auto tAllocStart = std::chrono::high_resolution_clock::now();
+        Resources::Resource outputTex = getRenderTarget(ctx, request.resolution,
+                                                        VK_FORMAT_R8G8B8A8_UNORM,
+                                                        request.materialHash);
+        auto tAllocEnd = std::chrono::high_resolution_clock::now();
+        totalAllocTime += std::chrono::duration<double, std::micro>(tAllocEnd - tAllocStart).count();
+
+        individualOutputs.push_back(outputTex);
+
+        // GPU copy from texture array layer to individual output using vkCmdCopyImage
+        auto tCopyStart = std::chrono::high_resolution_clock::now();
+        VkImageCopy copyRegion = {};
+        copyRegion.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        copyRegion.srcSubresource.baseArrayLayer = layerIdx;
+        copyRegion.srcSubresource.layerCount = 1;
+        copyRegion.srcSubresource.mipLevel = 0;
+        copyRegion.srcOffset = {0, 0, 0};
+
+        copyRegion.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        copyRegion.dstSubresource.baseArrayLayer = 0;
+        copyRegion.dstSubresource.layerCount = 1;
+        copyRegion.dstSubresource.mipLevel = 0;
+        copyRegion.dstOffset = {0, 0, 0};
+
+        copyRegion.extent = {request.resolution.width, request.resolution.height, 1};
+
+        ctx->copyImage(
+          outputTex.image, copyRegion.dstSubresource, copyRegion.dstOffset,
+          group.renderTarget.image, copyRegion.srcSubresource, copyRegion.srcOffset,
+          copyRegion.extent);
+        auto tCopyEnd = std::chrono::high_resolution_clock::now();
+        totalCopyTime += std::chrono::duration<double, std::micro>(tCopyEnd - tCopyStart).count();
+      }
+
+      auto tDistributeEnd = std::chrono::high_resolution_clock::now();
+      double distributeTime = std::chrono::duration<double, std::micro>(tDistributeEnd - tDistributeStart).count();
+
+      Logger::info(str::format("[PERF] Layer distribution - total: ", distributeTime, " us"));
+      Logger::info(str::format("[PERF]   getRenderTarget allocations: ", totalAllocTime, " us (", groupSize, " textures)"));
+      Logger::info(str::format("[PERF]   copyImage calls: ", totalCopyTime, " us (", groupSize, " copies)"));
+      Logger::info(str::format("[ShaderCapture-GPU] GPU copy distribution: ", groupSize,
+                              " layers in ", distributeTime, " us"));
+
+      // OLD CODE PATH REMOVED - now using true instanced multi-draw-indirect!
       if (false) {
-      if (groupSize > 1) {
         auto tMultiDrawStart = std::chrono::high_resolution_clock::now();
 
         multiDrawCount++;
@@ -549,14 +713,14 @@ namespace dxvk {
         totalSingleDrawTime += std::chrono::duration<double, std::micro>(tSingleDrawEnd - tSingleDrawStart).count();
       }
 
-      // Store all captures from this group - using self-contained request data
-      for (uint32_t idx : group.requestIndices) {
-        const auto& request = m_pendingCaptureRequests[idx];
+      // Store individual output textures in cache (OPTION 4: each capture gets its own texture!)
+      for (uint32_t layerIdx = 0; layerIdx < groupSize; layerIdx++) {
+        const auto& request = m_pendingCaptureRequests[group.requestIndices[layerIdx]];
 
         // Direct cache storage using request data (no DrawCallState pointer needed!)
         XXH64_hash_t cacheKey = request.materialHash;
         CapturedShaderOutput& output = m_capturedOutputs[cacheKey];
-        output.capturedTexture = group.renderTarget;
+        output.capturedTexture = individualOutputs[layerIdx];  // INDIVIDUAL texture, not shared array!
         output.geometryHash = request.geometryHash;
         output.materialHash = request.materialHash;
         output.lastCaptureFrame = m_currentFrame;
@@ -566,7 +730,6 @@ namespace dxvk {
         output.resolution = request.resolution;
       }
     }
-
     m_pendingCaptureRequests.clear();
 
     auto tExecutionEnd = std::chrono::high_resolution_clock::now();
@@ -907,26 +1070,39 @@ namespace dxvk {
       const DrawParameters& drawParams,
       TextureRef& outputTexture) {
 
+    Logger::info("[!!!DIAGNOSTIC!!!] captureDrawCall FUNCTION ENTRY - NEW CODE IS EXECUTING");
+
     static uint32_t captureCallEntryCount = 0;
-    if (++captureCallEntryCount <= 10) {
-      Logger::info(str::format("[CAPTURE-ENTRY] captureDrawCall #", captureCallEntryCount, " ENTERED"));
+    ++captureCallEntryCount;
+
+    // AGGRESSIVE LOGGING - Log EVERY call for first 100 to diagnose issue
+    if (captureCallEntryCount <= 100) {
+      Logger::info(str::format("[CAPTURE-ENTRY] ========== captureDrawCall #", captureCallEntryCount, " ENTERED =========="));
     }
 
     // GPU-DRIVEN BATCHED CAPTURE MODE - PRODUCTION READY
     // Queues captures and executes them in batches to eliminate CPU-GPU sync overhead
     static constexpr bool USE_GPU_DRIVEN_MODE = true; // ENABLED: Production-ready batched execution
 
+    if (captureCallEntryCount <= 100) {
+      Logger::info(str::format("[CAPTURE-MODE-CHECK] USE_GPU_DRIVEN_MODE = ", USE_GPU_DRIVEN_MODE ? "TRUE" : "FALSE"));
+    }
+
     if (USE_GPU_DRIVEN_MODE) {
       static uint32_t gpuModeEntryCount = 0;
-      if (++gpuModeEntryCount <= 10) {
-        Logger::info(str::format("[GPU-MODE-ENTRY] Entered GPU batching path #", gpuModeEntryCount));
+      ++gpuModeEntryCount;
+
+      if (gpuModeEntryCount <= 100) {
+        Logger::info(str::format("[GPU-MODE-ENTRY] ========== Entered GPU batching path #", gpuModeEntryCount, " =========="));
       }
       // Check if we should queue this capture
       const XXH64_hash_t matHash = drawCallState.getMaterialData().getHash();
       auto [cacheKey, isValidKey] = getCacheKey(drawCallState);
 
       static uint32_t cacheKeyLogCount = 0;
-      if (++cacheKeyLogCount <= 20) {
+      ++cacheKeyLogCount;
+
+      if (cacheKeyLogCount <= 100) {
         Logger::info(str::format("[GPU-CACHEKEY] #", cacheKeyLogCount,
                                 " matHash=0x", std::hex, matHash,
                                 " cacheKey=0x", cacheKey, std::dec,
@@ -935,8 +1111,10 @@ namespace dxvk {
 
       if (!isValidKey) {
         static uint32_t invalidKeyCount = 0;
-        if (++invalidKeyCount <= 10) {
-          Logger::info(str::format("[GPU-SKIP-INVALID] #", invalidKeyCount, " Invalid cache key, skipping"));
+        ++invalidKeyCount;
+
+        if (invalidKeyCount <= 100) {
+          Logger::info(str::format("[GPU-SKIP-INVALID] #", invalidKeyCount, " Invalid cache key, RETURNING FALSE"));
         }
         return false; // Invalid key, skip
       }
@@ -946,11 +1124,17 @@ namespace dxvk {
       if (it != m_capturedOutputs.end() && it->second.capturedTexture.isValid()) {
         // Already have a cached texture - return it
         static uint32_t cachedHitCount = 0;
-        if (++cachedHitCount <= 10) {
-          Logger::info(str::format("[GPU-CACHED-HIT] #", cachedHitCount, " Found cached texture for cacheKey=0x", std::hex, cacheKey, std::dec));
+        ++cachedHitCount;
+
+        if (cachedHitCount <= 100) {
+          Logger::info(str::format("[GPU-CACHED-HIT] #", cachedHitCount, " Found cached texture for cacheKey=0x", std::hex, cacheKey, std::dec, " RETURNING CACHED"));
         }
         outputTexture = getCapturedTexture(cacheKey);
         return outputTexture.isValid();
+      }
+
+      if (cacheKeyLogCount <= 100) {
+        Logger::info(str::format("[GPU-CACHE-MISS] cacheKey=0x", std::hex, cacheKey, std::dec, " - need to queue capture"));
       }
 
       // Queue new capture request - COPY ALL DATA (no pointers!)
@@ -994,19 +1178,27 @@ namespace dxvk {
       m_pendingCaptureRequests.push_back(request);
 
       static uint32_t queueLogCount = 0;
-      if (++queueLogCount <= 20) {
-        Logger::info(str::format("[ShaderCapture-GPU] Queued capture request #", queueLogCount,
+      ++queueLogCount;
+
+      if (queueLogCount <= 100) {
+        Logger::info(str::format("[ShaderCapture-GPU-QUEUED] ========== Request #", queueLogCount,
                                 " matHash=0x", std::hex, matHash, std::dec,
-                                " (", m_pendingCaptureRequests.size(), " total queued)"));
+                                " TOTAL_QUEUED=", m_pendingCaptureRequests.size(), " =========="));
       }
 
       // DEFERRED BATCHED EXECUTION (MegaGeometry-style):
       // Just queue - ALL captures execute together in onFrameBegin() next frame
       // This maximizes batching efficiency and matches reference implementation
 
+      if (queueLogCount <= 100) {
+        Logger::info(str::format("[GPU-DEFER] Deferring execution to onFrameBegin(), returning true to prevent fallback"));
+      }
+
       // Check if already cached from previous frame
       outputTexture = getCapturedTexture(cacheKey);
-      return outputTexture.isValid();
+      // Return true even if texture not ready yet - prevents old SHADER-REEXEC fallback
+      // Texture will be available next frame after batched execution
+      return true;
     }
 
     // ===== OLD CPU-DRIVEN MODE (below) =====
@@ -3083,27 +3275,34 @@ namespace dxvk {
     static uint32_t frameBeginCallCount = 0;
     ++frameBeginCallCount;
 
-    if (frameBeginCallCount <= 10) {
-      Logger::info(str::format("[FRAMEBEGIN-ENTRY] onFrameBegin #", frameBeginCallCount,
-                              " pendingRequests=", m_pendingCaptureRequests.size()));
-    }
+    // AGGRESSIVE LOGGING FOR DIAGNOSIS
+    Logger::info(str::format("[FRAMEBEGIN-ENTRY] ========== onFrameBegin #", frameBeginCallCount,
+                            " pendingRequests=", m_pendingCaptureRequests.size(),
+                            " enableShaderOutputCapture=", enableShaderOutputCapture() ? "TRUE" : "FALSE",
+                            " =========="));
 
     // GPU-DRIVEN CAPTURE SYSTEM: Lazy initialization on first frame
     static bool gpuSystemInitialized = false;
     if (!gpuSystemInitialized && enableShaderOutputCapture()) {
-      Logger::info("[ShaderCapture-GPU] Initializing GPU-driven batched capture system...");
+      Logger::info("[ShaderCapture-GPU-INIT] Initializing GPU-driven batched capture system...");
       initializeGpuCaptureSystem(ctx);
       // NO pre-allocated pool - RTs allocated on-demand for massive VRAM savings!
       gpuSystemInitialized = true;
-      Logger::info("[ShaderCapture-GPU] ===== GPU-DRIVEN CAPTURE SYSTEM READY =====");
+      Logger::info("[ShaderCapture-GPU-INIT] ===== GPU-DRIVEN CAPTURE SYSTEM READY =====");
     }
 
     // Execute any remaining captures from previous frame
+    Logger::info(str::format("[FRAMEBEGIN-CHECK] enableShaderOutputCapture=", enableShaderOutputCapture() ? "TRUE" : "FALSE",
+                            " pendingRequests.empty=", m_pendingCaptureRequests.empty() ? "TRUE" : "FALSE",
+                            " pendingRequests.size=", m_pendingCaptureRequests.size()));
+
     if (enableShaderOutputCapture() && !m_pendingCaptureRequests.empty()) {
-      Logger::info(str::format("[ShaderCapture-GPU-EXEC] Executing ", m_pendingCaptureRequests.size(),
-                              " queued captures from previous frame"));
+      Logger::info(str::format("[ShaderCapture-GPU-EXEC] ========== EXECUTING ", m_pendingCaptureRequests.size(),
+                              " queued captures from previous frame =========="));
       buildGpuCaptureList(ctx);
       executeMultiIndirectCaptures(ctx);
+    } else {
+      Logger::info("[FRAMEBEGIN-SKIP] Skipping executeMultiIndirectCaptures (no requests or disabled)");
     }
 
     m_capturesThisFrame = 0;
