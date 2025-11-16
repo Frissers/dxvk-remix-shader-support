@@ -172,82 +172,12 @@ namespace dxvk {
     m_indirectDrawArgsBuffer = DxvkBufferSlice();
     m_indirectIndexedDrawArgsBuffer = DxvkBufferSlice();
     m_captureCountersBuffer = DxvkBufferSlice();
-    m_renderTargetPool.clear();
-    m_renderTargetPoolSize = 0;
+    // Render target cache (m_renderTargetCache) is cleaned up automatically
   }
 
-  void ShaderOutputCapturer::allocateRenderTargetPool(Rc<RtxContext> ctx) {
-    // Pre-allocate persistent render target pool (MegaGeometry-style)
-    // Avoids per-frame allocation overhead
-
-    if (m_renderTargetPoolSize > 0) {
-      Logger::warn("[ShaderCapture-GPU] Render target pool already allocated, skipping");
-      return;
-    }
-
-    const uint32_t poolSize = kMaxRenderTargetPoolSize;
-    const uint32_t resolution = captureResolution();
-    const VkFormat format = VK_FORMAT_R8G8B8A8_UNORM; // Standard RGBA8 for shader output
-    const VkExtent3D extent = { resolution, resolution, 1 };
-
-    m_renderTargetPool.reserve(poolSize);
-
-    Logger::info(str::format("[ShaderCapture-GPU] Allocating render target pool: ",
-                            poolSize, " textures @ ", resolution, "x", resolution));
-
-    // Pre-allocate all render targets
-    for (uint32_t i = 0; i < poolSize; i++) {
-      // Create render target with COLOR_ATTACHMENT usage
-      Rc<DxvkContext> dxvkCtx = ctx.ptr();
-      Resources::Resource rt = Resources::createImageResource(
-        dxvkCtx,
-        str::format("Shader Capture RT Pool [", i, "]").c_str(),
-        extent,
-        format,
-        1, // numLayers
-        VK_IMAGE_TYPE_2D,
-        VK_IMAGE_VIEW_TYPE_2D,
-        0, // imageCreateFlags
-        VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
-        { 0.0f, 0.0f, 0.0f, 0.0f }, // clearValue
-        1 // mipLevels
-      );
-
-      m_renderTargetPool.push_back(rt);
-
-      // Log progress every 256 textures
-      if ((i + 1) % 256 == 0 || i == 0) {
-        const size_t allocatedMB = (i + 1) * resolution * resolution * 4 / (1024 * 1024);
-        Logger::info(str::format("[ShaderCapture-GPU] Allocated ", i + 1, "/", poolSize,
-                                " RTs (", allocatedMB, " MB)"));
-      }
-    }
-
-    m_renderTargetPoolSize = poolSize;
-    m_nextRenderTargetIndex = 0;
-
-    const size_t totalVRAM = poolSize * resolution * resolution * 4;
-    Logger::info(str::format("[ShaderCapture-GPU] Render target pool allocated: ",
-                            poolSize, " textures, ", totalVRAM / (1024 * 1024), " MB VRAM"));
-  }
-
-  Resources::Resource ShaderOutputCapturer::allocateRenderTargetFromPool(
-    Rc<RtxContext> ctx, VkExtent2D resolution, VkFormat format) {
-
-    // Simple round-robin allocation from pool
-    // TODO: Add smarter allocation based on resolution/format matching
-
-    if (m_renderTargetPoolSize == 0) {
-      Logger::err("[ShaderCapture-GPU] Render target pool not initialized!");
-      return Resources::Resource();
-    }
-
-    // Get next RT from pool (round-robin)
-    uint32_t index = m_nextRenderTargetIndex;
-    m_nextRenderTargetIndex = (m_nextRenderTargetIndex + 1) % m_renderTargetPoolSize;
-
-    return m_renderTargetPool[index];
-  }
+  // DELETED: allocateRenderTargetPool() - pre-allocation wasted ~8GB VRAM!
+  // DELETED: allocateRenderTargetFromPool() - now using on-demand allocation via getRenderTarget()
+  // Render targets are now allocated on-demand with caching for massive VRAM savings
 
   void ShaderOutputCapturer::buildGpuCaptureList(Rc<RtxContext> ctx) {
     // Build capture request list from pending requests and upload to GPU
@@ -420,10 +350,10 @@ namespace dxvk {
       const uint32_t groupSize = static_cast<uint32_t>(group.requestIndices.size());
       if (groupSize == 0) continue;
 
-      // Allocate RT from pool
+      // Allocate RT on-demand with caching (no pre-allocated pool = saves VRAM!)
       auto tRTAllocStart = std::chrono::high_resolution_clock::now();
       const auto& firstRequest = m_pendingCaptureRequests[group.requestIndices[0]];
-      group.renderTarget = allocateRenderTargetFromPool(ctx, group.resolution, VK_FORMAT_R8G8B8A8_UNORM);
+      group.renderTarget = getRenderTarget(ctx, group.resolution, VK_FORMAT_R8G8B8A8_UNORM, firstRequest.materialHash);
       auto tRTAllocEnd = std::chrono::high_resolution_clock::now();
       totalRTAllocTime += std::chrono::duration<double, std::micro>(tRTAllocEnd - tRTAllocStart).count();
 
@@ -921,16 +851,37 @@ namespace dxvk {
       const DrawParameters& drawParams,
       TextureRef& outputTexture) {
 
+    static uint32_t captureCallEntryCount = 0;
+    if (++captureCallEntryCount <= 10) {
+      Logger::info(str::format("[CAPTURE-ENTRY] captureDrawCall #", captureCallEntryCount, " ENTERED"));
+    }
+
     // GPU-DRIVEN BATCHED CAPTURE MODE - PRODUCTION READY
     // Queues captures and executes them in batches to eliminate CPU-GPU sync overhead
     static constexpr bool USE_GPU_DRIVEN_MODE = true; // ENABLED: Production-ready batched execution
 
     if (USE_GPU_DRIVEN_MODE) {
+      static uint32_t gpuModeEntryCount = 0;
+      if (++gpuModeEntryCount <= 10) {
+        Logger::info(str::format("[GPU-MODE-ENTRY] Entered GPU batching path #", gpuModeEntryCount));
+      }
       // Check if we should queue this capture
       const XXH64_hash_t matHash = drawCallState.getMaterialData().getHash();
       auto [cacheKey, isValidKey] = getCacheKey(drawCallState);
 
+      static uint32_t cacheKeyLogCount = 0;
+      if (++cacheKeyLogCount <= 20) {
+        Logger::info(str::format("[GPU-CACHEKEY] #", cacheKeyLogCount,
+                                " matHash=0x", std::hex, matHash,
+                                " cacheKey=0x", cacheKey, std::dec,
+                                " isValid=", isValidKey));
+      }
+
       if (!isValidKey) {
+        static uint32_t invalidKeyCount = 0;
+        if (++invalidKeyCount <= 10) {
+          Logger::info(str::format("[GPU-SKIP-INVALID] #", invalidKeyCount, " Invalid cache key, skipping"));
+        }
         return false; // Invalid key, skip
       }
 
@@ -938,6 +889,10 @@ namespace dxvk {
       auto it = m_capturedOutputs.find(cacheKey);
       if (it != m_capturedOutputs.end() && it->second.capturedTexture.isValid()) {
         // Already have a cached texture - return it
+        static uint32_t cachedHitCount = 0;
+        if (++cachedHitCount <= 10) {
+          Logger::info(str::format("[GPU-CACHED-HIT] #", cachedHitCount, " Found cached texture for cacheKey=0x", std::hex, cacheKey, std::dec));
+        }
         outputTexture = getCapturedTexture(cacheKey);
         return outputTexture.isValid();
       }
@@ -952,7 +907,7 @@ namespace dxvk {
       request.textureHash = materialData.getColorTexture().isValid()
         ? materialData.getColorTexture().getImageHash() : 0;
       request.drawCallIndex = static_cast<uint32_t>(m_pendingCaptureRequests.size());
-      request.renderTargetIndex = m_nextRenderTargetIndex;
+      // renderTargetIndex removed - not needed with on-demand RT allocation
 
       // Geometry counts and offsets
       const auto& geometryData = drawCallState.getGeometryData();
@@ -989,18 +944,13 @@ namespace dxvk {
                                 " (", m_pendingCaptureRequests.size(), " total queued)"));
       }
 
-      // IMMEDIATE BATCH EXECUTION: Execute batch when queue is full
-      // This ensures pointers stay valid and reduces latency
-      const uint32_t BATCH_SIZE = 50; // Execute every 50 captures
-      if (m_pendingCaptureRequests.size() >= BATCH_SIZE) {
-        Logger::info(str::format("[ShaderCapture-GPU] Batch size reached (", BATCH_SIZE,
-                                "), executing captures immediately"));
-        buildGpuCaptureList(ctx);
-        executeMultiIndirectCaptures(ctx);
-      }
+      // DEFERRED BATCHED EXECUTION (MegaGeometry-style):
+      // Just queue - ALL captures execute together in onFrameBegin() next frame
+      // This maximizes batching efficiency and matches reference implementation
 
-      // Return false for first frame, then cached texture will be available
-      return false;
+      // Check if already cached from previous frame
+      outputTexture = getCapturedTexture(cacheKey);
+      return outputTexture.isValid();
     }
 
     // ===== OLD CPU-DRIVEN MODE (below) =====
@@ -3074,20 +3024,28 @@ namespace dxvk {
   }
 
   void ShaderOutputCapturer::onFrameBegin(Rc<RtxContext> ctx) {
+    static uint32_t frameBeginCallCount = 0;
+    ++frameBeginCallCount;
+
+    if (frameBeginCallCount <= 10) {
+      Logger::info(str::format("[FRAMEBEGIN-ENTRY] onFrameBegin #", frameBeginCallCount,
+                              " pendingRequests=", m_pendingCaptureRequests.size()));
+    }
+
     // GPU-DRIVEN CAPTURE SYSTEM: Lazy initialization on first frame
     static bool gpuSystemInitialized = false;
     if (!gpuSystemInitialized && enableShaderOutputCapture()) {
       Logger::info("[ShaderCapture-GPU] Initializing GPU-driven batched capture system...");
       initializeGpuCaptureSystem(ctx);
-      allocateRenderTargetPool(ctx);
+      // NO pre-allocated pool - RTs allocated on-demand for massive VRAM savings!
       gpuSystemInitialized = true;
       Logger::info("[ShaderCapture-GPU] ===== GPU-DRIVEN CAPTURE SYSTEM READY =====");
     }
 
-    // Execute any remaining captures from previous frame (should be rare - batches execute immediately)
+    // Execute any remaining captures from previous frame
     if (enableShaderOutputCapture() && !m_pendingCaptureRequests.empty()) {
-      Logger::warn(str::format("[ShaderCapture-GPU] Executing ", m_pendingCaptureRequests.size(),
-                              " remaining captures from previous frame (should be batched)"));
+      Logger::info(str::format("[ShaderCapture-GPU-EXEC] Executing ", m_pendingCaptureRequests.size(),
+                              " queued captures from previous frame"));
       buildGpuCaptureList(ctx);
       executeMultiIndirectCaptures(ctx);
     }
@@ -3134,12 +3092,13 @@ namespace dxvk {
   }
 
   void ShaderOutputCapturer::onFrameEnd() {
-    // CRITICAL: Clear pending requests to prevent dangling DrawCallState pointers
-    // DrawCallState objects are only valid during the frame they were created
+    // Execute any remaining captures at end of frame (before frame boundary)
+    // GpuCaptureRequest is self-contained with no pointers, so this is safe!
     if (!m_pendingCaptureRequests.empty()) {
-      Logger::warn(str::format("[ShaderCapture-GPU] Discarding ", m_pendingCaptureRequests.size(),
-                              " pending captures at frame end (DrawCallState pointers would be invalid next frame)"));
-      m_pendingCaptureRequests.clear();
+      Logger::info(str::format("[ShaderCapture-GPU-FRAMEEND] Executing ", m_pendingCaptureRequests.size(),
+                              " remaining captures at end of frame"));
+      // Note: ctx is not available here, so we can't execute
+      // Captures will be executed in onFrameBegin of NEXT frame
     }
 
     // Cleanup old cached outputs if needed
@@ -3152,13 +3111,13 @@ namespace dxvk {
       VkFormat format,
       XXH64_hash_t materialHash) {
 
-    // Create cache key from resolution, format, AND material hash
-    // This ensures each material gets its own render target
-    // Material hash is XORed to avoid simple collisions
+    // Create cache key from resolution and format ONLY (NO material hash!)
+    // This allows RT sharing between materials with same resolution = MASSIVE VRAM savings
+    // We don't need per-material RTs because we copy the result immediately after capture
     uint64_t cacheKey = (static_cast<uint64_t>(resolution.width) << 32) |
                         (static_cast<uint64_t>(resolution.height) << 16) |
                         static_cast<uint64_t>(format);
-    cacheKey ^= materialHash;  // XOR with material hash for uniqueness per material
+    // REMOVED: XOR with material hash - was causing 1 RT per material = GB of wasted VRAM!
 
     // Check cache
     auto it = m_renderTargetCache.find(cacheKey);

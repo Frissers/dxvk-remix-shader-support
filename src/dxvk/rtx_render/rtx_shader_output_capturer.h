@@ -236,11 +236,8 @@ namespace dxvk {
       uint32_t padding[12];             // Align to cache line
     };
 
-    // Persistent render target pool (pre-allocated, MegaGeometry-style)
-    static constexpr uint32_t kMaxRenderTargetPoolSize = 2048;
-    std::vector<Resources::Resource> m_renderTargetPool;
-    uint32_t m_renderTargetPoolSize = 0;
-    uint32_t m_nextRenderTargetIndex = 0;
+    // DELETED: Pre-allocated pool wasted ~8GB VRAM!
+    // Now using on-demand allocation via m_renderTargetCache (see below)
 
     // GPU buffers for multi-indirect dispatch
     DxvkBufferSlice m_captureRequestsBuffer;      // GpuCaptureRequest array
@@ -254,10 +251,9 @@ namespace dxvk {
     // GPU-driven capture pipeline
     void initializeGpuCaptureSystem(Rc<RtxContext> ctx);
     void shutdownGpuCaptureSystem();
-    void allocateRenderTargetPool(Rc<RtxContext> ctx);
+    // DELETED: allocateRenderTargetPool, allocateRenderTargetFromPool - using on-demand allocation now
     void buildGpuCaptureList(Rc<RtxContext> ctx);
     void executeMultiIndirectCaptures(Rc<RtxContext> ctx);
-    Resources::Resource allocateRenderTargetFromPool(Rc<RtxContext> ctx, VkExtent2D resolution, VkFormat format);
 
     // Helper functions for maximum performance batching
     void setCommonPipelineState(Rc<RtxContext> ctx, const GpuCaptureRequest& request);
