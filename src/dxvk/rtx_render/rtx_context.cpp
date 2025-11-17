@@ -2316,12 +2316,21 @@ namespace dxvk {
     auto tFlushStart = std::chrono::high_resolution_clock::now();
 
     // flush the residue
+    auto tSkyStart = std::chrono::high_resolution_clock::now();
     tryHandleSky(nullptr, nullptr);
+    auto tSkyDone = std::chrono::high_resolution_clock::now();
+    auto skyTime = std::chrono::duration<double, std::micro>(tSkyDone - tSkyStart).count();
 
-    // CHRONO: Time the actual command list submission (vkQueueSubmit)
+    // CHRONO: Time endRecording (finalize command buffer - barriers, pipeline flushes)
+    auto tEndRecordStart = std::chrono::high_resolution_clock::now();
+    auto cmdList = this->endRecording();
+    auto tEndRecordDone = std::chrono::high_resolution_clock::now();
+    auto endRecordTime = std::chrono::duration<double, std::micro>(tEndRecordDone - tEndRecordStart).count();
+
+    // CHRONO: Time the actual command list submission (vkQueueSubmit - CPU->GPU transfer)
     auto tSubmitStart = std::chrono::high_resolution_clock::now();
     m_device->submitCommandList(
-      this->endRecording(),
+      cmdList,
       VK_NULL_HANDLE,
       VK_NULL_HANDLE,
       m_submitContainsInjectRtx,
@@ -2332,15 +2341,29 @@ namespace dxvk {
     // Reset this now that we've completed the submission
     m_submitContainsInjectRtx = false;
 
+    // CHRONO: Time beginRecording (allocate new command buffer, setup state)
+    auto tBeginRecordStart = std::chrono::high_resolution_clock::now();
     this->beginRecording(
       m_device->createCommandList());
+    auto tBeginRecordDone = std::chrono::high_resolution_clock::now();
+    auto beginRecordTime = std::chrono::duration<double, std::micro>(tBeginRecordDone - tBeginRecordStart).count();
 
+    auto tMetaGeoStart = std::chrono::high_resolution_clock::now();
     getCommonObjects()->metaGeometryUtils().flushCommandList();
+    auto tMetaGeoDone = std::chrono::high_resolution_clock::now();
+    auto metaGeoTime = std::chrono::duration<double, std::micro>(tMetaGeoDone - tMetaGeoStart).count();
 
-    // CHRONO: Output total flushCommandList time
+    // CHRONO: Output detailed breakdown of flushCommandList timing
     auto tFlushDone = std::chrono::high_resolution_clock::now();
     auto totalFlushTime = std::chrono::duration<double, std::micro>(tFlushDone - tFlushStart).count();
-    Logger::info(str::format("[CHRONO] flushCommandList: submitCommandList=", std::fixed, std::setprecision(2), submitTime / 1000.0, " ms, TOTAL=", totalFlushTime / 1000.0, " ms"));
+
+    Logger::info(str::format("[BOTTLENECK-1] CPU-GPU SYNC BREAKDOWN:"));
+    Logger::info(str::format("  [BOTTLENECK-1] tryHandleSky: ", std::fixed, std::setprecision(3), skyTime / 1000.0, " ms"));
+    Logger::info(str::format("  [BOTTLENECK-1] endRecording (barriers+finalize): ", endRecordTime / 1000.0, " ms"));
+    Logger::info(str::format("  [BOTTLENECK-1] submitCommandList (vkQueueSubmit): ", submitTime / 1000.0, " ms ← CPU->GPU SYNC POINT"));
+    Logger::info(str::format("  [BOTTLENECK-1] beginRecording (allocate+setup): ", beginRecordTime / 1000.0, " ms"));
+    Logger::info(str::format("  [BOTTLENECK-1] metaGeometryUtils flush: ", metaGeoTime / 1000.0, " ms"));
+    Logger::info(str::format("  [BOTTLENECK-1] TOTAL flushCommandList: ", totalFlushTime / 1000.0, " ms"));
   }
 
   void RtxContext::updateComputeShaderResources() {

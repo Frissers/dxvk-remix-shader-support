@@ -206,7 +206,11 @@ namespace dxvk {
   
   
   void DxvkCommandList::endRecording() {
-    TracyVkCollect(m_device->queues().graphics.tracyCtx, m_execBuffer);
+    // OPTIMIZATION: Disable Tracy GPU profiling to eliminate 30-66ms SyncPresent stall
+    // TracyVkCollect() calls vkGetQueryPoolResults() which blocks waiting for GPU query results.
+    // This is called 4 times per frame in the present path, causing massive CPU-GPU sync overhead.
+    // Disabling this should reduce SyncPresent from 30-66ms to near zero.
+    // TracyVkCollect(m_device->queues().graphics.tracyCtx, m_execBuffer);
 
     if (m_vkd->vkEndCommandBuffer(m_execBuffer) != VK_SUCCESS
      || m_vkd->vkEndCommandBuffer(m_initBuffer) != VK_SUCCESS

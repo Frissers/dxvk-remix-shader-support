@@ -31,6 +31,7 @@ namespace dxvk {
   struct DrawCallState;
   struct DrawParameters;
   struct DxvkRaytracingInstanceState;
+  class DxvkGpuQuery;
 
   /**
    * \brief Shader Output Capturer
@@ -115,6 +116,11 @@ namespace dxvk {
       "Capture shader output for all draw calls (except UI).\n"
       "Enabled by default to ensure shader effects work properly.\n"
       "UI draws (pixel shader only, no vertex shader) are automatically excluded.");
+
+    RTX_OPTION("rtx.shaderCapture", uint32_t, maxVramMB, 2048,
+      "Maximum VRAM in MB for shader capture render target cache.\n"
+      "When exceeded, least-recently-used RTs are evicted.\n"
+      "Default: 2048 MB (2 GB). Increase if you see frequent RT recreations.");
 
     RTX_OPTION_ENV("rtx.shaderCapture", fast_unordered_set, captureEnabledHashes, {},
       "RTX_SHADER_CAPTURE_ENABLED_HASHES",
@@ -313,8 +319,15 @@ namespace dxvk {
     // Check if material is marked as dynamic
     bool isDynamicMaterial(XXH64_hash_t materialHash) const;
 
-    // Cache of render targets by resolution
-    std::unordered_map<uint64_t, Resources::Resource> m_renderTargetCache;
+    // LRU VRAM cache entry - tracks last use and size for eviction
+    struct RenderTargetCacheEntry {
+      Resources::Resource resource;
+      uint32_t lastUsedFrame;  // Frame when RT was last accessed
+      size_t vramBytes;         // VRAM size in bytes
+    };
+
+    // Cache of render targets by resolution (LRU eviction when VRAM limit reached)
+    std::unordered_map<uint64_t, RenderTargetCacheEntry> m_renderTargetCache;
 
     // OPTIMIZATION 1: Cache texture arrays by (resolution, layerCount)
     // Key format: resolution (32 bits) | layerCount (32 bits)
@@ -350,11 +363,24 @@ namespace dxvk {
     Rc<DxvkShader> m_layerRoutingVertexShader;
     void initializeLayerRoutingShader(Rc<DxvkDevice> device);
 
+    // GPU profiling - timestamp queries to measure actual GPU execution time
+    Rc<DxvkGpuQuery> m_gpuTimestampStart;
+    Rc<DxvkGpuQuery> m_gpuTimestampEnd;
+    float m_timestampPeriod = 1.0f;  // ns per timestamp tick (from device properties)
+
+    // Previous frame's queries for delayed readback (GPU queries are asynchronous)
+    Rc<DxvkGpuQuery> m_prevFrameTimestampStart;
+    Rc<DxvkGpuQuery> m_prevFrameTimestampEnd;
+
     // Helper to compute UV bounds from geometry
     void computeUVBounds(
       const RasterGeometry& geom,
       Vector2& uvMin,
       Vector2& uvMax) const;
+
+    // DESCRIPTOR CACHING: Track last bound texture to skip redundant bindResourceView calls
+    XXH64_hash_t m_lastBoundTextureHash = 0;
+    Rc<DxvkImageView> m_lastBoundTextureView = nullptr;
   };
 
 } // namespace dxvk

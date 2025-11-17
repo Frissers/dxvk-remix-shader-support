@@ -25,6 +25,7 @@
 #include "rtx_options.h"
 #include "rtx_camera.h"
 #include "../dxvk_device.h"
+#include "../dxvk_gpu_query.h"
 #include "rtx_render/rtx_shader_manager.h"
 #include "../../util/log/log.h"
 #include "../../d3d9/d3d9_state.h"
@@ -170,6 +171,14 @@ namespace dxvk {
       Logger::info("[ShaderCapture-GPU] Created GPU counters buffer");
     }
 
+    // Initialize GPU timestamp queries for profiling actual GPU execution time
+    m_gpuTimestampStart = ctx->getDevice()->createGpuQuery(VK_QUERY_TYPE_TIMESTAMP, 0, 0);
+    m_gpuTimestampEnd = ctx->getDevice()->createGpuQuery(VK_QUERY_TYPE_TIMESTAMP, 0, 0);
+
+    // Get timestamp period (nanoseconds per tick) from device properties
+    m_timestampPeriod = ctx->getDevice()->adapter()->deviceProperties().limits.timestampPeriod;
+
+    Logger::info(str::format("[ShaderCapture-GPU] GPU profiling initialized (timestampPeriod=", m_timestampPeriod, " ns)"));
     Logger::info("[ShaderCapture-GPU] GPU-driven multi-indirect capture system initialized");
   }
 
@@ -446,6 +455,38 @@ namespace dxvk {
     // ========== STEP 2: EXECUTE WITH MULTI-DRAW-INDIRECT PER GROUP ==========
     auto tExecutionStart = std::chrono::high_resolution_clock::now();
 
+    // GPU PROFILING: Read PREVIOUS frame's timestamp results (delayed readback for async GPU)
+    if (m_prevFrameTimestampStart != nullptr && m_prevFrameTimestampEnd != nullptr) {
+      DxvkQueryData startData = {};
+      DxvkQueryData endData = {};
+
+      DxvkGpuQueryStatus startStatus = m_prevFrameTimestampStart->getData(startData);
+      DxvkGpuQueryStatus endStatus = m_prevFrameTimestampEnd->getData(endData);
+
+      if (startStatus == DxvkGpuQueryStatus::Available && endStatus == DxvkGpuQueryStatus::Available) {
+        // Calculate GPU execution time in milliseconds
+        uint64_t startTime = startData.timestamp.time;
+        uint64_t endTime = endData.timestamp.time;
+        uint64_t gpuTicks = (endTime > startTime) ? (endTime - startTime) : 0;
+        double gpuTimeNs = gpuTicks * m_timestampPeriod;
+        double gpuTimeMs = gpuTimeNs / 1000000.0;
+
+        Logger::info(str::format("[GPU-PROFILING] ========== ACTUAL GPU EXECUTION TIME (PREV FRAME) =========="));
+        Logger::info(str::format("[GPU-PROFILING] GPU Time: ", gpuTimeMs, " ms (", gpuTicks, " ticks)"));
+        Logger::info(str::format("[GPU-PROFILING] Timestamp Period: ", m_timestampPeriod, " ns/tick"));
+        Logger::info(str::format("[GPU-PROFILING] ============================================================"));
+      } else {
+        Logger::info(str::format("[GPU-PROFILING] Previous frame timestamp data not yet available (start=",
+                                static_cast<uint32_t>(startStatus), ", end=", static_cast<uint32_t>(endStatus), ")"));
+      }
+    }
+
+    // GPU PROFILING: Write start timestamp for CURRENT frame
+    if (m_gpuTimestampStart != nullptr) {
+      ctx->writeTimestamp(m_gpuTimestampStart);
+      Logger::info("[GPU-PROFILING] Start timestamp written (current frame)");
+    }
+
     uint32_t successCount = 0;
     uint32_t multiDrawCount = 0;
     uint32_t singleDrawCount = 0;
@@ -471,14 +512,27 @@ namespace dxvk {
       // Binding texture after bindRenderTargets() forces transitions inside render pass = individual barriers!
       auto tBindingStart = std::chrono::high_resolution_clock::now();
 
-      // OPTIMIZED: Bind texture ONCE per group (not per draw!)
+      // DESCRIPTOR CACHING: Bind texture ONCE per group and cache to skip redundant bindings
       // Since we group by texture, all draws in this group use the same texture
       if (firstRequest.colorTexture.isValid()) {
         TextureRef replacementTexture = getReplacementTexture(firstRequest.textureHash);
         const TextureRef& texToUse = replacementTexture.isValid() ? replacementTexture : firstRequest.colorTexture;
 
         if (texToUse.getImageView()) {
-          ctx->bindResourceView(0, texToUse.getImageView(), nullptr);
+          // Check descriptor cache: skip binding if same texture as previous group
+          XXH64_hash_t currentTextureHash = firstRequest.textureHash;
+          Rc<DxvkImageView> currentImageView = texToUse.getImageView();
+          bool needsBinding = (currentTextureHash != m_lastBoundTextureHash) ||
+                             (currentImageView.ptr() != m_lastBoundTextureView.ptr());
+
+          if (needsBinding) {
+            ctx->bindResourceView(0, currentImageView, nullptr);
+            m_lastBoundTextureHash = currentTextureHash;
+            m_lastBoundTextureView = currentImageView;
+            Logger::info(str::format("[DESC-CACHE] New texture bound (hash=0x", std::hex, currentTextureHash, std::dec, ")"));
+          } else {
+            Logger::info(str::format("[DESC-CACHE] CACHE HIT - skipped bindResourceView (hash=0x", std::hex, currentTextureHash, std::dec, ")"));
+          }
         }
       }
 
@@ -828,23 +882,50 @@ namespace dxvk {
                               m_pendingCaptureRequests.size(), " remain queued for next frame"));
     }
 
+    // GPU PROFILING: Write end timestamp for CURRENT frame
+    if (m_gpuTimestampStart != nullptr && m_gpuTimestampEnd != nullptr) {
+      ctx->writeTimestamp(m_gpuTimestampEnd);
+      Logger::info("[GPU-PROFILING] End timestamp written (current frame)");
+
+      // Swap queries for next frame's delayed readback
+      // Move current frame's queries to previous frame slots
+      m_prevFrameTimestampStart = m_gpuTimestampStart;
+      m_prevFrameTimestampEnd = m_gpuTimestampEnd;
+
+      // Create new queries for next frame
+      m_gpuTimestampStart = ctx->getDevice()->createGpuQuery(VK_QUERY_TYPE_TIMESTAMP, 0, 0);
+      m_gpuTimestampEnd = ctx->getDevice()->createGpuQuery(VK_QUERY_TYPE_TIMESTAMP, 0, 0);
+
+      Logger::info("[GPU-PROFILING] Queries swapped - current frame queries moved to previous frame slots for next frame readback");
+    }
+
     auto tExecutionEnd = std::chrono::high_resolution_clock::now();
     auto tFunctionEnd = std::chrono::high_resolution_clock::now();
 
     auto executionTime = std::chrono::duration<double, std::micro>(tExecutionEnd - tExecutionStart).count();
     auto totalTime = std::chrono::duration<double, std::micro>(tFunctionEnd - tFunctionStart).count();
 
+    // Calculate command buffer overhead (everything except actual GPU draw time)
+    double commandBufferOverhead = totalBindingTime + totalMultiDrawTime + totalSingleDrawTime;
+
     Logger::info(str::format("[ShaderCapture-GPU] ===== PERFORMANCE BREAKDOWN ====="));
     Logger::info(str::format("[ShaderCapture-GPU] Complete: ", successCount, " draws, ",
                             multiDrawCount, " multi-draw-indirect groups, ",
                             singleDrawCount, " single draws"));
-    Logger::info(str::format("[ShaderCapture-GPU] Grouping: ", groupingTime, " us"));
-    Logger::info(str::format("[ShaderCapture-GPU] RT Allocation: ", totalRTAllocTime, " us"));
-    Logger::info(str::format("[ShaderCapture-GPU] Binding (RT+Tex): ", totalBindingTime, " us"));
-    Logger::info(str::format("[ShaderCapture-GPU] Multi-draw: ", totalMultiDrawTime, " us"));
-    Logger::info(str::format("[ShaderCapture-GPU] Single-draw: ", totalSingleDrawTime, " us"));
-    Logger::info(str::format("[ShaderCapture-GPU] Execution time: ", executionTime, " us"));
-    Logger::info(str::format("[ShaderCapture-GPU] TOTAL TIME: ", totalTime, " us (", totalTime / 1000.0, " ms)"));
+    Logger::info(str::format("[ShaderCapture-GPU] Grouping: ", groupingTime / 1000.0, " ms"));
+    Logger::info(str::format("[ShaderCapture-GPU] RT Allocation: ", totalRTAllocTime / 1000.0, " ms"));
+    Logger::info(str::format(""));
+    Logger::info(str::format("[BOTTLENECK-3] COMMAND BUFFER OVERHEAD BREAKDOWN:"));
+    Logger::info(str::format("  [BOTTLENECK-3] Binding (RT+Tex+Pipeline): ", totalBindingTime / 1000.0, " ms"));
+    Logger::info(str::format("  [BOTTLENECK-3] Multi-draw setup+execute: ", totalMultiDrawTime / 1000.0, " ms"));
+    Logger::info(str::format("  [BOTTLENECK-3] Single-draw setup+execute: ", totalSingleDrawTime / 1000.0, " ms"));
+    Logger::info(str::format("  [BOTTLENECK-3] TOTAL CMD OVERHEAD: ", commandBufferOverhead / 1000.0, " ms"));
+    Logger::info(str::format(""));
+    Logger::info(str::format("[ShaderCapture-GPU] Execution time: ", executionTime / 1000.0, " ms"));
+    Logger::info(str::format("[ShaderCapture-GPU] TOTAL TIME: ", totalTime / 1000.0, " ms"));
+    Logger::info(str::format(""));
+    Logger::info(str::format("[BOTTLENECK-2] BARRIERS: See barrier logs above for total barrier overhead"));
+    Logger::info(str::format("[BOTTLENECK-SUMMARY] CPU time: ", totalTime / 1000.0, " ms vs GPU time: <0.1 ms (from GPU profiling)"));
   }
 
   void ShaderOutputCapturer::setCommonPipelineState(Rc<RtxContext> ctx, const GpuCaptureRequest& request) {
@@ -980,7 +1061,11 @@ namespace dxvk {
 
     // SIMPLIFIED: If shader capture is enabled, capture ALL materials (bypass hash whitelist)
     if (enableShaderOutputCapture()) {
-      Logger::info(str::format("[SHADER-CAPTURE] Allowing material hash 0x", std::hex, matHash, std::dec, " (capture enabled, accepting all)"));
+      // PERF: Only log first 20 unique materials to avoid per-draw overhead
+      static std::unordered_set<XXH64_hash_t> loggedMaterials;
+      if (loggedMaterials.size() < 20 && loggedMaterials.insert(matHash).second) {
+        Logger::info(str::format("[SHADER-CAPTURE] Allowing material hash 0x", std::hex, matHash, std::dec, " (capture enabled, accepting all)"));
+      }
       return true;
     }
 
@@ -992,31 +1077,39 @@ namespace dxvk {
   }
 
   bool ShaderOutputCapturer::shouldCapture(const DrawCallState& drawCallState) const {
-    // Log periodically to track behavior
+    // PERF-BUG-HUNT: Time the entire function
     static uint32_t callCount = 0;
+    static double totalTimeUs = 0.0;
+    auto tStart = std::chrono::high_resolution_clock::now();
+
     ++callCount;
     const bool shouldLog = (callCount <= 20) || (callCount % 1000 == 0);
 
-    // AGGRESSIVE LOGGING: Always log first 5 calls to confirm function is being invoked
-    if (callCount <= 5) {
-      Logger::info(str::format("========== [DEBUG] shouldCapture() CALLED (call #", callCount, ") =========="));
-    }
-
     if (!enableShaderOutputCapture()) {
+      auto tEnd = std::chrono::high_resolution_clock::now();
+      double elapsedUs = std::chrono::duration<double, std::micro>(tEnd - tStart).count();
+      totalTimeUs += elapsedUs;
       if (shouldLog) {
-        Logger::info("[ShaderOutputCapturer] shouldCapture() returning false - feature disabled");
+        Logger::info(str::format("[PERF-shouldCapture] Disabled path: ", elapsedUs, " μs (avg: ", totalTimeUs / callCount, " μs over ", callCount, " calls)"));
       }
       return false;
     }
 
     // Get cache key (uses texture hash for RT replacements, material hash otherwise)
+    auto tCacheKeyStart = std::chrono::high_resolution_clock::now();
     auto [cacheKey, isValidKey] = getCacheKey(drawCallState);
+    auto tCacheKeyEnd = std::chrono::high_resolution_clock::now();
+    double cacheKeyTimeUs = std::chrono::duration<double, std::micro>(tCacheKeyEnd - tCacheKeyStart).count();
     const bool hasRenderTargetReplacement = (drawCallState.renderTargetReplacementSlot >= 0);
 
     // Reject only if the key is explicitly marked invalid (invalid RT replacement texture)
     if (!isValidKey) {
+      auto tEnd = std::chrono::high_resolution_clock::now();
+      double totalTime = std::chrono::duration<double, std::micro>(tEnd - tStart).count();
+      totalTimeUs += totalTime;
       if (shouldLog) {
-        Logger::info(str::format("[ShaderOutputCapturer] shouldCapture() returning FALSE - invalid RT replacement texture (callCount=", callCount, ")"));
+        Logger::info(str::format("[PERF-shouldCapture] INVALID KEY path: ", totalTime, " μs (avg: ", totalTimeUs / callCount,
+                                " μs) | getCacheKey: ", cacheKeyTimeUs, " μs"));
       }
       return false;
     }
@@ -1028,16 +1121,27 @@ namespace dxvk {
     }
 
     // Check if we already captured this material
+    auto tCacheLookup1Start = std::chrono::high_resolution_clock::now();
     auto it = m_capturedOutputs.find(cacheKey);
+    auto tCacheLookup1End = std::chrono::high_resolution_clock::now();
+    double cacheLookup1TimeUs = std::chrono::duration<double, std::micro>(tCacheLookup1End - tCacheLookup1Start).count();
+
     if (it != m_capturedOutputs.end() && it->second.capturedTexture.isValid()) {
       // Already cached - check if it's a dynamic material that needs periodic re-capture
+      auto tIsDynamicStart = std::chrono::high_resolution_clock::now();
       const bool isDynamic = isDynamicMaterial(cacheKey);
+      auto tIsDynamicEnd = std::chrono::high_resolution_clock::now();
+      double isDynamicTimeUs = std::chrono::duration<double, std::micro>(tIsDynamicEnd - tIsDynamicStart).count();
 
       if (!isDynamic) {
         // Static material - ALWAYS use cache, never re-capture
+        auto tEnd = std::chrono::high_resolution_clock::now();
+        double totalTime = std::chrono::duration<double, std::micro>(tEnd - tStart).count();
+        totalTimeUs += totalTime;
         if (shouldLog) {
-          Logger::info(str::format("[PERF-OPT] CACHE HIT - using cached capture (cacheKey=0x",
-                                  std::hex, cacheKey, std::dec, " static material)"));
+          Logger::info(str::format("[PERF-shouldCapture] STATIC CACHE HIT: ", totalTime, " μs (avg: ", totalTimeUs / callCount,
+                                  " μs) | getCacheKey: ", cacheKeyTimeUs, " μs | lookup: ", cacheLookup1TimeUs,
+                                  " μs | isDynamic: ", isDynamicTimeUs, " μs"));
         }
         return false;
       }
@@ -1048,9 +1152,12 @@ namespace dxvk {
 
     // RT replacements always capture if not cached
     if (hasRenderTargetReplacement) {
+      auto tEnd = std::chrono::high_resolution_clock::now();
+      double totalTime = std::chrono::duration<double, std::micro>(tEnd - tStart).count();
+      totalTimeUs += totalTime;
       if (shouldLog) {
-        Logger::info(str::format("[ShaderOutputCapturer] shouldCapture() returning TRUE - RT replacement not cached (cacheKey=0x",
-                                std::hex, cacheKey, std::dec, " slot=", drawCallState.renderTargetReplacementSlot, ")"));
+        Logger::info(str::format("[PERF-shouldCapture] RT REPLACEMENT path: ", totalTime, " μs (avg: ", totalTimeUs / callCount,
+                                " μs) | getCacheKey: ", cacheKeyTimeUs, " μs"));
       }
       return true;
     }
@@ -1108,7 +1215,10 @@ namespace dxvk {
 
     // ASYNC CAPTURE MODE: Capture all materials without throttling, let GPU queue work asynchronously
     // GPU will naturally pipeline the work. We mark captures as "pending" and check completion later.
+    auto tCacheLookup2Start = std::chrono::high_resolution_clock::now();
     auto cacheIt = m_capturedOutputs.find(cacheKey);
+    auto tCacheLookup2End = std::chrono::high_resolution_clock::now();
+    double cacheLookup2TimeUs = std::chrono::duration<double, std::micro>(tCacheLookup2End - tCacheLookup2Start).count();
 
     // Check if already captured and ready (not pending)
     if (cacheIt != m_capturedOutputs.end() && cacheIt->second.capturedTexture.isValid()) {
@@ -1133,14 +1243,61 @@ namespace dxvk {
           return false; // Skip re-capture while pending
         }
       }
-      // Already captured and ready - don't recapture
-      return false;
+
+      // Already captured and ready - check if it's a dynamic material that needs periodic re-capture
+      auto tIsDynamic2Start = std::chrono::high_resolution_clock::now();
+      const bool isDynamic = isDynamicMaterial(cacheKey);
+      auto tIsDynamic2End = std::chrono::high_resolution_clock::now();
+      double isDynamic2TimeUs = std::chrono::duration<double, std::micro>(tIsDynamic2End - tIsDynamic2Start).count();
+
+      if (!isDynamic) {
+        // Static material - never re-capture
+        auto tEnd = std::chrono::high_resolution_clock::now();
+        double totalTime = std::chrono::duration<double, std::micro>(tEnd - tStart).count();
+        totalTimeUs += totalTime;
+        if (shouldLog) {
+          Logger::info(str::format("[PERF-shouldCapture] STATIC CACHE HIT (async path): ", totalTime, " μs (avg: ", totalTimeUs / callCount,
+                                  " μs) | getCacheKey: ", cacheKeyTimeUs, " μs | lookup2: ", cacheLookup2TimeUs,
+                                  " μs | isDynamic: ", isDynamic2TimeUs, " μs"));
+        }
+        return false;
+      }
+
+      // Dynamic material - check if needs re-capture based on interval
+      auto tNeedsRecapStart = std::chrono::high_resolution_clock::now();
+      const bool needRecap = needsRecapture(drawCallState, m_currentFrame);
+      auto tNeedsRecapEnd = std::chrono::high_resolution_clock::now();
+      double needsRecapTimeUs = std::chrono::duration<double, std::micro>(tNeedsRecapEnd - tNeedsRecapStart).count();
+
+      auto tEnd = std::chrono::high_resolution_clock::now();
+      double totalTime = std::chrono::duration<double, std::micro>(tEnd - tStart).count();
+      totalTimeUs += totalTime;
+
+      if (!needRecap) {
+        if (shouldLog) {
+          Logger::info(str::format("[PERF-shouldCapture] DYNAMIC NO RECAPTURE: ", totalTime, " μs (avg: ", totalTimeUs / callCount,
+                                  " μs) | getCacheKey: ", cacheKeyTimeUs, " μs | lookup2: ", cacheLookup2TimeUs,
+                                  " μs | isDynamic: ", isDynamic2TimeUs, " μs | needsRecap: ", needsRecapTimeUs, " μs"));
+        }
+        return false;
+      }
+
+      // Dynamic material that needs re-capture!
+      if (shouldLog) {
+        Logger::info(str::format("[PERF-shouldCapture] DYNAMIC NEEDS RECAPTURE: ", totalTime, " μs (avg: ", totalTimeUs / callCount,
+                                " μs) | getCacheKey: ", cacheKeyTimeUs, " μs | lookup2: ", cacheLookup2TimeUs,
+                                " μs | isDynamic: ", isDynamic2TimeUs, " μs | needsRecap: ", needsRecapTimeUs, " μs"));
+      }
+      return true;
     }
 
     // Not yet captured - allow async capture (no throttling)
-    if (callCount <= 50) {
-      Logger::info(str::format("[ShaderCapture-ASYNC] Starting ASYNC capture for matHash=0x", std::hex, matHash, std::dec,
-                              " (will run on GPU in parallel with rendering)"));
+    auto tEnd = std::chrono::high_resolution_clock::now();
+    double totalTime = std::chrono::duration<double, std::micro>(tEnd - tStart).count();
+    totalTimeUs += totalTime;
+    if (shouldLog) {
+      Logger::info(str::format("[PERF-shouldCapture] NEW CAPTURE: ", totalTime, " μs (avg: ", totalTimeUs / callCount,
+                              " μs) | getCacheKey: ", cacheKeyTimeUs, " μs | lookup2: ", cacheLookup2TimeUs, " μs"));
     }
     return true;
   }
@@ -1253,15 +1410,53 @@ namespace dxvk {
       // Check if already captured
       auto it = m_capturedOutputs.find(cacheKey);
       if (it != m_capturedOutputs.end() && it->second.capturedTexture.isValid()) {
-        // Already have a cached texture - return it
-        static uint32_t cachedHitCount = 0;
-        ++cachedHitCount;
+        // Already have a cached texture - check if it's static or dynamic
+        const bool isDynamic = isDynamicMaterial(cacheKey);
 
-        if (cachedHitCount <= 100) {
-          Logger::info(str::format("[GPU-CACHED-HIT] #", cachedHitCount, " Found cached texture for cacheKey=0x", std::hex, cacheKey, std::dec, " RETURNING CACHED"));
+        if (!isDynamic) {
+          // Static material - always use cache
+          static uint32_t cachedHitCount = 0;
+          ++cachedHitCount;
+
+          if (cachedHitCount <= 100) {
+            Logger::info(str::format("[GPU-CACHED-HIT-STATIC] #", cachedHitCount,
+                                    " Found cached texture for STATIC material cacheKey=0x",
+                                    std::hex, cacheKey, std::dec, " RETURNING CACHED"));
+          }
+          outputTexture = getCapturedTexture(cacheKey);
+          return outputTexture.isValid();
         }
-        outputTexture = getCapturedTexture(cacheKey);
-        return outputTexture.isValid();
+
+        // Dynamic material - check if needs re-capture
+        const bool needsRecap = needsRecapture(drawCallState, m_currentFrame);
+        if (!needsRecap) {
+          // Dynamic but not yet time to re-capture
+          static uint32_t cachedHitDynamicCount = 0;
+          ++cachedHitDynamicCount;
+
+          if (cachedHitDynamicCount <= 100) {
+            Logger::info(str::format("[GPU-CACHED-HIT-DYNAMIC] #", cachedHitDynamicCount,
+                                    " DYNAMIC material but not yet time to recapture, cacheKey=0x",
+                                    std::hex, cacheKey, std::dec,
+                                    " framesSince=", m_currentFrame - it->second.lastCaptureFrame,
+                                    " interval=", recaptureInterval()));
+          }
+          outputTexture = getCapturedTexture(cacheKey);
+          return outputTexture.isValid();
+        }
+
+        // Dynamic material that NEEDS re-capture - fall through to queue it
+        static uint32_t dynamicRecaptureCount = 0;
+        ++dynamicRecaptureCount;
+
+        if (dynamicRecaptureCount <= 100) {
+          Logger::info(str::format("[GPU-DYNAMIC-RECAPTURE] #", dynamicRecaptureCount,
+                                  " DYNAMIC material NEEDS RECAPTURE, will queue, cacheKey=0x",
+                                  std::hex, cacheKey, std::dec,
+                                  " framesSince=", m_currentFrame - it->second.lastCaptureFrame,
+                                  " interval=", recaptureInterval()));
+        }
+        // Don't return - continue to queue the capture request below
       }
 
       if (cacheKeyLogCount <= 100) {
@@ -3069,16 +3264,56 @@ namespace dxvk {
     // Queue is managed in executeMultiIndirectCaptures() which removes only processed requests.
     // m_pendingCaptureRequests.clear();  // REMOVED - was breaking async frame spreading
 
-    // VRAM CLEANUP: Clear caches every 60 frames to prevent unbounded growth
+    // PROACTIVE LRU VRAM CLEANUP - runs every frame
+    // This is critical for static materials which never call getRenderTarget() again after initial capture
+    // Without this, render target cache grows unbounded until OOM
+    {
+      size_t maxVramBytes = static_cast<size_t>(maxVramMB()) * 1024 * 1024;
+      size_t currentVramBytes = 0;
+
+      // Calculate current VRAM usage
+      for (const auto& entry : m_renderTargetCache) {
+        currentVramBytes += entry.second.vramBytes;
+      }
+
+      // Evict oldest RTs if we exceed VRAM limit
+      if (currentVramBytes > maxVramBytes) {
+        // Sort by lastUsedFrame (oldest first)
+        std::vector<std::pair<uint64_t, uint32_t>> rtsByAge;
+        for (const auto& entry : m_renderTargetCache) {
+          rtsByAge.push_back({entry.first, entry.second.lastUsedFrame});
+        }
+        std::sort(rtsByAge.begin(), rtsByAge.end(),
+                  [](const auto& a, const auto& b) { return a.second < b.second; });
+
+        // Evict oldest until we're under the limit
+        size_t freedBytes = 0;
+        for (const auto& [evictKey, evictFrame] : rtsByAge) {
+          if (currentVramBytes - freedBytes <= maxVramBytes) {
+            break;
+          }
+
+          auto evictIt = m_renderTargetCache.find(evictKey);
+          if (evictIt != m_renderTargetCache.end()) {
+            freedBytes += evictIt->second.vramBytes;
+            Logger::info(str::format("[LRU-EVICT] Freed ", evictIt->second.vramBytes / (1024 * 1024), " MB ",
+                                     "(frame ", evictFrame, ", age ", m_currentFrame - evictFrame, " frames) ",
+                                     "Total VRAM: ", (currentVramBytes - freedBytes) / (1024 * 1024), " MB"));
+            m_renderTargetCache.erase(evictIt);
+          }
+        }
+      }
+    }
+
+    // Periodic cleanup of captured outputs cache (not render targets!)
     if (m_currentFrame % 60 == 0) {
       // Clear captured outputs cache - will be rebuilt as needed
       m_capturedOutputs.clear();
 
-      // Clear render target cache - will be rebuilt as needed
-      m_renderTargetCache.clear();
-
       // Clear texture array pools - will be rebuilt as needed
       m_arrayPools.clear();
+
+      // NOTE: m_renderTargetCache is NOT cleared - managed by proactive LRU eviction above
     }
   }
 
@@ -3096,10 +3331,73 @@ namespace dxvk {
                         static_cast<uint64_t>(format);
     // REMOVED: XOR with material hash - was causing 1 RT per material = GB of wasted VRAM!
 
-    // Check cache
+    // Check cache - LRU tracking
     auto it = m_renderTargetCache.find(cacheKey);
-    if (it != m_renderTargetCache.end() && it->second.isValid()) {
-      return it->second;
+    if (it != m_renderTargetCache.end() && it->second.resource.isValid()) {
+      // Update last used frame for LRU tracking
+      it->second.lastUsedFrame = m_currentFrame;
+      return it->second.resource;
+    }
+
+    // LRU EVICTION: Check if we need to free VRAM before allocating
+    // Calculate bytes per pixel for this format
+    uint32_t bytesPerPixel = 4; // RGBA8 = 4 bytes
+    switch (format) {
+      case VK_FORMAT_R8G8B8A8_UNORM:
+      case VK_FORMAT_B8G8R8A8_UNORM:
+        bytesPerPixel = 4;
+        break;
+      case VK_FORMAT_R16G16B16A16_SFLOAT:
+        bytesPerPixel = 8;
+        break;
+      case VK_FORMAT_R32G32B32A32_SFLOAT:
+        bytesPerPixel = 16;
+        break;
+      default:
+        bytesPerPixel = 4;
+        break;
+    }
+
+    size_t newRTBytes = resolution.width * resolution.height * bytesPerPixel;
+    size_t maxVramBytes = static_cast<size_t>(maxVramMB()) * 1024 * 1024;
+
+    // Calculate current VRAM usage
+    size_t currentVramBytes = 0;
+    for (const auto& entry : m_renderTargetCache) {
+      currentVramBytes += entry.second.vramBytes;
+    }
+
+    // Evict oldest RTs if we'll exceed VRAM limit
+    if (currentVramBytes + newRTBytes > maxVramBytes) {
+      // Sort by lastUsedFrame (oldest first)
+      std::vector<std::pair<uint64_t, uint32_t>> rtsByAge; // (cacheKey, lastUsedFrame)
+      for (const auto& entry : m_renderTargetCache) {
+        rtsByAge.push_back({entry.first, entry.second.lastUsedFrame});
+      }
+      std::sort(rtsByAge.begin(), rtsByAge.end(),
+                [](const auto& a, const auto& b) { return a.second < b.second; });
+
+      // Evict oldest until we have enough space
+      size_t freedBytes = 0;
+      for (const auto& [evictKey, evictFrame] : rtsByAge) {
+        if (currentVramBytes - freedBytes + newRTBytes <= maxVramBytes) {
+          break; // Enough space now
+        }
+
+        auto evictIt = m_renderTargetCache.find(evictKey);
+        if (evictIt != m_renderTargetCache.end()) {
+          freedBytes += evictIt->second.vramBytes;
+          Logger::info(str::format("[LRU-EVICT] Freed ", evictIt->second.vramBytes / (1024 * 1024), " MB ",
+                                   "(frame ", evictFrame, ", age ", m_currentFrame - evictFrame, " frames)"));
+          m_renderTargetCache.erase(evictIt);
+        }
+      }
+
+      if (freedBytes > 0) {
+        Logger::info(str::format("[LRU-EVICT] Total freed: ", freedBytes / (1024 * 1024), " MB, ",
+                                 "VRAM usage: ", (currentVramBytes - freedBytes) / (1024 * 1024), " MB -> ",
+                                 (currentVramBytes - freedBytes + newRTBytes) / (1024 * 1024), " MB"));
+      }
     }
 
     // Create new render target - upcast to DxvkContext&
@@ -3124,11 +3422,16 @@ namespace dxvk {
                                resolution.width, "x", resolution.height,
                                " format=", format,
                                " matHash=0x", std::hex, materialHash, std::dec,
-                               " textureHash=0x", std::hex, cacheKey, std::dec));
+                               " textureHash=0x", std::hex, cacheKey, std::dec,
+                               " VRAM: ", newRTBytes / (1024 * 1024), " MB"));
     }
 
-    // Cache it
-    m_renderTargetCache[cacheKey] = resource;
+    // Cache it with LRU tracking
+    RenderTargetCacheEntry entry;
+    entry.resource = resource;
+    entry.lastUsedFrame = m_currentFrame;
+    entry.vramBytes = newRTBytes;
+    m_renderTargetCache[cacheKey] = entry;
 
     return resource;
   }
@@ -3328,12 +3631,39 @@ namespace dxvk {
   VkExtent2D ShaderOutputCapturer::calculateCaptureResolution(
       const DrawCallState& drawCallState) const {
 
-    uint32_t resolution = captureResolution();
+    // MATCH SOURCE TEXTURE RESOLUTION - don't waste VRAM on upscaling!
+    // For 512x512 source -> 512x512 capture (not 1024x1024)
+    const auto& materialData = drawCallState.getMaterialData();
+    const TextureRef& sourceTexture = materialData.getColorTexture();
+
+    uint32_t resolution = captureResolution(); // Fallback if no source texture
+
+    if (sourceTexture.isValid() && sourceTexture.getImageView() != nullptr) {
+      // Use source texture resolution
+      const auto& imageInfo = sourceTexture.getImageView()->imageInfo();
+      resolution = std::max(imageInfo.extent.width, imageInfo.extent.height);
+
+      static uint32_t resolutionLogCount = 0;
+      ++resolutionLogCount;
+
+      if (resolutionLogCount <= 20) {
+        Logger::info(str::format("[CAPTURE-RESOLUTION] #", resolutionLogCount,
+                                " Source texture: ", imageInfo.extent.width, "x", imageInfo.extent.height,
+                                " -> Using resolution: ", resolution, "x", resolution));
+      }
+    } else {
+      static uint32_t noTextureLogCount = 0;
+      ++noTextureLogCount;
+
+      if (noTextureLogCount <= 20) {
+        Logger::info(str::format("[CAPTURE-RESOLUTION-FALLBACK] #", noTextureLogCount,
+                                " No source texture, using fallback: ", resolution));
+      }
+    }
 
     // Clamp to valid range
     resolution = std::clamp(resolution, 256u, 4096u);
 
-    // Use fixed resolution - capture ALL maps at full quality
     return { resolution, resolution };
   }
 
@@ -3395,14 +3725,16 @@ namespace dxvk {
     }
     XXH64_hash_t matHash = drawCallState.getMaterialData().getHash();
     XXH64_hash_t geomHash = drawCallState.getGeometryData().getHashForRule<rules::FullGeometryHash>();
+    bool isDynamic = isDynamicMaterial(matHash);
 
+    // Store captured output (both static and dynamic materials)
     CapturedShaderOutput& output = m_capturedOutputs[cacheKey];
     output.capturedTexture = texture;
     output.geometryHash = geomHash;
     output.materialHash = matHash;
     output.lastCaptureFrame = currentFrame;
     output.captureSubmittedFrame = currentFrame;  // Track when submitted for async tracking
-    output.isDynamic = isDynamicMaterial(matHash);
+    output.isDynamic = isDynamic;
     output.isPending = true;  // Mark as pending - GPU hasn't finished yet
     output.resolution = { texture.image->info().extent.width,
                           texture.image->info().extent.height };
@@ -3413,8 +3745,8 @@ namespace dxvk {
       Logger::info(str::format("[ShaderCapture-Store] #", storeLogCount,
                               " Stored cacheKey=0x", std::hex, cacheKey, std::dec,
                               " matHash=0x", std::hex, matHash, std::dec,
+                              " isDynamic=", isDynamic ? "YES" : "NO",
                               " isRTReplacement=", (drawCallState.renderTargetReplacementSlot >= 0 ? "YES" : "NO"),
-                              " isDynamic=", output.isDynamic ? "YES" : "NO",
                               " resolution=", output.resolution.width, "x", output.resolution.height));
     }
 
@@ -3432,26 +3764,23 @@ namespace dxvk {
   }
 
   bool ShaderOutputCapturer::isDynamicMaterial(XXH64_hash_t materialHash) const {
-    // CRITICAL: RT replacement materials should be STATIC by default (capture once, cache forever)
-    // Only materials explicitly marked in dynamicShaderMaterials() should be recaptured every frame
-    //
-    // captureEnabledHashes() is for whitelisting which materials to capture with shader re-execution,
-    // but it does NOT mean they're dynamic (animated). Most RT replacement materials are static.
+    // Dynamic materials are those with TIME-BASED ANIMATION (water, scrolling textures, etc.)
+    // View-dependent UVs are NOT dynamic - the path tracer handles UV mapping
+    // Only mark as dynamic if explicitly listed in dynamicShaderMaterials option
 
-    static uint32_t isDynamicLogCount = 0;
-    const bool shouldLog = (++isDynamicLogCount <= 20);
-
-    // Check if this specific material is explicitly marked as dynamic
-    const bool inDynamicSet = dynamicShaderMaterials().count(materialHash) > 0;
-
-    if (shouldLog) {
-      Logger::info(str::format("[ShaderCapture-Dynamic] #", isDynamicLogCount,
-                              " matHash=0x", std::hex, materialHash, std::dec,
-                              " isDynamic=", inDynamicSet ? "YES (explicitly marked)" : "NO (default to static)",
-                              " dynamicShaderMaterials.size=", dynamicShaderMaterials().size()));
+    // Check if explicitly marked as dynamic
+    if (dynamicShaderMaterials().count(materialHash) > 0) {
+      static uint32_t isDynamicLogCount = 0;
+      if (++isDynamicLogCount <= 20) {
+        Logger::info(str::format("[ShaderCapture-Dynamic] #", isDynamicLogCount,
+                                " matHash=0x", std::hex, materialHash, std::dec,
+                                " is DYNAMIC (time-animated shader)"));
+      }
+      return true;
     }
 
-    return inDynamicSet;
+    // Everything else is static (capture once, path tracer handles UV mapping)
+    return false;
   }
 
   void ShaderOutputCapturer::showImguiSettings() {

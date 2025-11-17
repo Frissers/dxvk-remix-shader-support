@@ -288,7 +288,7 @@ namespace dxvk {
   public:
     // Shader output capture - prepares capture texture and sets it in active draw call state
     // Returns the capture texture to copy into, or nullptr if capture not needed
-    Rc<DxvkImageView> prepareFramebufferCapture(const Rc<DxvkImageView>& srcRenderTarget);
+    Rc<DxvkImageView> prepareFramebufferCapture(D3D9Surface* srcRenderTarget);
 
     // Render target replacement - temporarily swap textures before draw execution
     // Returns true if textures were swapped (caller must call restoreReplacedTextures after draw)
@@ -300,6 +300,9 @@ namespace dxvk {
     // OPTION A: Capture original D3D9 vertex/index buffers for shader re-execution
     // Must be called AFTER PrepareDraw() but BEFORE EmitCs() to capture the D3D9 state
     void captureOriginalD3D9Buffers(const Direct3DState9& state);
+
+    // Quick check if we should capture buffers (avoids expensive copies if capture won't be used)
+    bool shouldCaptureBuffers(const Direct3DState9& state) const;
 
   private:
     // Storage for original texture pointers during render target replacement

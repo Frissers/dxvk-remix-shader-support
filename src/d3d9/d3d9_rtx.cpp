@@ -1811,6 +1811,32 @@ namespace dxvk {
     }
   }
 
+  bool D3D9Rtx::shouldCaptureBuffers(const Direct3DState9& state) const {
+    // OPTIMIZATION: Quick check before expensive buffer copies
+    // Only copy buffers if this draw call will actually be captured for shader re-execution
+
+    // Requirement 1: Must have both vertex and pixel shaders
+    if (state.vertexShader == nullptr || state.pixelShader == nullptr) {
+      return false;
+    }
+
+    // Requirement 2: Must have vertex declaration
+    if (state.vertexDecl == nullptr) {
+      return false;
+    }
+
+    // CRITICAL PERF FIX: Check if this specific material needs capture
+    // If the material is already cached (static material), don't waste time capturing buffers!
+    // This prevents hundreds of expensive buffer locks/copies per frame for cached materials.
+    const bool needsCapture = ShaderOutputCapturer::shouldCaptureStatic(m_activeDrawCallState);
+    if (!needsCapture) {
+      return false;
+    }
+
+    // All checks passed - worth capturing buffers
+    return true;
+  }
+
 bool D3D9Rtx::shouldCaptureFramebuffer() const {
     // Check if shader output capture is enabled (either all draws or specific hashes)
     static uint32_t s_logCount = 0;
@@ -1826,13 +1852,34 @@ bool D3D9Rtx::shouldCaptureFramebuffer() const {
     return result;
   }
 
-  Rc<DxvkImageView> D3D9Rtx::prepareFramebufferCapture(const Rc<DxvkImageView>& srcRenderTarget) {
+  Rc<DxvkImageView> D3D9Rtx::prepareFramebufferCapture(D3D9Surface* srcRenderTarget) {
+    static uint32_t logCount = 0;
+    ++logCount;
+
     if (!shouldCaptureFramebuffer() || srcRenderTarget == nullptr) {
+      if (logCount <= 10) {
+        Logger::info(str::format("[prepareFramebuffer-SKIP] shouldCaptureFramebuffer=", shouldCaptureFramebuffer(), " srcRenderTarget=", srcRenderTarget != nullptr ? "valid" : "null"));
+      }
       return nullptr;
     }
 
+    // CRITICAL PERF FIX: Check if this specific material needs capture
+    // If the material is already cached (static material or not time for recapture),
+    // return nullptr to skip framebuffer copy AND expensive GetImageView() call.
+    // This prevents hundreds of GetImageView() calls per frame for cached materials.
+    const bool needsCapture = ShaderOutputCapturer::shouldCaptureStatic(m_activeDrawCallState);
+    if (logCount <= 10) {
+      Logger::info(str::format("[prepareFramebuffer-CHECK] needsCapture=", needsCapture ? 1 : 0));
+    }
+    if (!needsCapture) {
+      return nullptr;
+    }
+
+    // PERF: Only call expensive GetImageView() when we actually need to capture
+    Rc<DxvkImageView> srcImageView = srcRenderTarget->GetImageView(false);
+
     // Get render target properties
-    const auto& rtInfo = srcRenderTarget->imageInfo();
+    const auto& rtInfo = srcImageView->imageInfo();
     VkFormat format = rtInfo.format;
     VkExtent3D extent = rtInfo.extent;
 

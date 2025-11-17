@@ -45,6 +45,7 @@
 #include "../dxvk/rtx_render/rtx_context.h"
 #include "../dxvk/rtx_render/rtx_options.h"
 #include "../dxvk/rtx_render/rtx_terrain_baker.h"
+#include "../dxvk/rtx_render/rtx_shader_output_capturer.h"
 
 #include "d3d9_initializer.h"
 
@@ -2616,24 +2617,49 @@ namespace dxvk {
     if ((drawPrepare & PrepareDrawFlag::ApplyDrawState) ||
         (drawPrepare & PrepareDrawFlag::OriginalDrawCall)) {
       // Apply render target texture replacements BEFORE PrepareDraw binds textures
-      const bool didReplaceTextures = m_rtx.applyRenderTargetTextureReplacements();
+      // PERF FIX: Only do this if shader capture is enabled AND material needs capture
+      // Skip this entirely for cached materials to avoid overhead on every draw call
+      bool didReplaceTextures = false;
+      if (ShaderOutputCapturer::enableShaderOutputCapture() && m_rtx.shouldCaptureBuffers(m_state)) {
+        didReplaceTextures = m_rtx.applyRenderTargetTextureReplacements();
+      }
 
       PrepareDraw(PrimitiveType);
 
-      // OPTION A: Capture original D3D9 buffers for shader re-execution
-      // This must be called AFTER PrepareDraw() while D3D9 state is still available
-      m_rtx.captureOriginalD3D9Buffers(m_state);
+      // OPTIMIZATION: Only capture buffers if we'll actually use them
+      // captureOriginalD3D9Buffers() locks/copies ALL vertex/index buffers + 4KB of shader constants
+      // This was running for EVERY draw call, causing 50-100ms GPU stalls!
+      // Now we check if capture is enabled AND if this draw call qualifies BEFORE expensive copies
+      const bool shouldAttemptCapture = ShaderOutputCapturer::enableShaderOutputCapture() &&
+                                       m_rtx.shouldCaptureBuffers(m_state);
+      if (shouldAttemptCapture) {
+        // OPTION A: Capture original D3D9 buffers for shader re-execution
+        // This must be called AFTER PrepareDraw() while D3D9 state is still available
+        m_rtx.captureOriginalD3D9Buffers(m_state);
+      }
 
       // Prepare framebuffer capture texture ONLY for rasterized draws (OriginalDrawCall).
       // For raytraced-only draws, shader output capturer will re-execute the draw with replacement textures.
       // If we set capturedFramebufferOutput for non-executing draws, it will be empty and break replacement.
       Rc<DxvkImageView> captureView = nullptr;
-      const bool shouldCaptureFramebuffer = (drawPrepare & PrepareDrawFlag::OriginalDrawCall) && m_state.renderTargets[0] != nullptr;
-      if (drawPrepareLogCount <= 10) {
-        Logger::info(str::format("[D3D9Device] shouldCaptureFramebuffer=", shouldCaptureFramebuffer ? 1 : 0));
+      // CRITICAL PERF FIX: Only call GetImageView() if shader capture is actually enabled
+      // GetImageView() can be expensive and was being called on every draw call
+      const bool shouldCaptureFramebuffer = (drawPrepare & PrepareDrawFlag::OriginalDrawCall) &&
+                                           m_state.renderTargets[0] != nullptr &&
+                                           ShaderOutputCapturer::enableShaderOutputCapture();
+      static uint32_t deviceLogCount = 0;
+      ++deviceLogCount;
+      if (deviceLogCount <= 10) {
+        Logger::info(str::format("[D3D9Device-DRAW] shouldCaptureFramebuffer=", shouldCaptureFramebuffer ? 1 : 0));
       }
       if (shouldCaptureFramebuffer) {
-        captureView = m_rtx.prepareFramebufferCapture(m_state.renderTargets[0]->GetImageView(false));
+        if (deviceLogCount <= 10) {
+          Logger::info("[D3D9Device-CALL] Calling GetImageView() and prepareFramebufferCapture()");
+        }
+        captureView = m_rtx.prepareFramebufferCapture(m_state.renderTargets[0].ptr());
+        if (deviceLogCount <= 10) {
+          Logger::info(str::format("[D3D9Device-RESULT] captureView=", captureView != nullptr ? "VALID" : "nullptr"));
+        }
       }
 
       EmitCs([this,
@@ -2715,20 +2741,36 @@ namespace dxvk {
     if ((drawPrepare & PrepareDrawFlag::ApplyDrawState) ||
         (drawPrepare & PrepareDrawFlag::OriginalDrawCall)) {
       // Apply render target texture replacements BEFORE PrepareDraw binds textures
-      const bool didReplaceTextures = m_rtx.applyRenderTargetTextureReplacements();
+      // PERF FIX: Only do this if shader capture is enabled AND material needs capture
+      // Skip this entirely for cached materials to avoid overhead on every draw call
+      bool didReplaceTextures = false;
+      if (ShaderOutputCapturer::enableShaderOutputCapture() && m_rtx.shouldCaptureBuffers(m_state)) {
+        didReplaceTextures = m_rtx.applyRenderTargetTextureReplacements();
+      }
 
       PrepareDraw(PrimitiveType);
 
-      // OPTION A: Capture original D3D9 buffers for shader re-execution
-      // This must be called AFTER PrepareDraw() while D3D9 state is still available
-      m_rtx.captureOriginalD3D9Buffers(m_state);
+      // OPTIMIZATION: Only capture buffers if we'll actually use them
+      // captureOriginalD3D9Buffers() locks/copies ALL vertex/index buffers + 4KB of shader constants
+      // This was running for EVERY draw call, causing 50-100ms GPU stalls!
+      // Now we check if capture is enabled AND if this draw call qualifies BEFORE expensive copies
+      const bool shouldAttemptCapture = ShaderOutputCapturer::enableShaderOutputCapture() &&
+                                       m_rtx.shouldCaptureBuffers(m_state);
+      if (shouldAttemptCapture) {
+        // OPTION A: Capture original D3D9 buffers for shader re-execution
+        // This must be called AFTER PrepareDraw() while D3D9 state is still available
+        m_rtx.captureOriginalD3D9Buffers(m_state);
+      }
 
       // Prepare framebuffer capture texture ONLY for rasterized draws (OriginalDrawCall).
       // For raytraced-only draws, shader output capturer will re-execute the draw with replacement textures.
       // If we set capturedFramebufferOutput for non-executing draws, it will be empty and break replacement.
+      // CRITICAL PERF FIX: Only call GetImageView() if shader capture is actually enabled
       Rc<DxvkImageView> captureView = nullptr;
-      if ((drawPrepare & PrepareDrawFlag::OriginalDrawCall) && m_state.renderTargets[0] != nullptr) {
-        captureView = m_rtx.prepareFramebufferCapture(m_state.renderTargets[0]->GetImageView(false));
+      if ((drawPrepare & PrepareDrawFlag::OriginalDrawCall) &&
+          m_state.renderTargets[0] != nullptr &&
+          ShaderOutputCapturer::enableShaderOutputCapture()) {
+        captureView = m_rtx.prepareFramebufferCapture(m_state.renderTargets[0].ptr());
       }
 
       EmitCs([this,
@@ -2819,16 +2861,27 @@ namespace dxvk {
         (drawPrepare & PrepareDrawFlag::OriginalDrawCall)) {
       PrepareDraw(PrimitiveType);
 
-      // OPTION A: Capture original D3D9 buffers for shader re-execution
-      // This must be called AFTER PrepareDraw() while D3D9 state is still available
-      m_rtx.captureOriginalD3D9Buffers(m_state);
+      // OPTIMIZATION: Only capture buffers if we'll actually use them
+      // captureOriginalD3D9Buffers() locks/copies ALL vertex/index buffers + 4KB of shader constants
+      // This was running for EVERY draw call, causing 50-100ms GPU stalls!
+      // Now we check if capture is enabled AND if this draw call qualifies BEFORE expensive copies
+      const bool shouldAttemptCapture = ShaderOutputCapturer::enableShaderOutputCapture() &&
+                                       m_rtx.shouldCaptureBuffers(m_state);
+      if (shouldAttemptCapture) {
+        // OPTION A: Capture original D3D9 buffers for shader re-execution
+        // This must be called AFTER PrepareDraw() while D3D9 state is still available
+        m_rtx.captureOriginalD3D9Buffers(m_state);
+      }
 
       // Prepare framebuffer capture texture ONLY for rasterized draws (OriginalDrawCall).
       // For raytraced-only draws, shader output capturer will re-execute the draw with replacement textures.
       // If we set capturedFramebufferOutput for non-executing draws, it will be empty and break replacement.
+      // CRITICAL PERF FIX: Only call GetImageView() if shader capture is actually enabled
       Rc<DxvkImageView> captureView = nullptr;
-      if ((drawPrepare & PrepareDrawFlag::OriginalDrawCall) && m_state.renderTargets[0] != nullptr) {
-        captureView = m_rtx.prepareFramebufferCapture(m_state.renderTargets[0]->GetImageView(false));
+      if ((drawPrepare & PrepareDrawFlag::OriginalDrawCall) &&
+          m_state.renderTargets[0] != nullptr &&
+          ShaderOutputCapturer::enableShaderOutputCapture()) {
+        captureView = m_rtx.prepareFramebufferCapture(m_state.renderTargets[0].ptr());
       }
 
       EmitCs([this,
@@ -2927,16 +2980,27 @@ namespace dxvk {
         (drawPrepare & PrepareDrawFlag::OriginalDrawCall)) {
       PrepareDraw(PrimitiveType);
 
-      // OPTION A: Capture original D3D9 buffers for shader re-execution
-      // This must be called AFTER PrepareDraw() while D3D9 state is still available
-      m_rtx.captureOriginalD3D9Buffers(m_state);
+      // OPTIMIZATION: Only capture buffers if we'll actually use them
+      // captureOriginalD3D9Buffers() locks/copies ALL vertex/index buffers + 4KB of shader constants
+      // This was running for EVERY draw call, causing 50-100ms GPU stalls!
+      // Now we check if capture is enabled AND if this draw call qualifies BEFORE expensive copies
+      const bool shouldAttemptCapture = ShaderOutputCapturer::enableShaderOutputCapture() &&
+                                       m_rtx.shouldCaptureBuffers(m_state);
+      if (shouldAttemptCapture) {
+        // OPTION A: Capture original D3D9 buffers for shader re-execution
+        // This must be called AFTER PrepareDraw() while D3D9 state is still available
+        m_rtx.captureOriginalD3D9Buffers(m_state);
+      }
 
       // Prepare framebuffer capture texture ONLY for rasterized draws (OriginalDrawCall).
       // For raytraced-only draws, shader output capturer will re-execute the draw with replacement textures.
       // If we set capturedFramebufferOutput for non-executing draws, it will be empty and break replacement.
+      // CRITICAL PERF FIX: Only call GetImageView() if shader capture is actually enabled
       Rc<DxvkImageView> captureView = nullptr;
-      if ((drawPrepare & PrepareDrawFlag::OriginalDrawCall) && m_state.renderTargets[0] != nullptr) {
-        captureView = m_rtx.prepareFramebufferCapture(m_state.renderTargets[0]->GetImageView(false));
+      if ((drawPrepare & PrepareDrawFlag::OriginalDrawCall) &&
+          m_state.renderTargets[0] != nullptr &&
+          ShaderOutputCapturer::enableShaderOutputCapture()) {
+        captureView = m_rtx.prepareFramebufferCapture(m_state.renderTargets[0].ptr());
       }
 
       EmitCs([this,
