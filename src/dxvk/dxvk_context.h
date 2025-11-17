@@ -271,6 +271,12 @@ namespace dxvk {
     void changeImageLayout(
       const Rc<DxvkImage>&        image,
             VkImageLayout         layout);
+
+    // NV-DXVK start: batched image layout transitions for shader capture
+    // Transitions multiple images to target layouts in ONE barrier (massive perf win!)
+    void batchChangeImageLayout(
+      const std::vector<std::pair<Rc<DxvkImage>, VkImageLayout>>& imageLayoutPairs);
+    // NV-DXVK end
     
     /**
      * \brief Clears a buffer with a fixed value

@@ -1813,7 +1813,17 @@ namespace dxvk {
 
 bool D3D9Rtx::shouldCaptureFramebuffer() const {
     // Check if shader output capture is enabled (either all draws or specific hashes)
-    return ShaderOutputCapturer::captureAllDraws() || !ShaderOutputCapturer::captureEnabledHashes().empty();
+    static uint32_t s_logCount = 0;
+    bool result = ShaderOutputCapturer::captureAllDraws() || !ShaderOutputCapturer::captureEnabledHashes().empty();
+
+    if (++s_logCount <= 10) {
+      Logger::info(str::format("[D3D9RTX-FRAMEBUFFER #", s_logCount, "] shouldCaptureFramebuffer() called - ",
+                              "captureAllDraws=", ShaderOutputCapturer::captureAllDraws(),
+                              " hashesSize=", ShaderOutputCapturer::captureEnabledHashes().size(),
+                              " RETURNING: ", result));
+    }
+
+    return result;
   }
 
   Rc<DxvkImageView> D3D9Rtx::prepareFramebufferCapture(const Rc<DxvkImageView>& srcRenderTarget) {

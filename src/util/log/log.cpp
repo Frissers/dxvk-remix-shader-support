@@ -157,7 +157,7 @@ namespace dxvk {
         return pair.second;
     }
 
-    return LogLevel::None;  // DISABLED: Changed from Info to None to disable all logging for performance
+    return LogLevel::Info;  // RE-ENABLED for barrier debugging
   }
   
   std::string Logger::getFilePath(const std::string& fileName) {

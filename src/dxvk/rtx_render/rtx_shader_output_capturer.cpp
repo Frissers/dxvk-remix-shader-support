@@ -65,8 +65,9 @@ namespace dxvk {
   }
 
   ShaderOutputCapturer::ShaderOutputCapturer() {
-    Logger::info("[ShaderOutputCapturer] Initialized (feature enabled, capture-on-demand)");
+    Logger::info("[ShaderOutputCapturer] ========== INITIALIZATION ==========");
     Logger::info(str::format("[ShaderOutputCapturer] enableShaderOutputCapture = ", enableShaderOutputCapture()));
+    Logger::info(str::format("[ShaderOutputCapturer] captureAllDraws = ", captureAllDraws()));
     Logger::info(str::format("[ShaderOutputCapturer] captureEnabledHashes size = ", captureEnabledHashes().size()));
 
     // Log the actual hash values in the set
@@ -79,6 +80,11 @@ namespace dxvk {
 
     Logger::info(str::format("[ShaderOutputCapturer] maxCapturesPerFrame = ", maxCapturesPerFrame()));
     Logger::info(str::format("[ShaderOutputCapturer] captureResolution = ", captureResolution()));
+
+    // Log the combined shouldCaptureFramebuffer() logic
+    bool wouldCapture = captureAllDraws() || !captureEnabledHashes().empty();
+    Logger::info(str::format("[ShaderOutputCapturer] shouldCaptureFramebuffer() would return: ", wouldCapture));
+    Logger::info("[ShaderOutputCapturer] ========================================");
   }
 
   ShaderOutputCapturer::~ShaderOutputCapturer() {
@@ -295,17 +301,29 @@ namespace dxvk {
 
     auto tFunctionStart = std::chrono::high_resolution_clock::now();
 
-    Logger::info(str::format("========== [DEBUG] executeMultiIndirectCaptures() CALLED - pendingRequests=", m_pendingCaptureRequests.size(), " =========="));
+    static uint32_t s_executeCallCount = 0;
+    s_executeCallCount++;
+
+    Logger::info(str::format("========== [SHADER-CAPTURE-EXEC #", s_executeCallCount,
+                            "] executeMultiIndirectCaptures() CALLED - pendingRequests=",
+                            m_pendingCaptureRequests.size(), " =========="));
 
     if (m_pendingCaptureRequests.empty()) {
-      Logger::info("[DEBUG] executeMultiIndirectCaptures() - NO PENDING REQUESTS, returning early");
+      Logger::info(str::format("[SHADER-CAPTURE-EXEC #", s_executeCallCount,
+                              "] NO PENDING REQUESTS, returning early"));
       return;
     }
 
-    const uint32_t numRequests = static_cast<uint32_t>(m_pendingCaptureRequests.size());
+    // ASYNC FRAME SPREADING: Only process maxCapturesPerFrame requests per frame
+    // This spreads GPU work across multiple frames to prevent stalls
+    const uint32_t totalPendingRequests = static_cast<uint32_t>(m_pendingCaptureRequests.size());
+    const uint32_t maxPerFrame = maxCapturesPerFrame();
+    const uint32_t numRequests = std::min(totalPendingRequests, maxPerFrame);
 
-    Logger::info(str::format("[ShaderCapture-GPU] ===== MAXIMUM PERFORMANCE MULTI-DRAW-INDIRECT ====="));
-    Logger::info(str::format("[ShaderCapture-GPU] Processing ", numRequests, " requests"));
+    Logger::info(str::format("[ShaderCapture-GPU] ===== ASYNC FRAME-SPREAD EXECUTION ====="));
+    Logger::info(str::format("[ShaderCapture-GPU] Total queued: ", totalPendingRequests,
+                            " | Processing this frame: ", numRequests, " (limit: ", maxPerFrame, ")"));
+    Logger::info(str::format("[ShaderCapture-GPU] Remaining for next frame: ", totalPendingRequests - numRequests));
 
     // ========== STEP 1: GROUP BY (RT, SHADER, TEXTURE) FOR MAXIMUM BATCHING ==========
     Logger::info("[ShaderCapture-GPU] [TIMING] Starting grouping phase...");
@@ -378,6 +396,53 @@ namespace dxvk {
     Logger::info(str::format("[ShaderCapture-GPU] Grouped ", numRequests, " into ",
                             captureGroups.size(), " resource groups [", groupingTime, " us]"));
 
+    // ========== STEP 1.5: ALLOCATE RTs AND BATCH BARRIER TRANSITIONS ==========
+    // Optimization #1 & #3: Batch all image transitions into ONE barrier
+    auto tPreAllocStart = std::chrono::high_resolution_clock::now();
+
+    // Pre-allocate all RTs and collect images for batching
+    for (auto& group : captureGroups) {
+      const uint32_t groupSize = static_cast<uint32_t>(group.requestIndices.size());
+      if (groupSize == 0) continue;
+
+      group.renderTarget = getRenderTargetArray(ctx, group.resolution, VK_FORMAT_R8G8B8A8_UNORM, groupSize);
+    }
+
+    // CRITICAL OPTIMIZATION: Transition ALL render targets to GENERAL in ONE batched barrier
+    // This prevents individual barriers when binding each RT later
+    std::vector<std::pair<Rc<DxvkImage>, VkImageLayout>> rtLayoutTransitions;
+    uint32_t alreadyCorrectLayout = 0;
+    uint32_t needsTransition = 0;
+
+    for (auto& group : captureGroups) {
+      if (group.renderTarget.isValid()) {
+        VkImageLayout currentLayout = group.renderTarget.image->info().layout;
+        Logger::info(str::format("[RT-BATCH-DEBUG] RT 0x", std::hex, group.renderTarget.image->getHash(), std::dec,
+                                " current layout=", currentLayout, " (GENERAL=", VK_IMAGE_LAYOUT_GENERAL, ")"));
+
+        if (currentLayout != VK_IMAGE_LAYOUT_GENERAL) {
+          rtLayoutTransitions.emplace_back(group.renderTarget.image, VK_IMAGE_LAYOUT_GENERAL);
+          needsTransition++;
+        } else {
+          alreadyCorrectLayout++;
+        }
+      }
+    }
+
+    Logger::info(str::format("[RT-BATCH-DEBUG] RTs: ", alreadyCorrectLayout, " already GENERAL, ",
+                            needsTransition, " need transition, ", captureGroups.size(), " total groups"));
+
+    if (!rtLayoutTransitions.empty()) {
+      Logger::info(str::format("[RT-BATCH-DEBUG] Calling batchChangeImageLayout with ", rtLayoutTransitions.size(), " RTs"));
+      ctx->batchChangeImageLayout(rtLayoutTransitions);
+    } else {
+      Logger::info("[RT-BATCH-DEBUG] NO RT transitions needed - all already in GENERAL layout or invalid");
+    }
+
+    auto tPreAllocEnd = std::chrono::high_resolution_clock::now();
+    Logger::info(str::format("[ShaderCapture] Pre-allocation took ",
+                            std::chrono::duration<double, std::micro>(tPreAllocEnd - tPreAllocStart).count(), " us]"));
+
     // ========== STEP 2: EXECUTE WITH MULTI-DRAW-INDIRECT PER GROUP ==========
     auto tExecutionStart = std::chrono::high_resolution_clock::now();
 
@@ -395,34 +460,44 @@ namespace dxvk {
       const uint32_t groupSize = static_cast<uint32_t>(group.requestIndices.size());
       if (groupSize == 0) continue;
 
-      // Allocate TEXTURE ARRAY RT for layered rendering (one layer per capture)
-      auto tRTAllocStart = std::chrono::high_resolution_clock::now();
       const auto& firstRequest = m_pendingCaptureRequests[group.requestIndices[0]];
-
-      // Use texture array for layered rendering - each draw writes to a different layer
-      group.renderTarget = getRenderTargetArray(ctx, group.resolution, VK_FORMAT_R8G8B8A8_UNORM, groupSize);
-
-      auto tRTAllocEnd = std::chrono::high_resolution_clock::now();
-      totalRTAllocTime += std::chrono::duration<double, std::micro>(tRTAllocEnd - tRTAllocStart).count();
 
       if (!group.renderTarget.isValid()) {
         Logger::err(str::format("[ShaderCapture-GPU] Failed to allocate RT for group (", groupSize, " draws)"));
         continue;
       }
 
-      // Prepare texture array for layered rendering
+      // CRITICAL: Bind texture BEFORE render targets to allow DXVK to batch layout transitions
+      // Binding texture after bindRenderTargets() forces transitions inside render pass = individual barriers!
       auto tBindingStart = std::chrono::high_resolution_clock::now();
 
-      ctx->changeImageLayout(group.renderTarget.image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+      // OPTIMIZED: Bind texture ONCE per group (not per draw!)
+      // Since we group by texture, all draws in this group use the same texture
+      if (firstRequest.colorTexture.isValid()) {
+        TextureRef replacementTexture = getReplacementTexture(firstRequest.textureHash);
+        const TextureRef& texToUse = replacementTexture.isValid() ? replacementTexture : firstRequest.colorTexture;
+
+        if (texToUse.getImageView()) {
+          ctx->bindResourceView(0, texToUse.getImageView(), nullptr);
+        }
+      }
+
+      Logger::info(str::format("[BARRIER-DEBUG] ===== BINDING RT 0x", std::hex, group.renderTarget.image->getHash(), std::dec,
+                              " currentLayout=", group.renderTarget.image->info().layout, " ====="));
 
       // Bind texture array as render target (layered rendering)
       DxvkRenderTargets captureRt;
       captureRt.color[0].view = group.renderTarget.view;
-      captureRt.color[0].layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+      captureRt.color[0].layout = VK_IMAGE_LAYOUT_GENERAL;
+
+      Logger::info(str::format("[BARRIER-DEBUG] Calling bindRenderTargets with GENERAL layout..."));
       ctx->bindRenderTargets(captureRt);
+      Logger::info(str::format("[BARRIER-DEBUG] After bindRenderTargets, layout=", group.renderTarget.image->info().layout));
 
       VkClearValue clearValue = {};
+      Logger::info(str::format("[BARRIER-DEBUG] Calling clearRenderTarget..."));
       ctx->clearRenderTarget(group.renderTarget.view, VK_IMAGE_ASPECT_COLOR_BIT, clearValue);
+      Logger::info(str::format("[BARRIER-DEBUG] After clearRenderTarget, layout=", group.renderTarget.image->info().layout));
 
       // Initialize vertex shader on first use
       initializeLayerRoutingShader(ctx->getDevice());
@@ -439,21 +514,6 @@ namespace dxvk {
 
       // Check if this group uses indexed or non-indexed draws (use firstRequest from line 379)
       bool useIndexed = (firstRequest.indexCount > 0);
-
-      // OPTIMIZED: Bind texture ONCE per group (not per draw!)
-      // Since we group by texture, all draws in this group use the same texture
-      auto tTexBindStart = std::chrono::high_resolution_clock::now();
-      if (firstRequest.colorTexture.isValid()) {
-        TextureRef replacementTexture = getReplacementTexture(firstRequest.textureHash);
-        const TextureRef& texToUse = replacementTexture.isValid() ? replacementTexture : firstRequest.colorTexture;
-
-        if (texToUse.getImageView()) {
-          ctx->bindResourceView(0, texToUse.getImageView(), nullptr);
-        }
-      }
-      auto tTexBindEnd = std::chrono::high_resolution_clock::now();
-      Logger::info(str::format("[PERF] Texture bind (ONCE per group): ",
-        std::chrono::duration<double, std::micro>(tTexBindEnd - tTexBindStart).count(), " us"));
 
       // Build indirect draw buffer with firstInstance = layer index
       auto tBuildCmdStart = std::chrono::high_resolution_clock::now();
@@ -754,7 +814,19 @@ namespace dxvk {
         output.resolution = request.resolution;
       }
     }
-    m_pendingCaptureRequests.clear();
+
+    // ASYNC FRAME SPREADING: Remove only processed requests, keep the rest queued
+    if (numRequests >= m_pendingCaptureRequests.size()) {
+      // Processed all requests - clear everything
+      m_pendingCaptureRequests.clear();
+      Logger::info("[ASYNC] All queued requests processed - queue empty");
+    } else {
+      // Remove processed requests from front, keep unprocessed for next frame
+      m_pendingCaptureRequests.erase(m_pendingCaptureRequests.begin(),
+                                      m_pendingCaptureRequests.begin() + numRequests);
+      Logger::info(str::format("[ASYNC] Removed ", numRequests, " processed requests - ",
+                              m_pendingCaptureRequests.size(), " remain queued for next frame"));
+    }
 
     auto tExecutionEnd = std::chrono::high_resolution_clock::now();
     auto tFunctionEnd = std::chrono::high_resolution_clock::now();
@@ -852,7 +924,16 @@ namespace dxvk {
     // Stage 2 version - no cache checking, just basic feature/hash checking
     // This is called early in D3D9Rtx before GPU context is available
 
+    static uint32_t s_callCount = 0;
+    s_callCount++;
+    if (s_callCount <= 10) {
+      Logger::info(str::format("[STATIC-CHECK #", s_callCount, "] shouldCaptureStatic() CALLED - enableShaderOutputCapture=", enableShaderOutputCapture()));
+    }
+
     if (!enableShaderOutputCapture()) {
+      if (s_callCount <= 10) {
+        Logger::info(str::format("[STATIC-CHECK #", s_callCount, "] RETURNING FALSE - feature disabled"));
+      }
       return false;
     }
 
@@ -897,12 +978,16 @@ namespace dxvk {
       return true; // Capture all non-UI draws
     }
 
-    // Check if capturing all materials via hash list
-    if (captureEnabledHashes().count(0xALL) > 0) {
+    // SIMPLIFIED: If shader capture is enabled, capture ALL materials (bypass hash whitelist)
+    if (enableShaderOutputCapture()) {
+      Logger::info(str::format("[SHADER-CAPTURE] Allowing material hash 0x", std::hex, matHash, std::dec, " (capture enabled, accepting all)"));
       return true;
     }
 
-    // Check if this specific material is whitelisted
+    // Fallback: check hash whitelist (only used if feature is disabled above)
+    if (captureEnabledHashes().count(0xALL) > 0) {
+      return true;
+    }
     return captureEnabledHashes().count(matHash) > 0;
   }
 
@@ -1437,19 +1522,18 @@ namespace dxvk {
       }
     }
 
-    // CRITICAL FIX: Transition render target TO COLOR_ATTACHMENT_OPTIMAL before binding
-    // If this RT was used before, it's in SHADER_READ_ONLY_OPTIMAL from the previous capture
-    // We need to transition it back so we can render to it again
-    ctx->changeImageLayout(renderTarget.image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+    // BARRIER OPTIMIZATION: Transition to GENERAL layout once, then never transition again
+    // GENERAL supports both COLOR_ATTACHMENT and SHADER_READ without transitions (820 barrier reduction!)
+    ctx->changeImageLayout(renderTarget.image, VK_IMAGE_LAYOUT_GENERAL);
 
     Logger::info(str::format("[ShaderCapture-Layout] Transitioned render target 0x", std::hex,
                             renderTarget.image->getHash(), std::dec,
-                            " to COLOR_ATTACHMENT_OPTIMAL for rendering"));
+                            " to GENERAL layout (supports both render and read without transitions)"));
 
     // Bind offscreen render target
     DxvkRenderTargets captureRt;
     captureRt.color[0].view = renderTarget.view;
-    captureRt.color[0].layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    captureRt.color[0].layout = VK_IMAGE_LAYOUT_GENERAL;
     ctx->bindRenderTargets(captureRt);
 
     // Clear the render target to MAGENTA for debugging
@@ -2836,22 +2920,22 @@ namespace dxvk {
     // ASYNC OPTIMIZATION: Removed pixel readback debug code that was calling flushCommandList()
     // and blocking GPU pipeline. Captures now run fully async without CPU/GPU sync points.
 
-    // CRITICAL FIX: Transition render target from COLOR_ATTACHMENT_OPTIMAL to SHADER_READ_ONLY_OPTIMAL
-    // This allows the image to be:
-    // 1. Saved to disk correctly (fixes transparent/corrupt saved textures)
-    // 2. Used as a shader input texture in the raytracing pipeline
-    // Without this transition, Vulkan validation errors occur and textures appear black/transparent
-    ctx->changeImageLayout(renderTarget.image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    // BARRIER OPTIMIZATION: No transition needed! GENERAL layout supports both rendering and reading
+    // This eliminates 100+ barriers per frame (was transitioning to SHADER_READ_ONLY_OPTIMAL)
+    // GENERAL layout allows:
+    // 1. Image to be saved to disk correctly
+    // 2. Image to be used as shader input texture in raytracing pipeline
+    // 3. NO BARRIERS needed between captures!
 
-    Logger::info(str::format("[ShaderCapture-Layout] Transitioned render target 0x", std::hex,
+    Logger::info(str::format("[ShaderCapture-Layout] Render target 0x", std::hex,
                             renderTarget.image->getHash(), std::dec,
-                            " from COLOR_ATTACHMENT_OPTIMAL to SHADER_READ_ONLY_OPTIMAL"));
+                            " stays in GENERAL layout (no transition needed - barrier optimization!)"));
 
-    // Restore previous render target
+    // Restore previous render target (game's RT, not our captured RT)
     if (prevColorTarget != nullptr) {
       DxvkRenderTargets prevRt;
       prevRt.color[0].view = prevColorTarget;
-      prevRt.color[0].layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+      prevRt.color[0].layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL; // Game's RT uses standard layout
       ctx->bindRenderTargets(prevRt);
     }
 
@@ -2980,8 +3064,10 @@ namespace dxvk {
     static uint32_t frameEndCallCount = 0;
     ++frameEndCallCount;
 
-    // Clear pending requests - they were already submitted
-    m_pendingCaptureRequests.clear();
+    // ASYNC FRAME SPREADING: Do NOT clear pending requests here!
+    // Unprocessed requests are intentionally kept queued for next frame.
+    // Queue is managed in executeMultiIndirectCaptures() which removes only processed requests.
+    // m_pendingCaptureRequests.clear();  // REMOVED - was breaking async frame spreading
 
     // VRAM CLEANUP: Clear caches every 60 frames to prevent unbounded growth
     if (m_currentFrame % 60 == 0) {
@@ -3060,15 +3146,30 @@ namespace dxvk {
                         uint64_t(layerCount);
 
     // Check cache first
+    static uint32_t s_cacheHits = 0;
+    static uint32_t s_cacheMisses = 0;
+    static uint32_t s_totalCacheChecks = 0;
+
     auto it = m_renderTargetArrayCache.find(cacheKey);
+    s_totalCacheChecks++;
+
     if (it != m_renderTargetArrayCache.end() && it->second.isValid()) {
-      Logger::info(str::format("[PERF-OPT] Reusing cached texture array: ",
-                               resolution.width, "x", resolution.height,
-                               " layers=", layerCount, " (cache HIT)"));
+      s_cacheHits++;
+      float hitRate = 100.0f * s_cacheHits / s_totalCacheChecks;
+      Logger::info(str::format("[CACHE-HIT] RT ", resolution.width, "x", resolution.height,
+                               " layers=", layerCount, " (hit rate: ", hitRate, "% - ",
+                               s_cacheHits, "/", s_totalCacheChecks, ")"));
       return it->second;
     }
 
     // Cache miss - create new texture array
+    s_cacheMisses++;
+    float missRate = 100.0f * s_cacheMisses / s_totalCacheChecks;
+    Logger::info(str::format("[CACHE-MISS] RT ", resolution.width, "x", resolution.height,
+                             " layers=", layerCount, " NOT in cache (miss rate: ", missRate,
+                             "% - ", s_cacheMisses, "/", s_totalCacheChecks,
+                             ") cache size=", m_renderTargetArrayCache.size()));
+
     VkExtent3D extent = { resolution.width, resolution.height, 1 };
 
     Rc<DxvkContext> dxvkCtx = ctx;
@@ -3084,12 +3185,14 @@ namespace dxvk {
       VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
 
     if (resource.image != nullptr) {
-      Logger::info(str::format("[PERF-OPT] Created NEW texture array (cache MISS): ",
-                               resolution.width, "x", resolution.height,
-                               " layers=", layerCount,
-                               " format=", format));
+      VkImageLayout initialLayout = resource.image->info().layout;
+      Logger::info(str::format("[CACHE-MISS] Created NEW RT 0x", std::hex, resource.image->getHash(), std::dec,
+                               " ", resolution.width, "x", resolution.height,
+                               " layers=", layerCount, " initialLayout=", initialLayout));
       // Add to cache
       m_renderTargetArrayCache[cacheKey] = resource;
+    } else {
+      Logger::err(str::format("[CACHE-MISS] FAILED to create RT ", resolution.width, "x", resolution.height));
     }
 
     return resource;

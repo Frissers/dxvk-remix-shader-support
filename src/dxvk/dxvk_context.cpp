@@ -405,14 +405,20 @@ namespace dxvk {
     VkImageLayout         layout) {
     ScopedCpuProfileZone();
     if (image->info().layout != layout) {
+      Logger::info(str::format("[LAYOUT-CHANGE] Image 0x", std::hex, image->getHash(), std::dec,
+                              " transitioning ", image->info().layout, " -> ", layout));
+
       this->spillRenderPass(true);
 
       VkImageSubresourceRange subresources = image->getAvailableSubresources();
 
       this->prepareImage(m_execBarriers, image, subresources);
 
-      if (m_execBarriers.isImageDirty(image, subresources, DxvkAccess::Write))
+      if (m_execBarriers.isImageDirty(image, subresources, DxvkAccess::Write)) {
+        Logger::info(str::format("[LAYOUT-CHANGE] Image 0x", std::hex, image->getHash(), std::dec,
+                                " is DIRTY, emitting barrier before transition"));
         m_execBarriers.recordCommands(m_cmd);
+      }
 
       m_execBarriers.accessImage(image, subresources,
         image->info().layout,
@@ -426,6 +432,74 @@ namespace dxvk {
       m_cmd->trackResource<DxvkAccess::Write>(image);
     }
   }
+
+  // NV-DXVK start: batched image layout transitions for shader capture
+  void DxvkContext::batchChangeImageLayout(
+    const std::vector<std::pair<Rc<DxvkImage>, VkImageLayout>>& imageLayoutPairs) {
+    ScopedCpuProfileZone();
+
+    if (imageLayoutPairs.empty())
+      return;
+
+    Logger::info(str::format("[BATCH-LAYOUT-CHANGE] Batching ", imageLayoutPairs.size(), " image layout transitions"));
+
+    // Spill render pass ONCE before all transitions
+    this->spillRenderPass(true);
+
+    // Phase 1: Prepare all images and check if ANY are dirty
+    bool anyDirty = false;
+    uint32_t transitionCount = 0;
+    for (const auto& [image, targetLayout] : imageLayoutPairs) {
+      if (image->info().layout == targetLayout) {
+        Logger::info(str::format("[BATCH-LAYOUT-CHANGE] Image 0x", std::hex, image->getHash(), std::dec,
+                                " already in layout ", targetLayout, " (skipping)"));
+        continue;  // Skip if already in target layout
+      }
+
+      transitionCount++;
+      Logger::info(str::format("[BATCH-LAYOUT-CHANGE] Image 0x", std::hex, image->getHash(), std::dec,
+                              " will transition ", image->info().layout, " -> ", targetLayout));
+
+      VkImageSubresourceRange subresources = image->getAvailableSubresources();
+      this->prepareImage(m_execBarriers, image, subresources);
+
+      // Check if this image has pending writes
+      if (m_execBarriers.isImageDirty(image, subresources, DxvkAccess::Write)) {
+        anyDirty = true;
+        Logger::info(str::format("[BATCH-LAYOUT-CHANGE] Image 0x", std::hex, image->getHash(), std::dec,
+                                " has pending writes (DIRTY)"));
+      }
+    }
+
+    // Flush ALL pending writes in ONE barrier before layout transitions
+    if (anyDirty) {
+      Logger::info(str::format("[BATCH-LAYOUT-CHANGE] Flushing dirty images barrier before transitions"));
+      m_execBarriers.recordCommands(m_cmd);
+    }
+
+    // Phase 2: Queue ALL layout transitions (will be batched into ONE barrier!)
+    for (const auto& [image, targetLayout] : imageLayoutPairs) {
+      if (image->info().layout == targetLayout)
+        continue;
+
+      VkImageSubresourceRange subresources = image->getAvailableSubresources();
+
+      m_execBarriers.accessImage(image, subresources,
+        image->info().layout,    // src layout
+        image->info().stages, 0, // src stages, src access
+        targetLayout,            // dst layout
+        image->info().stages,    // dst stages
+        image->info().access);   // dst access
+
+      image->setLayout(targetLayout);
+      m_cmd->trackResource<DxvkAccess::Write>(image);
+    }
+
+    // Phase 3: Emit ONE barrier containing ALL queued transitions!
+    Logger::info(str::format("[BATCH-LAYOUT-CHANGE] Emitting SINGLE barrier with ", transitionCount, " transitions"));
+    m_execBarriers.recordCommands(m_cmd);
+  }
+  // NV-DXVK end
 
 
   void DxvkContext::clearBuffer(

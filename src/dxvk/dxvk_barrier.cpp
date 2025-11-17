@@ -213,9 +213,11 @@ namespace dxvk {
 
   void DxvkBarrierSet::recordCommands(const Rc<DxvkCommandList>& commandList) {
     if (m_srcStages | m_dstStages) {
+      auto tBarrierStart = std::chrono::high_resolution_clock::now();
+
       VkPipelineStageFlags srcFlags = m_srcStages;
       VkPipelineStageFlags dstFlags = m_dstStages;
-      
+
       if (!srcFlags) srcFlags = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
       if (!dstFlags) dstFlags = VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT;
 
@@ -228,7 +230,25 @@ namespace dxvk {
       VkMemoryBarrier* pMemBarrier = nullptr;
       if (m_srcAccess | m_dstAccess)
         pMemBarrier = &memBarrier;
-      
+
+      // DETAILED BARRIER LOGGING
+      static uint32_t s_barrierCount = 0;
+      static double s_totalBarrierTime = 0.0;
+      s_barrierCount++;
+
+      Logger::info(str::format("[BARRIER #", s_barrierCount, "] Emitting barrier: ",
+                              m_imgBarriers.size(), " image barriers, ",
+                              m_bufBarriers.size(), " buffer barriers"));
+
+      // Log each image barrier transition
+      for (size_t i = 0; i < m_imgBarriers.size(); ++i) {
+        const auto& imgBarrier = m_imgBarriers[i];
+        Logger::info(str::format("  [IMG ", i, "] Layout transition: ",
+                                imgBarrier.oldLayout, " -> ", imgBarrier.newLayout,
+                                " (srcAccess=0x", std::hex, imgBarrier.srcAccessMask,
+                                " dstAccess=0x", imgBarrier.dstAccessMask, std::dec, ")"));
+      }
+
       commandList->cmdPipelineBarrier(
         m_cmdBuffer, srcFlags, dstFlags, 0,
         pMemBarrier ? 1 : 0, pMemBarrier,
@@ -236,8 +256,16 @@ namespace dxvk {
         m_bufBarriers.data(),
         m_imgBarriers.size(),
         m_imgBarriers.data());
-      
+
       commandList->addStatCtr(DxvkStatCounter::CmdBarrierCount, 1);
+
+      auto tBarrierEnd = std::chrono::high_resolution_clock::now();
+      double barrierTime = std::chrono::duration<double, std::micro>(tBarrierEnd - tBarrierStart).count();
+      s_totalBarrierTime += barrierTime;
+
+      Logger::info(str::format("[BARRIER #", s_barrierCount, "] Completed in ", barrierTime, " us ",
+                              "(total: ", s_totalBarrierTime, " us, avg: ",
+                              s_totalBarrierTime / s_barrierCount, " us)"));
 
       this->reset();
     }
