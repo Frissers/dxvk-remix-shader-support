@@ -92,7 +92,7 @@ namespace dxvk {
       "Enables capturing of pixel shader output to use as albedo textures in path tracing.\n"
       "This allows shader effects (water, animated textures, etc.) to work with RTX.\n"
       "Uses proper texture replacement system to avoid braille artifacts.\n"
-      "Enabled by default - disable if you experience issues.");
+      "Enabled by default with automatic VRAM cleanup every 60 frames.");
 
     RTX_OPTION("rtx.shaderCapture", uint32_t, captureResolution, 1024,
       "Resolution of captured shader output textures. Higher = better quality but more VRAM.\n"
@@ -103,9 +103,9 @@ namespace dxvk {
       "Reduces overhead for static materials.\n"
       "TEMP: Disabled to force re-capture with new pipeline state.");
 
-    RTX_OPTION("rtx.shaderCapture", uint32_t, maxCapturesPerFrame, 100,
+    RTX_OPTION("rtx.shaderCapture", uint32_t, maxCapturesPerFrame, 1000,
       "Maximum number of shader captures per frame to prevent performance spikes.\n"
-      "Remaining captures will be done in subsequent frames.");
+      "Set high (1000) for many dynamic materials. TODO: Async execution to spread cost.");
 
     RTX_OPTION("rtx.shaderCapture", uint32_t, recaptureInterval, 1,
       "Number of frames between re-captures for dynamic materials.\n"
@@ -149,7 +149,10 @@ namespace dxvk {
     }
 
     struct CapturedShaderOutput {
-      Resources::Resource capturedTexture;
+      Resources::Resource capturedTexture;  // Albedo output (always captured)
+      Resources::Resource capturedNormals;  // Normal map output (if material has normals)
+      Resources::Resource capturedRoughness; // Roughness output (if material has roughness)
+      Resources::Resource capturedEmissive;  // Emissive output (if material has emissive)
       XXH64_hash_t geometryHash;
       XXH64_hash_t materialHash;
       uint32_t lastCaptureFrame;
@@ -157,6 +160,13 @@ namespace dxvk {
       bool isDynamic;
       bool isPending;                   // True if GPU hasn't finished capture yet
       VkExtent2D resolution;
+      uint32_t arrayLayer = 0;          // Layer index if capturedTexture is an array (0 if individual)
+      bool isArrayLayer = false;        // True if this references a layer in a texture array
+
+      // Material complexity flags for efficient detection
+      bool hasNormals = false;
+      bool hasRoughness = false;
+      bool hasEmissive = false;
     };
 
     // Storage for captured outputs (mutable to allow updating isPending flag from const functions)
@@ -245,6 +255,12 @@ namespace dxvk {
     DxvkBufferSlice m_indirectIndexedDrawArgsBuffer; // IndirectIndexedDrawArgs array
     DxvkBufferSlice m_captureCountersBuffer;      // GpuCaptureCounters (GPU atomics)
 
+    // OPTIMIZED: Persistent indirect buffers for multi-draw-indirect (reused every frame)
+    Rc<DxvkBuffer> m_persistentIndirectBuffer;         // For non-indexed draws
+    Rc<DxvkBuffer> m_persistentIndexedIndirectBuffer;  // For indexed draws
+    size_t m_persistentIndirectBufferSize = 0;
+    size_t m_persistentIndexedIndirectBufferSize = 0;
+
     // CPU-side request queue (built during frame, uploaded to GPU)
     std::vector<GpuCaptureRequest> m_pendingCaptureRequests;
 
@@ -299,6 +315,36 @@ namespace dxvk {
 
     // Cache of render targets by resolution
     std::unordered_map<uint64_t, Resources::Resource> m_renderTargetCache;
+
+    // OPTIMIZATION 1: Cache texture arrays by (resolution, layerCount)
+    // Key format: resolution (32 bits) | layerCount (32 bits)
+    std::unordered_map<uint64_t, Resources::Resource> m_renderTargetArrayCache;
+
+    // OPTIMIZATION 2: Texture array pool for layer allocation
+    struct TextureArrayPool {
+      Resources::Resource arrayResource;  // The texture array
+      uint32_t totalLayers;               // Total layers in array
+      uint64_t usedLayersMask;            // Bitfield of used layers (supports up to 64 layers)
+      uint32_t allocatedLayers;           // Count of allocated layers
+      VkExtent2D resolution;              // Resolution of this pool
+    };
+    std::vector<TextureArrayPool> m_arrayPools;  // Pool of pre-allocated arrays
+    static constexpr uint32_t POOL_LAYERS_PER_ARRAY = 64;
+    static constexpr uint32_t MAX_POOL_ARRAYS = 8;
+
+    // OPTIMIZATION 3: Hash-based capture dirty detection
+    std::unordered_map<XXH64_hash_t, XXH64_hash_t> m_lastCaptureContentHash;
+
+    // Helper to allocate layers from pool
+    struct LayerAllocation {
+      Resources::Resource arrayResource;
+      uint32_t startLayer;
+      uint32_t layerCount;
+      size_t poolIndex;
+      bool valid = false;
+    };
+    LayerAllocation allocateLayersFromPool(Rc<RtxContext> ctx, VkExtent2D resolution, uint32_t layerCount);
+    void freeLayersToPool(const LayerAllocation& allocation);
 
     // Vertex shader for gl_Layer output (instanced multi-draw-indirect)
     Rc<DxvkShader> m_layerRoutingVertexShader;

@@ -883,33 +883,18 @@ namespace dxvk {
       assert(dynamic_cast<RtxContext*>(ctx));
       DrawCallState drawCallState;
       if (m_drawCallStateQueue.pop(drawCallState)) {
-        // DEBUG: Log index data size after queue pop
-        Logger::info(str::format("[INDEX-DEBUG-QUEUE-POP] originalIndexData size after queue pop: ",
-                                drawCallState.originalIndexData.size(),
-                                " hasIndexBuffer=", drawCallState.geometryData.indexBuffer.defined() ? 1 : 0,
-                                " materialHash=", drawCallState.getMaterialData().getHash()));
         static_cast<RtxContext*>(ctx)->commitGeometryToRT(params, drawCallState);
       }
     });
   }
 
   void D3D9Rtx::submitActiveDrawCallState() {
-    // DEBUG: Log index data size before move
-    Logger::info(str::format("[INDEX-DEBUG-SUBMIT-BEFORE] originalIndexData size before move: ",
-                            m_activeDrawCallState.originalIndexData.size(),
-                            " materialHash=", m_activeDrawCallState.getMaterialData().getHash()));
-
     // We must be prepared for `push` failing here, this can happen, since we're pushing to a circular buffer, which
     //  may not have room for new entries.  In such cases, we trust that the consumer thread will make space for us, and
     //  so we may just need to wait a little bit.
     while (!m_drawCallStateQueue.push(std::move(m_activeDrawCallState))) {
       Sleep(0);
     }
-
-    // DEBUG: Log after move (data should be empty now)
-    Logger::info(str::format("[INDEX-DEBUG-SUBMIT-AFTER] originalIndexData size after move: ",
-                            m_activeDrawCallState.originalIndexData.size(),
-                            " (should be 0 after move)"));
   }
 
   Future<SkinningData> D3D9Rtx::processSkinning(const RasterGeometry& geoData) {
@@ -1233,8 +1218,6 @@ namespace dxvk {
           // This is needed even when no replacement is found, for render target feedback detection
           m_activeDrawCallState.originalRenderTargetHash = tex0->GetImage()->getHash();
 
-          Logger::info(str::format("[RT-SEARCH] Slot 0 is render target 0x", std::hex, tex0->GetImage()->getHash(), std::dec, ", searching alternatives..."));
-
           // Try slots in order: s7, s8, s15, s5, s3, s2, s1, s6
           const int candidateSlots[] = {7, 8, 15, 5, 3, 2, 1, 6};
           for (int slot : candidateSlots) {
@@ -1247,24 +1230,14 @@ namespace dxvk {
                 const bool isRT = isCategorizedRenderTarget(tex);
                 const XXH64_hash_t texHash = tex->GetImage()->getHash();
 
-                Logger::info(str::format("[RT-SEARCH] Slot ", slot, ": hash=0x", std::hex, texHash, std::dec,
-                                        " size=", desc->Width, "x", desc->Height,
-                                        " isRT=", isRT, " isDepth=", isDepthStencil, " isTiny=", isTinyTexture));
-
                 if (!isRT && !isDepthStencil && !isTinyTexture) {
                   recommendedAlbedoSampler = slot;
                   // CRITICAL: Set renderTargetReplacementSlot so shader capturer knows this is a RT replacement
                   m_activeDrawCallState.renderTargetReplacementSlot = slot;
 
-                  Logger::info(str::format("[RT-SEARCH] SELECTED slot ", slot, " hash=0x", std::hex, texHash, std::dec,
-                                          " to replace RT 0x", std::hex, tex0->GetImage()->getHash(), std::dec));
                   break;
-                } else {
-                  Logger::info(str::format("[RT-SEARCH] REJECTED slot ", slot, " - invalid candidate"));
                 }
               }
-            } else {
-              Logger::info(str::format("[RT-SEARCH] Slot ", slot, ": EMPTY"));
             }
           }
         }
@@ -1359,10 +1332,6 @@ namespace dxvk {
                                   " textureHash=0x", std::hex, capturedHash, std::dec,
                                   " recommendedAlbedoSampler=", recommendedAlbedoSampler,
                                   " WARNING: Captured the RENDER TARGET itself!"));
-        } else {
-          Logger::info(str::format("[RTX-TextureCapture] textureID=0 stage=", stage,
-                                  " textureHash=0x", std::hex, capturedHash, std::dec,
-                                  " recommendedAlbedoSampler=", recommendedAlbedoSampler));
         }
       }
 
@@ -1605,12 +1574,6 @@ namespace dxvk {
     m_activeDrawCallState.pixelShader = state.pixelShader.ptr();
     m_activeDrawCallState.vertexDecl = state.vertexDecl.ptr();
 
-    // Log capture for debugging (VERBOSE)
-    Logger::info(str::format("[OPTION-A-CAPTURE] Capturing D3D9 buffers - VS=", (void*)m_activeDrawCallState.vertexShader,
-                            " PS=", (void*)m_activeDrawCallState.pixelShader,
-                            " VDecl=", (void*)m_activeDrawCallState.vertexDecl,
-                            " vertexCount=", m_activeDrawCallState.geometryData.vertexCount));
-
     // Capture shader constants
     // Vertex shader constants (D3D9 supports up to 256 float4 constants for VS software, 256 for hardware)
     if (state.vertexShader != nullptr) {
@@ -1777,23 +1740,12 @@ namespace dxvk {
       capturedStreams.emplace(elem.Stream,
                              uint32_t(m_activeDrawCallState.capturedVertexStreams.size() - 1));
 
-      // Log successful capture
-      Logger::info(str::format("[OPTION-A-CAPTURE] Successfully captured stream ", elem.Stream,
-                              " - stride=", captured.stride,
-                              " bytes=", captured.data.size()));
-
       // CRITICAL FIX: Set originalVertexStride from first captured stream (stream 0)
       // This is used by shader re-execution (Option C) to replay vertex buffers
       if (elem.Stream == 0 && m_activeDrawCallState.originalVertexStride == 0) {
         m_activeDrawCallState.originalVertexStride = captured.stride;
-        Logger::info(str::format("[OPTION-A-CAPTURE] Set originalVertexStride=", captured.stride,
-                                " from stream 0 (CRITICAL for shader re-execution)"));
       }
     }
-
-    // Log final originalVertexStride value after all streams captured
-    Logger::info(str::format("[OPTION-A-CAPTURE] FINAL originalVertexStride=", m_activeDrawCallState.originalVertexStride,
-                            " (captured ", m_activeDrawCallState.capturedVertexStreams.size(), " streams)"));
 
     // Capture index buffer if present AND the draw uses indices
     if (state.indices != nullptr && m_activeDrawCallState.geometryData.indexCount > 0) {
@@ -1841,19 +1793,9 @@ namespace dxvk {
 
             ibo->Unlock();
 
-            Logger::info(str::format("[OPTION-A-CAPTURE] Successfully captured index buffer - ",
-                                    "indexCount=", indexCount,
-                                    " bytes=", bytes,
-                                    " indexType=", (indexType == VK_INDEX_TYPE_UINT16 ? "UINT16" : "UINT32"),
-                                    " minIndex=", minIndex,
-                                    " maxIndex=", maxIndex));
           } else {
             if (src) ibo->Unlock();
-            Logger::warn("[OPTION-A-CAPTURE] Failed to lock index buffer for capture");
           }
-        } else {
-          Logger::warn(str::format("[OPTION-A-CAPTURE] Index buffer bounds check failed - offset=", indexOffset,
-                                  " bytes=", bytes, " bufferSize=", ibo->Desc()->Size));
         }
       }
     }
@@ -1862,18 +1804,11 @@ namespace dxvk {
     // If matrices are invalid (all zeros), clear ALL captured data to mark it as invalid
     // But DON'T return early - we've already done the capture work
     if (!ShaderOutputCapturer::shouldCaptureStatic(m_activeDrawCallState)) {
-      Logger::warn("[OPTION-A-CAPTURE] ⚠️ VS constants validation FAILED after capture - clearing all data");
       m_activeDrawCallState.vertexShaderConstantData.clear();
       m_activeDrawCallState.capturedVertexStreams.clear();
       m_activeDrawCallState.capturedVertexElements.clear();
       m_activeDrawCallState.originalIndexData.clear();
     }
-
-    // FINAL SUMMARY LOG
-    Logger::info(str::format("[OPTION-A-CAPTURE] Capture complete: ",
-                            m_activeDrawCallState.capturedVertexStreams.size(), " streams, ",
-                            m_activeDrawCallState.capturedVertexElements.size(), " elements, ",
-                            "indexData=", m_activeDrawCallState.originalIndexData.size(), " bytes"));
   }
 
 bool D3D9Rtx::shouldCaptureFramebuffer() const {

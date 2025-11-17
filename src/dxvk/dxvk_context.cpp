@@ -4781,14 +4781,6 @@ namespace dxvk {
                                                            : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
             VkImageLayout layout = res.imageView->image()->pickLayout(requestedLayout);
 
-            if (isDepthStencil) {
-              Logger::info(str::format("[LAYOUT] SAMPLED_IMAGE slot=", binding.slot,
-                                       " img=", res.imageView->image()->handle(),
-                                       " imgInfo.layout=", imgInfo.layout,
-                                       " requested=", requestedLayout,
-                                       " picked=", layout));
-            }
-
             descriptors[i].image.sampler     = VK_NULL_HANDLE;
             descriptors[i].image.imageView   = res.imageView->handle(binding.view);
             descriptors[i].image.imageLayout = layout;
@@ -4830,14 +4822,6 @@ namespace dxvk {
             VkImageLayout requestedLayout = isDepthStencil ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL
                                                            : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
             VkImageLayout layout = res.imageView->image()->pickLayout(requestedLayout);
-
-            if (isDepthStencil) {
-              Logger::info(str::format("[LAYOUT] COMBINED_IMAGE_SAMPLER slot=", binding.slot,
-                                       " img=", res.imageView->image()->handle(),
-                                       " imgInfo.layout=", imgInfo.layout,
-                                       " requested=", requestedLayout,
-                                       " picked=", layout));
-            }
 
             descriptors[i].image.sampler     = res.sampler->handle();
             descriptors[i].image.imageView   = res.imageView->handle(binding.view);

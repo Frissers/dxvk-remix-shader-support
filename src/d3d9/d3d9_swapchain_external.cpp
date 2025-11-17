@@ -27,6 +27,8 @@
 #include "../util/util_env.h"
 #include "../dxvk/rtx_render/rtx_bridge_message_channel.h"
 #include "../dxvk/dxvk_scoped_annotation.h"
+#include <chrono>
+#include <iomanip>
 
 namespace dxvk {
 
@@ -40,14 +42,21 @@ namespace dxvk {
   }
 
   HRESULT STDMETHODCALLTYPE D3D9SwapchainExternal::Present(const RECT*, const RECT*, HWND, const RGNDATA*,  DWORD) {
+    // CHRONO: Start timing Present function (area 3 - Present/swap chain overhead)
+    auto tPresentStart = std::chrono::high_resolution_clock::now();
+
     auto targetImage = m_backBuffers[0]->GetCommonTexture()->GetImage();
 
     auto& imageInfo = targetImage->info();
 
     m_parent->m_rtx.EndFrame(targetImage);
 
+    // CHRONO: Time Flush + SynchronizeCsThread (CPU-GPU sync)
+    auto tSyncStart = std::chrono::high_resolution_clock::now();
     m_parent->Flush();
     m_parent->SynchronizeCsThread();
+    auto tSyncDone = std::chrono::high_resolution_clock::now();
+    auto syncTime = std::chrono::duration<double, std::micro>(tSyncDone - tSyncStart).count();
 
     m_context->beginRecording(m_device->createCommandList());
 
@@ -76,7 +85,12 @@ namespace dxvk {
 
     // signal to external that rendewring is done
     m_context->getCommandList()->addSignalSemaphore(m_frameEndSemaphore->handle(), 1);
+
+    // CHRONO: Time submitCommandList (CPU-GPU sync)
+    auto tSubmitStart = std::chrono::high_resolution_clock::now();
     m_device->submitCommandList(m_context->endRecording(), VK_NULL_HANDLE, VK_NULL_HANDLE);
+    auto tSubmitDone = std::chrono::high_resolution_clock::now();
+    auto submitTime = std::chrono::duration<double, std::micro>(tSubmitDone - tSubmitStart).count();
 
 
     m_parent->GetDXVKDevice()->incrementPresentCount();
@@ -86,6 +100,11 @@ namespace dxvk {
       ctx->getCommandList()->addWaitSemaphore(m_frameResumeSemaphore->handle(), 1);
       ctx->flushCommandList();
     });
+
+    // CHRONO: Output Present function timing
+    auto tPresentDone = std::chrono::high_resolution_clock::now();
+    auto totalPresentTime = std::chrono::duration<double, std::micro>(tPresentDone - tPresentStart).count();
+    Logger::info(str::format("[CHRONO] Present: Flush+SyncCsThread=", std::fixed, std::setprecision(2), syncTime / 1000.0, " ms, submitCommandList=", submitTime / 1000.0, " ms, TOTAL=", totalPresentTime / 1000.0, " ms"));
 
     return S_OK;
   }

@@ -647,11 +647,6 @@ namespace dxvk {
 
 
   void SceneManager::submitDrawState(Rc<DxvkContext> ctx, const DrawCallState& input, const MaterialData* overrideMaterialData) {
-    // Log IMMEDIATELY at function entry - before ANYTHING else
-    static uint32_t entryCount = 0;
-    ++entryCount;
-    Logger::err(str::format("[SceneManager-ENTRY-ERR] Function entered, call #", entryCount, " override=", overrideMaterialData != nullptr ? 1 : 0));
-
     ScopedCpuProfileZone();
 
     // CRITICAL: Log ALL submissions with override material
@@ -1169,17 +1164,10 @@ namespace dxvk {
       XXH64_hash_t originalHash = inputTexture.getImageHash();
       ShaderOutputCapturer& shaderCapturer = m_device->getCommon()->metaShaderOutputCapturer();
 
-      Logger::info(str::format("[OPTION-A-TEXTURE-LOOKUP] Checking texture 0x", std::hex, originalHash, std::dec,
-                              " hasReplacement=", shaderCapturer.hasReplacementTexture(originalHash) ? "YES" : "NO"));
-
       if (shaderCapturer.hasReplacementTexture(originalHash)) {
         TextureRef replacementTexture = shaderCapturer.getReplacementTexture(originalHash);
         if (replacementTexture.isValid()) {
           textureToUse = replacementTexture;
-          Logger::info(str::format("[OPTION-A-TEXTURE-LOOKUP] REPLACING texture 0x", std::hex, originalHash,
-                                  " with captured output 0x", replacementTexture.getImageHash(), std::dec));
-        } else {
-          Logger::warn(str::format("[OPTION-A-TEXTURE-LOOKUP] Replacement texture for 0x", std::hex, originalHash, std::dec, " is INVALID!"));
         }
       }
     }
@@ -1190,12 +1178,6 @@ namespace dxvk {
 
   RtInstance* SceneManager::processDrawCallState(Rc<DxvkContext> ctx, const DrawCallState& drawCallState, MaterialData& renderMaterialData, RtInstance* existingInstance, const RtxParticleSystemDesc* pParticleSystemDesc) {
     ScopedCpuProfileZone();
-
-    // DEBUG: Log entry for hash=0
-    if (drawCallState.getMaterialData().getHash() == 0) {
-      Logger::info(str::format("[PROCESS-DEBUG] processDrawCallState entered for materialHash=0, renderTargetReplacementSlot=",
-                              drawCallState.renderTargetReplacementSlot));
-    }
 
     if (renderMaterialData.getIgnored()) {
       return nullptr;
@@ -1223,13 +1205,6 @@ namespace dxvk {
 
       // Try to capture if needed
       if (shouldTryCapture) {
-        // DEBUG: Check if buffers are available
-        if (matHash == 0) {
-          Logger::info(str::format("[PROCESS-DEBUG-BUFFERS] originalIndexData.size=", drawCallState.originalIndexData.size(),
-                                  " originalVertexBuffer=", (void*)drawCallState.originalVertexBuffer.ptr(),
-                                  " capturedVertexStreams.size=", drawCallState.capturedVertexStreams.size()));
-        }
-
         DrawParameters drawParams;
         // CRITICAL FIX: Fill basic draw parameters from geometry data
         // Non-instanced draws must have instanceCount=1 (not 0!)
@@ -1248,12 +1223,6 @@ namespace dxvk {
       // If we didn't capture this frame, get the cached texture
       if (!capturedTexture.isValid()) {
         capturedTexture = shaderCapturer.getCapturedTexture(matHash);
-        // DEBUG: Log cache lookup for RT replacements
-        if (drawCallState.renderTargetReplacementSlot >= 0) {
-          Logger::info(str::format("[SHADER-CAPTURE-LOOKUP] RT replacement material matHash=0x", std::hex, matHash, std::dec,
-                                  " hasCachedCapture=", hasCachedCapture ? "YES" : "NO",
-                                  " capturedTexture.isValid=", capturedTexture.isValid() ? "YES" : "NO"));
-        }
       }
 
       // Use the captured texture as albedo by modifying the material data
@@ -1263,18 +1232,6 @@ namespace dxvk {
         if (renderMaterialData.getType() == MaterialDataType::Opaque) {
           // Directly set the albedo texture - it will be tracked automatically later
           renderMaterialData.getOpaqueMaterialData().getAlbedoOpacityTexture() = capturedTexture;
-
-          // Verify the assignment worked
-          const TextureRef& verifyTexture = renderMaterialData.getOpaqueMaterialData().getAlbedoOpacityTexture();
-          Logger::info(str::format("[OPTION-A-ALBEDO-REPLACE] Opaque: Set captured texture 0x",
-                                  std::hex, capturedTexture.getImageHash(),
-                                  " as albedo for material 0x", matHash,
-                                  " - verification: actualTexture=0x", verifyTexture.getImageHash(),
-                                  " isValid=", verifyTexture.isValid() ? 1 : 0, std::dec));
-        } else if (renderMaterialData.getType() == MaterialDataType::Translucent) {
-          // Translucent materials don't have albedo texture in the same way
-          Logger::info(str::format("[OPTION-A-ALBEDO-REPLACE] Translucent material 0x",
-                                  std::hex, matHash, std::dec, " - skipping albedo replacement"));
         }
       }
     }
@@ -1282,24 +1239,13 @@ namespace dxvk {
     ObjectCacheState result = ObjectCacheState::kInvalid;
     BlasEntry* pBlas = nullptr;
     if (m_drawCallCache.get(drawCallState, &pBlas) == DrawCallCache::CacheState::kExisted) {
-      if (matHash == 0) {
-        Logger::info("[PROCESS-DEBUG-CACHE] materialHash=0 - cache EXISTED, calling onSceneObjectUpdated");
-      }
       result = onSceneObjectUpdated(ctx, drawCallState, pBlas);
     } else {
-      if (matHash == 0) {
-        Logger::info("[PROCESS-DEBUG-CACHE] materialHash=0 - cache MISS, calling onSceneObjectAdded");
-      }
       result = onSceneObjectAdded(ctx, drawCallState, pBlas);
     }
 
     assert(pBlas != nullptr);
     assert(result != ObjectCacheState::kInvalid);
-
-    if (matHash == 0) {
-      Logger::info(str::format("[PROCESS-DEBUG-RESULT] materialHash=0 - result=", (int)result,
-                              " pBlas=", (void*)pBlas));
-    }
 
     // Update the input state, so we always have a reference to the original draw call state
     pBlas->frameLastTouched = m_device->getCurrentFrameId();

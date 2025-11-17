@@ -23,6 +23,8 @@
 #include <cmath>
 #include <cassert>
 #include <array>
+#include <chrono>
+#include <iomanip>
 
 #include "dxvk_device.h"
 #include "dxvk_scoped_annotation.h"
@@ -384,8 +386,12 @@ namespace dxvk {
     getResourceManager().onFrameBegin(this, getCommonObjects()->getTextureManager(), getSceneManager(), downscaledExtent,
                                       upscaledExtent, m_resetHistory, mainCamera.isCameraCut());
 
-    // Call ShaderOutputCapturer::onFrameBegin to clear old viewport cache
+    // CHRONO: Time shader capture onFrameBegin (includes buildGpuCaptureList + executeMultiIndirectCaptures)
+    auto tShaderCaptureStart = std::chrono::high_resolution_clock::now();
     getCommonObjects()->metaShaderOutputCapturer().onFrameBegin(this);
+    auto tShaderCaptureDone = std::chrono::high_resolution_clock::now();
+    auto shaderCaptureOnFrameBeginTime = std::chrono::duration<double, std::micro>(tShaderCaptureDone - tShaderCaptureStart).count();
+    Logger::info(str::format("[CHRONO] ShaderCapture::onFrameBegin: ", std::fixed, std::setprecision(2), shaderCaptureOnFrameBeginTime, " μs (", shaderCaptureOnFrameBeginTime / 1000.0, " ms)"));
 
     // Force history reset on integrate indirect mode change to discard incompatible history 
     if (RtxOptions::integrateIndirectMode() != m_prevIntegrateIndirectMode) {
@@ -402,7 +408,12 @@ namespace dxvk {
     m_currentUpscaler = getCurrentFrameUpscaler();
     if (m_currentUpscaler != m_previousUpscaler) {
       // Need to wait before the previous frame is executed.
+      // CHRONO: Time waitForIdle (CPU-GPU sync - blocks CPU waiting for GPU)
+      auto tWaitStart = std::chrono::high_resolution_clock::now();
       getDevice()->waitForIdle();
+      auto tWaitDone = std::chrono::high_resolution_clock::now();
+      auto waitTime = std::chrono::duration<double, std::micro>(tWaitDone - tWaitStart).count();
+      Logger::info(str::format("[CHRONO] waitForIdle (upscaler switch): ", std::fixed, std::setprecision(2), waitTime / 1000.0, " ms"));
 
       // Release resources
       if (m_previousUpscaler == InternalUpscaler::DLSS_RR) {
@@ -420,6 +431,10 @@ namespace dxvk {
   // Hooked into D3D9 presentImage (same place HUD rendering is)
   void RtxContext::injectRTX(std::uint64_t cachedReflexFrameId, Rc<DxvkImage> targetImage) {
     ScopedCpuProfileZone();
+
+    // CHRONO: Start timing entire injectRTX function
+    auto tInjectRTXStart = std::chrono::high_resolution_clock::now();
+
 #ifdef REMIX_DEVELOPMENT
     m_currentPassStage = RtxFramePassStage::FrameBegin;
 #endif
@@ -585,9 +600,13 @@ namespace dxvk {
       m_submitContainsInjectRtx = true;
       m_cachedReflexFrameId = cachedReflexFrameId;
 
-      // Update all the GPU buffers needed to describe the scene
+      // CHRONO: Time scene preparation
+      auto tScenePrepStart = std::chrono::high_resolution_clock::now();
       getSceneManager().prepareSceneData(this, m_execBarriers);
-      
+      auto tScenePrepDone = std::chrono::high_resolution_clock::now();
+      auto scenePrepTime = std::chrono::duration<double, std::micro>(tScenePrepDone - tScenePrepStart).count();
+      Logger::info(str::format("[CHRONO] SceneManager::prepareSceneData: ", std::fixed, std::setprecision(2), scenePrepTime, " μs (", scenePrepTime / 1000.0, " ms)"));
+
       // If we really don't have any RT to do, just bail early (could be UI/menus rendering)
       if (getSceneManager().getSurfaceBuffer() != nullptr) {
 
@@ -608,21 +627,39 @@ namespace dxvk {
         // Generate ray tracing constant buffer
         updateRaytraceArgsConstantBuffer(rtOutput, downscaledExtent, targetImage->info().extent);
 
+        // CHRONO: Start frame timing
+        auto tFrameStart = std::chrono::high_resolution_clock::now();
+        auto tStageStart = tFrameStart;
+
         // Volumetric Lighting
         dispatchVolumetrics(rtOutput);
-        
+        auto tVolumeDone = std::chrono::high_resolution_clock::now();
+        auto volumeTime = std::chrono::duration<double, std::micro>(tVolumeDone - tStageStart).count();
+
         // Path Tracing
+        tStageStart = std::chrono::high_resolution_clock::now();
         dispatchPathTracing(rtOutput);
+        auto tPathDone = std::chrono::high_resolution_clock::now();
+        auto pathTime = std::chrono::duration<double, std::micro>(tPathDone - tStageStart).count();
 
         // Neural Radiance Cache
+        tStageStart = std::chrono::high_resolution_clock::now();
         m_common->metaNeuralRadianceCache().dispatchTrainingAndResolve(*this, rtOutput);
+        auto tNRCDone = std::chrono::high_resolution_clock::now();
+        auto nrcTime = std::chrono::duration<double, std::micro>(tNRCDone - tStageStart).count();
 
         // RTXDI confidence
+        tStageStart = std::chrono::high_resolution_clock::now();
         m_common->metaRtxdiRayQuery().dispatchConfidence(this, rtOutput);
+        auto tRTXDIDone = std::chrono::high_resolution_clock::now();
+        auto rtxdiTime = std::chrono::duration<double, std::micro>(tRTXDIDone - tStageStart).count();
 
         // ReSTIR GI
+        tStageStart = std::chrono::high_resolution_clock::now();
         m_common->metaReSTIRGIRayQuery().dispatch(this, rtOutput);
-        
+        auto tRestirDone = std::chrono::high_resolution_clock::now();
+        auto restirTime = std::chrono::duration<double, std::micro>(tRestirDone - tStageStart).count();
+
         if (captureScreenImage && captureDebugImage) {
           takeScreenshot("baseReflectivity", rtOutput.m_primaryBaseReflectivity.image(Resources::AccessType::Read));
           takeScreenshot("sharedSubsurfaceData", rtOutput.m_sharedSubsurfaceData.image);
@@ -630,7 +667,10 @@ namespace dxvk {
         }
 
         // Demodulation
+        tStageStart = std::chrono::high_resolution_clock::now();
         dispatchDemodulate(rtOutput);
+        auto tDemodulateDone = std::chrono::high_resolution_clock::now();
+        auto demodulateTime = std::chrono::duration<double, std::micro>(tDemodulateDone - tStageStart).count();
 
         // Note: Primary direct diffuse/specular radiance textures noisy and in a demodulated state after demodulation step.
         if (captureScreenImage && captureDebugImage) {
@@ -639,7 +679,10 @@ namespace dxvk {
         }
 
         // Denoising
+        tStageStart = std::chrono::high_resolution_clock::now();
         dispatchDenoise(rtOutput);
+        auto tDenoiseDone = std::chrono::high_resolution_clock::now();
+        auto denoiseTime = std::chrono::duration<double, std::micro>(tDenoiseDone - tStageStart).count();
 
         // Note: Primary direct diffuse/specular radiance textures denoised but in a still demodulated state after denoising step.
         if (captureScreenImage && captureDebugImage) {
@@ -648,7 +691,10 @@ namespace dxvk {
         }
 
         // Composition
+        tStageStart = std::chrono::high_resolution_clock::now();
         dispatchComposite(rtOutput);
+        auto tCompositeDone = std::chrono::high_resolution_clock::now();
+        auto compositeTime = std::chrono::duration<double, std::micro>(tCompositeDone - tStageStart).count();
 
         // Post composite Debug View that may overwrite Composite output
         dispatchReplaceCompositeWithDebugView(rtOutput);
@@ -661,6 +707,7 @@ namespace dxvk {
         dispatchObjectPicking(rtOutput, downscaledExtent, targetImage->info().extent);
 
         // Upscaling if DLSS/NIS enabled, or the Composition Pass will do upscaling
+        tStageStart = std::chrono::high_resolution_clock::now();
         if (m_currentUpscaler == InternalUpscaler::DLSS) {
           // xxxnsubtil: the DLSS indicator reads our exposure texture even with DLSS autoexposure on
           // make sure it has been created, otherwise we run into trouble on the first frame
@@ -686,19 +733,31 @@ namespace dxvk {
             { 0, 0, 0 },
             rtOutput.m_compositeOutputExtent);
         }
+        auto tUpscaleDone = std::chrono::high_resolution_clock::now();
+        auto upscaleTime = std::chrono::duration<double, std::micro>(tUpscaleDone - tStageStart).count();
         m_previousUpscaler = m_currentUpscaler;
 
         RtxDustParticles& dust = m_common->metaDustParticles();
         dust.simulateAndDraw(this, m_state, rtOutput);
 
+        tStageStart = std::chrono::high_resolution_clock::now();
         dispatchBloom(rtOutput);
+        auto tBloomDone = std::chrono::high_resolution_clock::now();
+        auto bloomTime = std::chrono::duration<double, std::micro>(tBloomDone - tStageStart).count();
+
+        tStageStart = std::chrono::high_resolution_clock::now();
         dispatchPostFx(rtOutput);
+        auto tPostFxDone = std::chrono::high_resolution_clock::now();
+        auto postFxTime = std::chrono::duration<double, std::micro>(tPostFxDone - tStageStart).count();
 
         // Tone mapping
         // WAR for TREX-553 - disable sRGB conversion as NVTT implicitly applies it during dds->png
         // conversion for 16bit float formats
+        tStageStart = std::chrono::high_resolution_clock::now();
         const bool performSRGBConversion = !captureScreenImage && g_allowSrgbConversionForOutput;
         dispatchToneMapping(rtOutput, performSRGBConversion);
+        auto tToneMappingDone = std::chrono::high_resolution_clock::now();
+        auto toneMappingTime = std::chrono::duration<double, std::micro>(tToneMappingDone - tStageStart).count();
 
         if (captureScreenImage) {
           if (m_common->metaDebugView().debugViewIdx() == DEBUG_VIEW_DISABLED) {
@@ -717,9 +776,34 @@ namespace dxvk {
         Rc<DxvkImage> srcImage = rtOutput.m_finalOutput.resource(Resources::AccessType::Read).image;
 
         // Debug view
+        tStageStart = std::chrono::high_resolution_clock::now();
         dispatchDebugView(srcImage, rtOutput, captureScreenImage);
+        auto tDebugViewDone = std::chrono::high_resolution_clock::now();
+        auto debugViewTime = std::chrono::duration<double, std::micro>(tDebugViewDone - tStageStart).count();
 
         dispatchDLFG();
+
+        // CHRONO: Output timing table
+        auto tFrameEnd = std::chrono::high_resolution_clock::now();
+        auto totalTime = std::chrono::duration<double, std::micro>(tFrameEnd - tFrameStart).count();
+
+        Logger::info(str::format("\n=== RTX PIPELINE TIMING (microseconds) ==="));
+        Logger::info(str::format("Volumetrics:    ", std::fixed, std::setprecision(2), volumeTime, " μs"));
+        Logger::info(str::format("PathTracing:    ", std::fixed, std::setprecision(2), pathTime, " μs"));
+        Logger::info(str::format("NRC:            ", std::fixed, std::setprecision(2), nrcTime, " μs"));
+        Logger::info(str::format("RTXDI:          ", std::fixed, std::setprecision(2), rtxdiTime, " μs"));
+        Logger::info(str::format("ReSTIR GI:      ", std::fixed, std::setprecision(2), restirTime, " μs"));
+        Logger::info(str::format("Demodulate:     ", std::fixed, std::setprecision(2), demodulateTime, " μs"));
+        Logger::info(str::format("Denoise:        ", std::fixed, std::setprecision(2), denoiseTime, " μs"));
+        Logger::info(str::format("Composite:      ", std::fixed, std::setprecision(2), compositeTime, " μs"));
+        Logger::info(str::format("Upscaling:      ", std::fixed, std::setprecision(2), upscaleTime, " μs"));
+        Logger::info(str::format("Bloom:          ", std::fixed, std::setprecision(2), bloomTime, " μs"));
+        Logger::info(str::format("PostFX:         ", std::fixed, std::setprecision(2), postFxTime, " μs"));
+        Logger::info(str::format("ToneMapping:    ", std::fixed, std::setprecision(2), toneMappingTime, " μs"));
+        Logger::info(str::format("DebugView:      ", std::fixed, std::setprecision(2), debugViewTime, " μs"));
+        Logger::info(str::format("---"));
+        Logger::info(str::format("TOTAL:          ", std::fixed, std::setprecision(2), totalTime, " μs (", totalTime / 1000.0, " ms)"));
+        Logger::info(str::format("==========================================\n"));
 
         // Blit to the game target
         {
@@ -760,6 +844,13 @@ namespace dxvk {
     updateMetrics(gpuIdleTimeMilliseconds);
 
     m_resetHistory = false;
+
+    // CHRONO: Output total injectRTX time
+    auto tInjectRTXDone = std::chrono::high_resolution_clock::now();
+    auto totalInjectRTXTime = std::chrono::duration<double, std::micro>(tInjectRTXDone - tInjectRTXStart).count();
+    Logger::info(str::format("[CHRONO] ========================================"));
+    Logger::info(str::format("[CHRONO] TOTAL injectRTX time: ", std::fixed, std::setprecision(2), totalInjectRTXTime, " μs (", totalInjectRTXTime / 1000.0, " ms)"));
+    Logger::info(str::format("[CHRONO] ========================================\n"));
   }
 
   void RtxContext::endFrame(std::uint64_t cachedReflexFrameId, Rc<DxvkImage> targetImage, bool callInjectRtx) {
@@ -918,24 +1009,12 @@ namespace dxvk {
       const MaterialData* overrideMaterialData = nullptr;
       bakeTerrain(params, drawCallState, &overrideMaterialData);
 
-      Logger::info(str::format("[SHADER-REEXEC-DEBUG-PRE] override=", (overrideMaterialData != nullptr ? 1 : 0),
-                              " VS=", (drawCallState.vertexShader != nullptr ? 1 : 0),
-                              " PS=", (drawCallState.pixelShader != nullptr ? 1 : 0),
-                              " capturedStreams=", drawCallState.capturedVertexStreams.size(),
-                              " hasPositionBuffer=", drawCallState.geometryData.positionBuffer.defined() ? 1 : 0,
-                              " hasIndexBuffer=", drawCallState.geometryData.indexBuffer.defined() ? 1 : 0,
-                              " vertexCount=", drawCallState.geometryData.vertexCount));
-
       // Check if shader re-execution is needed for captured buffers
       // Skip re-execution for UI shaders (they should pass through without processing)
       if (overrideMaterialData == nullptr &&
           drawCallState.vertexShader != nullptr &&
           drawCallState.pixelShader != nullptr &&
           !drawCallState.capturedVertexStreams.empty()) {
-
-        Logger::info(str::format("[SHADER-REEXEC-DEBUG] Detected captured buffers: VS=", drawCallState.vertexShader,
-                                " PS=", drawCallState.pixelShader,
-                                " streams=", drawCallState.capturedVertexStreams.size()));
 
         // UI shaders are detected via RtxGeometryStatus::Rasterized during PrepareDrawGeometryForRT
         // If we have captured buffers here, it means the shader was marked for ray tracing (not UI)
@@ -944,29 +1023,31 @@ namespace dxvk {
         ShaderOutputCapturer& shaderCapturer = m_common->metaShaderOutputCapturer();
 
         const bool shouldCapture = shaderCapturer.shouldCapture(drawCallState);
-        Logger::info(str::format("[SHADER-REEXEC-DEBUG] shouldCapture returned: ", shouldCapture));
 
         if (shouldCapture) {
           TextureRef capturedTexture;
 
           // Re-execute the shaders with captured D3D9 state
+          auto tCaptureCallStart = std::chrono::high_resolution_clock::now();
           const bool captured = shaderCapturer.captureDrawCall(
             this,
             m_rtState,
             drawCallState,
             params,
             capturedTexture);
+          auto tCaptureCallDone = std::chrono::high_resolution_clock::now();
+          auto captureCallTime = std::chrono::duration<double, std::micro>(tCaptureCallDone - tCaptureCallStart).count();
 
           if (captured && capturedTexture.isValid()) {
             Logger::info(str::format("[SHADER-REEXEC] Successfully re-executed shaders and captured output texture 0x",
-                                    std::hex, capturedTexture.getImageHash(), std::dec));
+                                    std::hex, capturedTexture.getImageHash(), std::dec, " (took ", std::fixed, std::setprecision(2), captureCallTime, " μs)"));
 
             // Register the captured texture as a replacement
             // This will be looked up later when the material is processed
             XXH64_hash_t originalTextureHash = drawCallState.getMaterialData().getColorTexture().getImageHash();
             shaderCapturer.registerTextureReplacement(originalTextureHash, capturedTexture);
           } else {
-            Logger::warn("[SHADER-REEXEC] Failed to capture shader output");
+            Logger::warn(str::format("[SHADER-REEXEC] Failed to capture shader output (took ", std::fixed, std::setprecision(2), captureCallTime, " μs)"));
           }
         }
       }
@@ -2231,23 +2312,35 @@ namespace dxvk {
   void RtxContext::flushCommandList() {
     ScopedCpuProfileZone();
 
+    // CHRONO: Start timing flushCommandList (CPU-GPU sync area)
+    auto tFlushStart = std::chrono::high_resolution_clock::now();
+
     // flush the residue
     tryHandleSky(nullptr, nullptr);
 
+    // CHRONO: Time the actual command list submission (vkQueueSubmit)
+    auto tSubmitStart = std::chrono::high_resolution_clock::now();
     m_device->submitCommandList(
       this->endRecording(),
       VK_NULL_HANDLE,
       VK_NULL_HANDLE,
       m_submitContainsInjectRtx,
       m_cachedReflexFrameId);
-    
+    auto tSubmitDone = std::chrono::high_resolution_clock::now();
+    auto submitTime = std::chrono::duration<double, std::micro>(tSubmitDone - tSubmitStart).count();
+
     // Reset this now that we've completed the submission
     m_submitContainsInjectRtx = false;
-    
+
     this->beginRecording(
       m_device->createCommandList());
 
     getCommonObjects()->metaGeometryUtils().flushCommandList();
+
+    // CHRONO: Output total flushCommandList time
+    auto tFlushDone = std::chrono::high_resolution_clock::now();
+    auto totalFlushTime = std::chrono::duration<double, std::micro>(tFlushDone - tFlushStart).count();
+    Logger::info(str::format("[CHRONO] flushCommandList: submitCommandList=", std::fixed, std::setprecision(2), submitTime / 1000.0, " ms, TOTAL=", totalFlushTime / 1000.0, " ms"));
   }
 
   void RtxContext::updateComputeShaderResources() {

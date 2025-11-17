@@ -28,6 +28,8 @@
 #include "../dxvk/dxvk_objects.h"
 #include "../util/util_env.h"
 #include "../util/util_once.h"
+#include <chrono>
+#include <iomanip>
 #include "../util/util_string.h"
 #include "../dxvk/rtx_render/rtx_bridge_message_channel.h"
 #include "../dxvk/dxvk_scoped_annotation.h"
@@ -456,11 +458,20 @@ namespace dxvk {
           DWORD    dwFlags) {
     ScopedCpuProfileZone();
 
+    // CHRONO: Track time between frames (static variable persists between calls)
+    static auto tLastPresentEnd = std::chrono::high_resolution_clock::now();
+    auto tPresentTotalStart = std::chrono::high_resolution_clock::now();
+    auto gapBetweenFrames = std::chrono::duration<double, std::micro>(tPresentTotalStart - tLastPresentEnd).count();
+
     // NV-DXVK start: Restart RTX capture on the new frame
     m_parent->m_rtx.EndFrame(m_backBuffers[0]->GetCommonTexture()->GetImage());
     // NV-DXVK end
 
+    // CHRONO: Time the lock acquisition (could be a sync point)
+    auto tLockStart = std::chrono::high_resolution_clock::now();
     D3D9DeviceLock lock = m_parent->LockDevice();
+    auto tLockDone = std::chrono::high_resolution_clock::now();
+    auto lockTime = std::chrono::duration<double, std::micro>(tLockDone - tLockStart).count();
     // NV-DXVK: Flush pending Remix API light updates safely once per frame.
     // This only enqueues into LightManager; actual mutations apply at frame start.
     (void)remixapi_AutoInstancePersistentLights();
@@ -586,11 +597,34 @@ namespace dxvk {
       // just end up crashing (like with alt-tab loss)
       
       // NV-DXVK start: DLFG integration
-      if (!GetPresenter()->hasSwapChain())
-      // NV-DXVK end
+      if (!GetPresenter()->hasSwapChain()) {
+        // CHRONO: Output timing for early return case
+        auto tPresentTotalDone = std::chrono::high_resolution_clock::now();
+        auto totalPresentTime = std::chrono::duration<double, std::micro>(tPresentTotalDone - tPresentTotalStart).count();
+        Logger::info(str::format("[CHRONO] GAP between frames: ", std::fixed, std::setprecision(2), gapBetweenFrames / 1000.0, " ms"));
+        Logger::info(str::format("[CHRONO] Present (no swapchain): LockDevice=", std::fixed, std::setprecision(2), lockTime / 1000.0, " ms, TOTAL=", totalPresentTime / 1000.0, " ms"));
+        tLastPresentEnd = tPresentTotalDone;
         return D3D_OK;
+      }
+      // NV-DXVK end
 
+      // CHRONO: Time PresentImage - THE CRITICAL BOTTLENECK!
+      auto tPresentImageStart = std::chrono::high_resolution_clock::now();
       PresentImage(presentInterval);
+      auto tPresentImageDone = std::chrono::high_resolution_clock::now();
+      auto presentImageTime = std::chrono::duration<double, std::micro>(tPresentImageDone - tPresentImageStart).count();
+
+      // CHRONO: Output complete Present() timing
+      auto tPresentTotalDone = std::chrono::high_resolution_clock::now();
+      auto totalPresentTime = std::chrono::duration<double, std::micro>(tPresentTotalDone - tPresentTotalStart).count();
+      Logger::info(str::format("[CHRONO] ========================================"));
+      Logger::info(str::format("[CHRONO] GAP between frames: ", std::fixed, std::setprecision(2), gapBetweenFrames / 1000.0, " ms"));
+      Logger::info(str::format("[CHRONO] Present: LockDevice=", std::fixed, std::setprecision(2), lockTime / 1000.0, " ms, PresentImage=", presentImageTime / 1000.0, " ms, TOTAL=", totalPresentTime / 1000.0, " ms"));
+      Logger::info(str::format("[CHRONO] ========================================"));
+
+      // Update last present end time for next frame
+      tLastPresentEnd = tPresentTotalDone;
+
       return D3D_OK;
     } catch (const DxvkError& e) {
       Logger::err(e.message());
@@ -1180,7 +1214,14 @@ namespace dxvk {
 
   void D3D9SwapChainEx::PresentImage(UINT SyncInterval) {
     ScopedCpuProfileZone();
+
+    // CHRONO: Start timing PresentImage internals
+    auto tPresentImageStart = std::chrono::high_resolution_clock::now();
+
+    auto tFlushStart = std::chrono::high_resolution_clock::now();
     m_parent->Flush();
+    auto tFlushDone = std::chrono::high_resolution_clock::now();
+    auto flushTime = std::chrono::duration<double, std::micro>(tFlushDone - tFlushStart).count();
 
     // NV-DXVK start: Reflex integration
     auto& reflex = m_device->getCommon()->metaReflex();
@@ -1215,10 +1256,17 @@ namespace dxvk {
 
     // Bump our frame id.
     ++m_frameId;
+
+    auto tSyncLatencyStart = std::chrono::high_resolution_clock::now();
     SyncFrameLatency();
+    auto tSyncLatencyDone = std::chrono::high_resolution_clock::now();
+    auto syncLatencyTime = std::chrono::duration<double, std::micro>(tSyncLatencyDone - tSyncLatencyStart).count();
 
     for (uint32_t i = 0; i < SyncInterval || i < 1; i++) {
+      auto tSyncPresentStart = std::chrono::high_resolution_clock::now();
       SynchronizePresent();
+      auto tSyncPresentDone = std::chrono::high_resolution_clock::now();
+      auto syncPresentTime = std::chrono::duration<double, std::micro>(tSyncPresentDone - tSyncPresentStart).count();
 
       // NV-DXVK start: DLFG integration
       vk::Presenter* presenter = GetPresenter();
@@ -1233,7 +1281,10 @@ namespace dxvk {
       uint32_t imageIndex = 0;
 
       // NV-DXVK start: DLFG integration
+      auto tAcquireStart = std::chrono::high_resolution_clock::now();
       VkResult status = presenter->acquireNextImage(sync, imageIndex);
+      auto tAcquireDone = std::chrono::high_resolution_clock::now();
+      auto acquireTime = std::chrono::duration<double, std::micro>(tAcquireDone - tAcquireStart).count();
       // NV-DXVK end
 
       while (status != VK_SUCCESS) {
@@ -1286,7 +1337,14 @@ namespace dxvk {
       if (i + 1 >= SyncInterval)
         m_context->signal(m_frameLatencySignal, m_frameId);
 
+      auto tSubmitStart = std::chrono::high_resolution_clock::now();
       SubmitPresent(sync, i, imageIndex);
+      auto tSubmitDone = std::chrono::high_resolution_clock::now();
+      auto submitTime = std::chrono::duration<double, std::micro>(tSubmitDone - tSubmitStart).count();
+
+      // CHRONO: Output timing for this iteration
+      Logger::info(str::format("[CHRONO-PRESENT] Iteration ", i, ": SyncPresent=", std::fixed, std::setprecision(2), syncPresentTime / 1000.0,
+        " ms, AcquireImage=", acquireTime / 1000.0, " ms, SubmitPresent=", submitTime / 1000.0, " ms"));
     }
 
     // Rotate swap chain buffers so that the back
@@ -1299,7 +1357,10 @@ namespace dxvk {
     // NV-DXVK start: Reflex integration
     // Note: Sleeping here in the present function essentially makes it so when the application calls into a D3D Present function it will block for the desired amount of time Reflex indicates.
     // This helps accomplish what Reflex desires by delaying the point at which the application does input sampling likely near the start of its simulation on the next frame, thus reducing latency.
+    auto tReflexSleepStart = std::chrono::high_resolution_clock::now();
     reflex.sleep();
+    auto tReflexSleepDone = std::chrono::high_resolution_clock::now();
+    auto reflexSleepTime = std::chrono::duration<double, std::micro>(tReflexSleepDone - tReflexSleepStart).count();
 
     // Note: Increment the Reflex Frame ID to prepare for the next frame, now that this Reflex frame has ended.
     // Take care to ensure this happens after all other application thread operations call GetReflexFrameId for this frame
@@ -1310,6 +1371,12 @@ namespace dxvk {
     // on the main thread after the Reflex sleep has completed to encompass this region.
     reflex.beginSimulation(d3d9Rtx.GetReflexFrameId());
     reflex.latencyPing(d3d9Rtx.GetReflexFrameId());
+
+    // CHRONO: Output complete PresentImage breakdown
+    auto tPresentImageDone = std::chrono::high_resolution_clock::now();
+    auto totalPresentImageTime = std::chrono::duration<double, std::micro>(tPresentImageDone - tPresentImageStart).count();
+    Logger::info(str::format("[CHRONO-PRESENT] TOTAL PresentImage: Flush=", std::fixed, std::setprecision(2), flushTime / 1000.0,
+      " ms, SyncLatency=", syncLatencyTime / 1000.0, " ms, ReflexSleep=", reflexSleepTime / 1000.0, " ms, TOTAL=", totalPresentImageTime / 1000.0, " ms"));
 
     // Tell tracy its the end of the frame
     FrameMark;

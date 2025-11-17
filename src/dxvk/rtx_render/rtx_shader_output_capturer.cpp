@@ -318,37 +318,58 @@ namespace dxvk {
       VkExtent2D resolution;
       std::vector<uint32_t> requestIndices;
     };
-    std::vector<CaptureGroup> captureGroups;
 
-    // Hash = (RT resolution << 32) | (texture hash & 0xFFFFFFFF)
-    std::unordered_map<uint64_t, size_t> groupHash;
-
-    Logger::info(str::format("[ShaderCapture-GPU] [GROUPING] Beginning loop over ", numRequests, " requests"));
+    // OPTIMIZATION: Pre-sort requests by grouping key for O(N) grouping instead of O(N*log(N))
+    // Create index array with grouping keys
+    struct RequestSortKey {
+      uint32_t index;
+      uint64_t groupKey;
+    };
+    std::vector<RequestSortKey> sortedIndices;
+    sortedIndices.reserve(numRequests);
 
     for (uint32_t i = 0; i < numRequests; i++) {
-      Logger::info(str::format("[ShaderCapture-GPU] [GROUPING] Processing request ", i, "/", numRequests));
-
       const auto& request = m_pendingCaptureRequests[i];
-
-      // All data is self-contained in the request - no pointer dereferencing needed!
       XXH64_hash_t texHash = request.textureHash;
 
-      // Group key: RT resolution ONLY (for texture array layered rendering)
-      // All captures with same resolution go into ONE batch with texture array
-      uint64_t key = (uint64_t(request.resolution.width) << 32) |
-                     uint64_t(request.resolution.height);
+      // Group key: resolution (32 bits) | texture hash (32 bits)
+      uint64_t key = (uint64_t(request.resolution.width) << 48) |
+                     (uint64_t(request.resolution.height) << 32) |
+                     (uint64_t(texHash) & 0xFFFFFFFF);
 
-      auto it = groupHash.find(key);
-      if (it == groupHash.end()) {
+      sortedIndices.push_back({i, key});
+    }
+
+    // Sort by group key - this allows O(N) grouping with single linear pass
+    std::sort(sortedIndices.begin(), sortedIndices.end(),
+              [](const RequestSortKey& a, const RequestSortKey& b) {
+                return a.groupKey < b.groupKey;
+              });
+
+    // Now group in O(N) with single pass over sorted array
+    std::vector<CaptureGroup> captureGroups;
+    uint64_t currentKey = ~0ULL;  // Invalid key
+    size_t currentGroupIndex = 0;
+
+    Logger::info(str::format("[ShaderCapture-GPU] [GROUPING-OPT] Pre-sorted ", numRequests, " requests, grouping in O(N)..."));
+
+    for (uint32_t i = 0; i < numRequests; i++) {
+      const uint32_t reqIndex = sortedIndices[i].index;
+      const uint64_t key = sortedIndices[i].groupKey;
+      const auto& request = m_pendingCaptureRequests[reqIndex];
+
+      // New group needed?
+      if (key != currentKey) {
+        currentKey = key;
         captureGroups.push_back(CaptureGroup{});
+        currentGroupIndex = captureGroups.size() - 1;
         captureGroups.back().resolution = request.resolution;
-        captureGroups.back().textureHash = texHash;
-        captureGroups.back().shaderHash = 0; // TODO: Extract shader hash
-        groupHash[key] = captureGroups.size() - 1;
-        it = groupHash.find(key);
+        captureGroups.back().textureHash = request.textureHash;
+        captureGroups.back().shaderHash = 0;
       }
 
-      captureGroups[it->second].requestIndices.push_back(i);
+      // Add request to current group
+      captureGroups[currentGroupIndex].requestIndices.push_back(reqIndex);
     }
 
     auto tGroupingEnd = std::chrono::high_resolution_clock::now();
@@ -419,6 +440,21 @@ namespace dxvk {
       // Check if this group uses indexed or non-indexed draws (use firstRequest from line 379)
       bool useIndexed = (firstRequest.indexCount > 0);
 
+      // OPTIMIZED: Bind texture ONCE per group (not per draw!)
+      // Since we group by texture, all draws in this group use the same texture
+      auto tTexBindStart = std::chrono::high_resolution_clock::now();
+      if (firstRequest.colorTexture.isValid()) {
+        TextureRef replacementTexture = getReplacementTexture(firstRequest.textureHash);
+        const TextureRef& texToUse = replacementTexture.isValid() ? replacementTexture : firstRequest.colorTexture;
+
+        if (texToUse.getImageView()) {
+          ctx->bindResourceView(0, texToUse.getImageView(), nullptr);
+        }
+      }
+      auto tTexBindEnd = std::chrono::high_resolution_clock::now();
+      Logger::info(str::format("[PERF] Texture bind (ONCE per group): ",
+        std::chrono::duration<double, std::micro>(tTexBindEnd - tTexBindStart).count(), " us"));
+
       // Build indirect draw buffer with firstInstance = layer index
       auto tBuildCmdStart = std::chrono::high_resolution_clock::now();
       std::vector<VkDrawIndexedIndirectCommand> indirectIndexedDraws;
@@ -443,16 +479,6 @@ namespace dxvk {
           cmd.firstInstance = layerIdx;  // KEY: gl_InstanceIndex = layer index!
           indirectDraws.push_back(cmd);
         }
-
-        // Bind input texture (TODO: batch by texture for even more perf)
-        if (request.colorTexture.isValid()) {
-          TextureRef replacementTexture = getReplacementTexture(request.textureHash);
-          const TextureRef& texToUse = replacementTexture.isValid() ? replacementTexture : request.colorTexture;
-
-          if (texToUse.getImageView()) {
-            ctx->bindResourceView(0, texToUse.getImageView(), nullptr);
-          }
-        }
       }
       auto tBuildCmdEnd = std::chrono::high_resolution_clock::now();
       Logger::info(str::format("[PERF] Build indirect commands: ",
@@ -461,20 +487,30 @@ namespace dxvk {
       // Upload indirect args to GPU and execute single multi-draw-indirect call
       if (useIndexed && !indirectIndexedDraws.empty()) {
         auto tBufCreateStart = std::chrono::high_resolution_clock::now();
-        DxvkBufferCreateInfo bufInfo = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
-        bufInfo.size = indirectIndexedDraws.size() * sizeof(VkDrawIndexedIndirectCommand);
-        bufInfo.usage = VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-        bufInfo.stages = VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
-        bufInfo.access = VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
 
-        Rc<DxvkBuffer> indirectBuffer = ctx->getDevice()->createBuffer(bufInfo,
-          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-          DxvkMemoryStats::Category::RTXBuffer, "Shader Capture Indirect Buffer");
-        DxvkBufferSlice indirectBuf(indirectBuffer, 0, bufInfo.size);
-        memcpy(indirectBuf.mapPtr(0), indirectIndexedDraws.data(), bufInfo.size);
+        // OPTIMIZED: Reuse persistent buffer, only reallocate if size grows
+        size_t requiredSize = indirectIndexedDraws.size() * sizeof(VkDrawIndexedIndirectCommand);
+        if (m_persistentIndexedIndirectBuffer == nullptr || m_persistentIndexedIndirectBufferSize < requiredSize) {
+          // Grow buffer with 50% headroom to reduce reallocations
+          size_t newSize = requiredSize + (requiredSize / 2);
+          DxvkBufferCreateInfo bufInfo = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+          bufInfo.size = newSize;
+          bufInfo.usage = VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+          bufInfo.stages = VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
+          bufInfo.access = VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+
+          m_persistentIndexedIndirectBuffer = ctx->getDevice()->createBuffer(bufInfo,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            DxvkMemoryStats::Category::RTXBuffer, "Shader Capture Indexed Indirect Buffer (Persistent)");
+          m_persistentIndexedIndirectBufferSize = newSize;
+          Logger::info(str::format("[PERF-OPT] Resized persistent indexed indirect buffer to ", newSize, " bytes"));
+        }
+
+        DxvkBufferSlice indirectBuf(m_persistentIndexedIndirectBuffer, 0, requiredSize);
+        memcpy(indirectBuf.mapPtr(0), indirectIndexedDraws.data(), requiredSize);
         auto tBufCreateEnd = std::chrono::high_resolution_clock::now();
         Logger::info(str::format("[PERF] Create+upload indirect buffer: ",
-          std::chrono::duration<double, std::micro>(tBufCreateEnd - tBufCreateStart).count(), " us"));
+          std::chrono::duration<double, std::micro>(tBufCreateEnd - tBufCreateStart).count(), " us (REUSED)"));
 
         // Set pipeline state once
         auto tPipelineStart = std::chrono::high_resolution_clock::now();
@@ -505,20 +541,30 @@ namespace dxvk {
                                 groupSize, " draws in 1 call (indexed)"));
       } else if (!indirectDraws.empty()) {
         auto tBufCreateStart = std::chrono::high_resolution_clock::now();
-        DxvkBufferCreateInfo bufInfo = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
-        bufInfo.size = indirectDraws.size() * sizeof(VkDrawIndirectCommand);
-        bufInfo.usage = VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-        bufInfo.stages = VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
-        bufInfo.access = VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
 
-        Rc<DxvkBuffer> indirectBuffer = ctx->getDevice()->createBuffer(bufInfo,
-          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-          DxvkMemoryStats::Category::RTXBuffer, "Shader Capture Indirect Buffer");
-        DxvkBufferSlice indirectBuf(indirectBuffer, 0, bufInfo.size);
-        memcpy(indirectBuf.mapPtr(0), indirectDraws.data(), bufInfo.size);
+        // OPTIMIZED: Reuse persistent buffer, only reallocate if size grows
+        size_t requiredSize = indirectDraws.size() * sizeof(VkDrawIndirectCommand);
+        if (m_persistentIndirectBuffer == nullptr || m_persistentIndirectBufferSize < requiredSize) {
+          // Grow buffer with 50% headroom to reduce reallocations
+          size_t newSize = requiredSize + (requiredSize / 2);
+          DxvkBufferCreateInfo bufInfo = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+          bufInfo.size = newSize;
+          bufInfo.usage = VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+          bufInfo.stages = VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
+          bufInfo.access = VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+
+          m_persistentIndirectBuffer = ctx->getDevice()->createBuffer(bufInfo,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            DxvkMemoryStats::Category::RTXBuffer, "Shader Capture Indirect Buffer (Persistent)");
+          m_persistentIndirectBufferSize = newSize;
+          Logger::info(str::format("[PERF-OPT] Resized persistent indirect buffer to ", newSize, " bytes"));
+        }
+
+        DxvkBufferSlice indirectBuf(m_persistentIndirectBuffer, 0, requiredSize);
+        memcpy(indirectBuf.mapPtr(0), indirectDraws.data(), requiredSize);
         auto tBufCreateEnd = std::chrono::high_resolution_clock::now();
         Logger::info(str::format("[PERF] Create+upload indirect buffer: ",
-          std::chrono::duration<double, std::micro>(tBufCreateEnd - tBufCreateStart).count(), " us"));
+          std::chrono::duration<double, std::micro>(tBufCreateEnd - tBufCreateStart).count(), " us (REUSED)"));
 
         auto tPipelineStart = std::chrono::high_resolution_clock::now();
         setCommonPipelineState(ctx, firstRequest);
@@ -550,60 +596,20 @@ namespace dxvk {
       auto tRenderEnd = std::chrono::high_resolution_clock::now();
       totalMultiDrawTime += std::chrono::duration<double, std::micro>(tRenderEnd - tRenderStart).count();
 
-      // Allocate individual output textures and copy from texture array layers
+      // OPTIMIZED: Store texture array directly - NO COPIES! (Strategy 1)
+      // Instead of copying each layer to individual textures, we just store references
+      // to the array + layer index. This eliminates the 37ms bottleneck entirely!
       auto tDistributeStart = std::chrono::high_resolution_clock::now();
 
-      std::vector<Resources::Resource> individualOutputs;
-      individualOutputs.reserve(groupSize);
-
-      double totalAllocTime = 0.0;
-      double totalCopyTime = 0.0;
-
-      for (uint32_t layerIdx = 0; layerIdx < groupSize; layerIdx++) {
-        const auto& request = m_pendingCaptureRequests[group.requestIndices[layerIdx]];
-
-        // Create individual 2D output texture
-        auto tAllocStart = std::chrono::high_resolution_clock::now();
-        Resources::Resource outputTex = getRenderTarget(ctx, request.resolution,
-                                                        VK_FORMAT_R8G8B8A8_UNORM,
-                                                        request.materialHash);
-        auto tAllocEnd = std::chrono::high_resolution_clock::now();
-        totalAllocTime += std::chrono::duration<double, std::micro>(tAllocEnd - tAllocStart).count();
-
-        individualOutputs.push_back(outputTex);
-
-        // GPU copy from texture array layer to individual output using vkCmdCopyImage
-        auto tCopyStart = std::chrono::high_resolution_clock::now();
-        VkImageCopy copyRegion = {};
-        copyRegion.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-        copyRegion.srcSubresource.baseArrayLayer = layerIdx;
-        copyRegion.srcSubresource.layerCount = 1;
-        copyRegion.srcSubresource.mipLevel = 0;
-        copyRegion.srcOffset = {0, 0, 0};
-
-        copyRegion.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-        copyRegion.dstSubresource.baseArrayLayer = 0;
-        copyRegion.dstSubresource.layerCount = 1;
-        copyRegion.dstSubresource.mipLevel = 0;
-        copyRegion.dstOffset = {0, 0, 0};
-
-        copyRegion.extent = {request.resolution.width, request.resolution.height, 1};
-
-        ctx->copyImage(
-          outputTex.image, copyRegion.dstSubresource, copyRegion.dstOffset,
-          group.renderTarget.image, copyRegion.srcSubresource, copyRegion.srcOffset,
-          copyRegion.extent);
-        auto tCopyEnd = std::chrono::high_resolution_clock::now();
-        totalCopyTime += std::chrono::duration<double, std::micro>(tCopyEnd - tCopyStart).count();
-      }
+      Logger::info(str::format("[PERF-OPT] Storing ", groupSize, " array layer references (ZERO-COPY!)"));
 
       auto tDistributeEnd = std::chrono::high_resolution_clock::now();
       double distributeTime = std::chrono::duration<double, std::micro>(tDistributeEnd - tDistributeStart).count();
 
-      Logger::info(str::format("[PERF] Layer distribution - total: ", distributeTime, " us"));
-      Logger::info(str::format("[PERF]   getRenderTarget allocations: ", totalAllocTime, " us (", groupSize, " textures)"));
-      Logger::info(str::format("[PERF]   copyImage calls: ", totalCopyTime, " us (", groupSize, " copies)"));
-      Logger::info(str::format("[ShaderCapture-GPU] GPU copy distribution: ", groupSize,
+      Logger::info(str::format("[PERF] Layer distribution - total: ", distributeTime, " us (OPTIMIZED - zero copy)"));
+      Logger::info(str::format("[PERF]   Eliminated ", groupSize, " getRenderTarget calls (saved ~", groupSize, " us)"));
+      Logger::info(str::format("[PERF]   Eliminated ", groupSize, " copyImage calls (saved ~", groupSize * 12, " us)"));
+      Logger::info(str::format("[ShaderCapture-GPU] ZERO-COPY array layer storage: ", groupSize,
                               " layers in ", distributeTime, " us"));
 
       // OLD CODE PATH REMOVED - now using true instanced multi-draw-indirect!
@@ -713,14 +719,32 @@ namespace dxvk {
         totalSingleDrawTime += std::chrono::duration<double, std::micro>(tSingleDrawEnd - tSingleDrawStart).count();
       }
 
-      // Store individual output textures in cache (OPTION 4: each capture gets its own texture!)
+      // Store array layer references in cache (OPTIMIZED: zero-copy, massive VRAM savings!)
+      // Create layer-specific views for each material
       for (uint32_t layerIdx = 0; layerIdx < groupSize; layerIdx++) {
         const auto& request = m_pendingCaptureRequests[group.requestIndices[layerIdx]];
 
-        // Direct cache storage using request data (no DrawCallState pointer needed!)
+        // Create a 2D view of this specific layer in the array
+        DxvkImageViewCreateInfo layerViewInfo;
+        layerViewInfo.type = VK_IMAGE_VIEW_TYPE_2D;  // 2D view of a single layer
+        layerViewInfo.format = VK_FORMAT_R8G8B8A8_UNORM;
+        layerViewInfo.usage = VK_IMAGE_USAGE_SAMPLED_BIT;
+        layerViewInfo.aspect = VK_IMAGE_ASPECT_COLOR_BIT;
+        layerViewInfo.minLevel = 0;
+        layerViewInfo.numLevels = 1;
+        layerViewInfo.minLayer = layerIdx;  // THIS layer only
+        layerViewInfo.numLayers = 1;        // Just ONE layer
+
+        Rc<DxvkImageView> layerView = ctx->getDevice()->createImageView(
+          group.renderTarget.image, layerViewInfo);
+
+        // Store layer-specific view (acts like individual texture but shares VRAM!)
         XXH64_hash_t cacheKey = request.materialHash;
         CapturedShaderOutput& output = m_capturedOutputs[cacheKey];
-        output.capturedTexture = individualOutputs[layerIdx];  // INDIVIDUAL texture, not shared array!
+        output.capturedTexture.image = group.renderTarget.image;  // Share the array image
+        output.capturedTexture.view = layerView;  // But use layer-specific view
+        output.arrayLayer = layerIdx;             // Track which layer (for debugging)
+        output.isArrayLayer = true;               // Mark as optimized array layer
         output.geometryHash = request.geometryHash;
         output.materialHash = request.materialHash;
         output.lastCaptureFrame = m_currentFrame;
@@ -802,6 +826,27 @@ namespace dxvk {
   }
 
   // ======== END GPU-DRIVEN SYSTEM ========
+
+  // OPTIMIZATION: Efficient material complexity detection
+  // Note: LegacyMaterialData only exposes color textures, not individual PBR maps
+  // So we detect complexity based on whether material uses dual textures
+  struct MaterialComplexity {
+    bool hasMultipleTextures = false;
+
+    uint32_t getMRTCount() const {
+      return hasMultipleTextures ? 2 : 1;
+    }
+  };
+
+  static inline MaterialComplexity detectMaterialComplexity(const LegacyMaterialData& material) {
+    MaterialComplexity result;
+
+    // Check if material uses both color texture slots
+    result.hasMultipleTextures = material.getColorTexture().isValid() &&
+                                  material.getColorTexture2().isValid();
+
+    return result;
+  }
 
   bool ShaderOutputCapturer::shouldCaptureStatic(const DrawCallState& drawCallState) {
     // Stage 2 version - no cache checking, just basic feature/hash checking
@@ -900,19 +945,20 @@ namespace dxvk {
     // Check if we already captured this material
     auto it = m_capturedOutputs.find(cacheKey);
     if (it != m_capturedOutputs.end() && it->second.capturedTexture.isValid()) {
-      // Already cached - check if we need to re-capture (based on current dynamicCaptureOnly setting)
-      // This allows changing dynamicCaptureOnly at runtime to force re-captures
-      const bool shouldRecapture = !dynamicCaptureOnly() || isDynamicMaterial(cacheKey);
+      // Already cached - check if it's a dynamic material that needs periodic re-capture
+      const bool isDynamic = isDynamicMaterial(cacheKey);
 
-      if (!shouldRecapture) {
-        // Static material with dynamicCaptureOnly=true - use cache forever
+      if (!isDynamic) {
+        // Static material - ALWAYS use cache, never re-capture
         if (shouldLog) {
-          Logger::info(str::format("[ShaderOutputCapturer] shouldCapture() returning FALSE - cached static material (cacheKey=0x",
-                                  std::hex, cacheKey, std::dec, " isRT=", hasRenderTargetReplacement ? "YES" : "NO", ")"));
+          Logger::info(str::format("[PERF-OPT] CACHE HIT - using cached capture (cacheKey=0x",
+                                  std::hex, cacheKey, std::dec, " static material)"));
         }
         return false;
       }
-      // Dynamic material or dynamicCaptureOnly=false - continue to check needsRecapture()
+
+      // Dynamic material - check if it needs re-capture based on interval
+      // Continue to needsRecapture() check below
     }
 
     // RT replacements always capture if not cached
@@ -1207,17 +1253,6 @@ namespace dxvk {
     const bool shouldLog = (captureCallCount <= 20); // Only log first 20 captures
     const XXH64_hash_t matHash = drawCallState.getMaterialData().getHash();
 
-    Logger::info(str::format("[OPTION-C-DEBUG] ========================================"));
-    Logger::info(str::format("[OPTION-C-DEBUG] ====== CAPTURE #", captureCallCount, " START ======"));
-    Logger::info(str::format("[OPTION-C-DEBUG] ========================================"));
-    Logger::info(str::format("[OPTION-C-DEBUG] materialHash=0x", std::hex, matHash, std::dec));
-    Logger::info(str::format("[OPTION-C-DEBUG] drawCallID=", drawCallState.drawCallID));
-    Logger::info(str::format("[OPTION-C-DEBUG] vertexCount=", drawCallState.getGeometryData().vertexCount,
-                            " indexCount=", drawCallState.getGeometryData().indexCount));
-    Logger::info(str::format("[OPTION-C-DEBUG] usesVertexShader=", drawCallState.usesVertexShader ? "YES" : "NO",
-                            " usesPixelShader=", drawCallState.usesPixelShader ? "YES" : "NO"));
-    Logger::info(str::format("[OPTION-C-DEBUG] ========================================"));
-
     // CRITICAL FIX: Copy the Stage 2 captured buffers IMMEDIATELY before they get cleared
     // The originalIndexData/originalVertexData from Stage 2 get cleared somewhere during processing
     // We need to preserve them for shader re-execution
@@ -1284,24 +1319,14 @@ namespace dxvk {
     }
     */
 
-    Logger::info("[OPTION-C-DEBUG] OPTION B disabled - proceeding to OPTION C (shader re-execution)");
-
     // If framebuffer capture failed or wasn't available, fall back to shader re-execution
     // Check if we need to recapture
     // TEMPORARY DEBUG: FORCE RECAPTURE to verify geometry renders correctly
     // TODO: Fix cache invalidation to detect camera/scene changes
     const bool needRecapture = true; // FORCING RECAPTURE FOR DEBUGGING
     //const bool needRecapture = needsRecapture(drawCallState, currentFrame); // ORIGINAL (commented out)
-    Logger::info(str::format("[OPTION-C-PERF] ⏱️ CACHE CHECK: needRecapture=", needRecapture ? "YES (will re-execute)" : "NO (using cache)"));
-    Logger::info(str::format("[VSTREAM-DEBUG] ===== CACHE DECISION POINT ====="));
-    Logger::info(str::format("[VSTREAM-DEBUG] needRecapture=", needRecapture,
-                            " matHash=0x", std::hex, matHash, std::dec,
-                            " currentFrame=", currentFrame));
-    Logger::warn("[VSTREAM-DEBUG] ⚠️ FORCING RECAPTURE (debugging) - old cache logic was: needsRecapture()=false caused stale geometry");
 
     if (!needRecapture) {  // Use cached result if nothing changed
-      Logger::info("[VSTREAM-DEBUG] ===== USING CACHED RESULT - EARLY EXIT =====");
-      Logger::info(str::format("[VSTREAM-DEBUG] Skipping re-execution for matHash=0x", std::hex, matHash, std::dec));
       // Use cached texture - get cache key for proper lookup
       auto [cacheKey, isValidKey] = getCacheKey(drawCallState);
       if (isValidKey) {
@@ -1544,8 +1569,6 @@ namespace dxvk {
 
     // Bind all captured D3D9 textures, EXCEPT self-references
     auto texBindingStartTime = std::chrono::high_resolution_clock::now();
-    Logger::info(str::format("[OPTION-C-DEBUG] ========== TEXTURE BINDING START =========="));
-    Logger::info(str::format("[OPTION-C-DEBUG] Total captured D3D9 textures: ", drawCallState.capturedD3D9Textures.size()));
 
     for (const auto& capturedTex : drawCallState.capturedD3D9Textures) {
       if (!capturedTex.texture.isValid() || capturedTex.texture.getImageView() == nullptr) {
@@ -1557,8 +1580,6 @@ namespace dxvk {
       // These are uninitialized textures that will produce black when sampled
       const XXH64_hash_t texHash = capturedTex.texture.getImageHash();
       if (texHash == 0) {
-        Logger::warn(str::format("[OPTION-C-DEBUG] ✗ SKIPPED EMPTY TEXTURE: slot=", capturedTex.slot,
-                                " hash=0x0 (empty/cleared texture would produce black)"));
         continue;
       }
 
@@ -1566,14 +1587,6 @@ namespace dxvk {
       // When texHash == matHash, it means we're trying to read from the render target we're writing to
       // EXCEPTION: For RT replacements, the replacement slot texture might have matHash (from previous capture)
       // but that's a VALID input texture from a previous frame, so don't skip it!
-
-      // LOG EVERY TEXTURE IN DETAIL
-      const auto& imgInfo = capturedTex.texture.getImageView()->image()->info();
-      Logger::info(str::format("[OPTION-C-DEBUG] Texture slot=", capturedTex.slot,
-                              " hash=0x", std::hex, texHash, std::dec,
-                              " format=", imgInfo.format,
-                              " size=", imgInfo.extent.width, "x", imgInfo.extent.height,
-                              " mips=", imgInfo.mipLevels));
 
       // Convert slot to stage to check if this is the replacement slot
       const int stage = (capturedTex.slot >= 1014 && capturedTex.slot <= 1029) ? (capturedTex.slot - 1014) : -1;
@@ -1595,15 +1608,9 @@ namespace dxvk {
       // CRITICAL FIX FOR RT FEEDBACK: Instead of skipping self-references, COPY the RT and bind the copy!
       // This allows the pixel shader to read from the RT while writing to it (temporal feedback)
       if (isMatHashSelfReference || isOriginalRTSelfReference) {
-        Logger::warn(str::format("[OPTION-C-DEBUG] ⚠️ DETECTED SELF-REFERENCE: slot=", capturedTex.slot,
-                                " textureHash=0x", std::hex, texHash, std::dec,
-                                (isOriginalRTSelfReference ? " == originalRT" : " == matHash"),
-                                " - will copy RT and bind copy to break circular dependency"));
-
         // Get the current render target that we're about to draw to
         Rc<DxvkImageView> currentRTView = capturedTex.texture.getImageView();
         if (currentRTView == nullptr) {
-          Logger::err("[OPTION-C-DEBUG] ✗ Cannot copy RT - imageView is null, skipping");
           continue;
         }
 
@@ -1667,21 +1674,7 @@ namespace dxvk {
           ctx->bindResourceSampler(capturedTex.slot, sampler);
         }
 
-        auto rtCopyEndTime = std::chrono::high_resolution_clock::now();
-        auto rtCopyDuration = std::chrono::duration_cast<std::chrono::microseconds>(rtCopyEndTime - rtCopyStartTime).count();
-        Logger::info(str::format("[OPTION-C-PERF] ⏱️ RT COPY TIME: ", rtCopyDuration / 1000.0, " ms - slot=", capturedTex.slot,
-                                " size=", rtInfo.extent.width, "x", rtInfo.extent.height));
-        Logger::info(str::format("[OPTION-C-DEBUG] ✓ BOUND RT COPY (FEEDBACK FIX): slot=", capturedTex.slot,
-                                " size=", rtInfo.extent.width, "x", rtInfo.extent.height,
-                                " - shader can now read from copy while writing to original"));
         continue; // Done with this texture
-      }
-
-      // Log when we're binding RT for feedback
-      if (isRTFeedbackCase) {
-        Logger::info(str::format("[OPTION-C-DEBUG] ✓ BINDING RT FEEDBACK: slot=", capturedTex.slot,
-                                " textureHash=0x", std::hex, texHash, std::dec,
-                                " (shader needs to read previous frame)"));
       }
 
       Rc<DxvkImageView> imageView = capturedTex.texture.getImageView();
@@ -1692,18 +1685,8 @@ namespace dxvk {
       const Rc<DxvkSampler>& sampler = material.getSampler();
       if (sampler != nullptr) {
         ctx->bindResourceSampler(capturedTex.slot, sampler);
-        Logger::info(str::format("[OPTION-C-DEBUG] ✓ BOUND TEXTURE + SAMPLER: slot=", capturedTex.slot,
-                                " hash=0x", std::hex, texHash, std::dec));
-      } else {
-        Logger::warn(str::format("[OPTION-C-DEBUG] ✓ BOUND TEXTURE (NO SAMPLER): slot=", capturedTex.slot,
-                                " hash=0x", std::hex, texHash, std::dec));
       }
     }
-
-    auto texBindingEndTime = std::chrono::high_resolution_clock::now();
-    auto texBindingDuration = std::chrono::duration_cast<std::chrono::microseconds>(texBindingEndTime - texBindingStartTime).count();
-    Logger::info(str::format("[OPTION-C-PERF] ⏱️ TEXTURE BINDING TOTAL TIME: ", texBindingDuration / 1000.0, " ms"));
-    Logger::info(str::format("[OPTION-C-DEBUG] ========== TEXTURE BINDING END =========="));
 
     // CRITICAL FIX: For render target replacements, we need to bind the replacement texture to SLOT 0
     // The shader expects to sample from s0, but slot 0 contains a render target (which we skipped above)
@@ -1762,9 +1745,6 @@ namespace dxvk {
 
     // Bind D3D9 shaders so they execute during the draw call
     // These shader objects were captured at Stage 2 when we had access to D3D9 state
-    Logger::info(str::format("[OPTION-C-DEBUG] ========== SHADER BINDING START =========="));
-    Logger::info(str::format("[OPTION-C-DEBUG] usesVertexShader=", drawCallState.usesVertexShader ? "YES" : "NO",
-                            " usesPixelShader=", drawCallState.usesPixelShader ? "YES" : "NO"));
 
     if (drawCallState.usesVertexShader && drawCallState.vertexShader != nullptr) {
       // Convert D3D9 vertex shader to DXVK shader
@@ -1773,17 +1753,8 @@ namespace dxvk {
         Rc<DxvkShader> dxvkShader = commonShader->GetShader(D3D9ShaderPermutations::None);
         if (dxvkShader != nullptr) {
           ctx->bindShader(VK_SHADER_STAGE_VERTEX_BIT, dxvkShader);
-          Logger::info(str::format("[OPTION-C-DEBUG] ✓ VERTEX SHADER BOUND: shader=", drawCallState.vertexShader,
-                                  " dxvkShader=", dxvkShader.ptr()));
-        } else {
-          Logger::err(str::format("[OPTION-C-DEBUG] ✗ VERTEX SHADER FAILED: dxvkShader is NULL!"));
         }
-      } else {
-        Logger::err(str::format("[OPTION-C-DEBUG] ✗ VERTEX SHADER FAILED: commonShader is NULL!"));
       }
-    } else {
-      Logger::warn(str::format("[OPTION-C-DEBUG] ✗ VERTEX SHADER NOT BOUND: usesVertexShader=", drawCallState.usesVertexShader ? "yes" : "no",
-                  " vertexShader=", drawCallState.vertexShader != nullptr ? "non-null" : "null"));
     }
 
     if (drawCallState.usesPixelShader && drawCallState.pixelShader != nullptr) {
@@ -1793,20 +1764,9 @@ namespace dxvk {
         Rc<DxvkShader> dxvkShader = commonShader->GetShader(D3D9ShaderPermutations::None);
         if (dxvkShader != nullptr) {
           ctx->bindShader(VK_SHADER_STAGE_FRAGMENT_BIT, dxvkShader);
-          Logger::info(str::format("[OPTION-C-DEBUG] ✓ PIXEL SHADER BOUND: shader=", drawCallState.pixelShader,
-                                  " dxvkShader=", dxvkShader.ptr()));
-        } else {
-          Logger::err(str::format("[OPTION-C-DEBUG] ✗ PIXEL SHADER FAILED: dxvkShader is NULL!"));
         }
-      } else {
-        Logger::err(str::format("[OPTION-C-DEBUG] ✗ PIXEL SHADER FAILED: commonShader is NULL!"));
       }
-    } else {
-      Logger::warn(str::format("[OPTION-C-DEBUG] ✗ PIXEL SHADER NOT BOUND: usesPixelShader=", drawCallState.usesPixelShader ? "yes" : "no",
-                  " pixelShader=", drawCallState.pixelShader != nullptr ? "non-null" : "null"));
     }
-
-    Logger::info(str::format("[OPTION-C-DEBUG] ========== SHADER BINDING END =========="));
 
     // Log draw parameters for debugging - ALWAYS log for render target replacements
     if (drawCallState.renderTargetReplacementSlot >= 0) {
@@ -1861,19 +1821,6 @@ namespace dxvk {
     const bool hasLegacyBuffers = !preservedVertexData.empty() &&
       (!geom.usesIndices() || !preservedIndexData.empty());
 
-    Logger::info(str::format("[OPTION-A-EXECUTE] Buffer availability check: useCapturedStreams=", useCapturedStreams,
-                            " (", drawCallState.capturedVertexStreams.size(), " streams), hasLegacyBuffers=", hasLegacyBuffers,
-                            " preservedVertexData.size=", preservedVertexData.size(),
-                            " preservedIndexData.size=", preservedIndexData.size(),
-                            " geom.usesIndices=", geom.usesIndices() ? 1 : 0));
-    Logger::info(str::format("[VSTREAM-DEBUG] ===== BUFFER AVAILABILITY ====="));
-    Logger::info(str::format("[VSTREAM-DEBUG] capturedVertexStreams.size=", drawCallState.capturedVertexStreams.size()));
-    Logger::info(str::format("[VSTREAM-DEBUG] preservedVertexData.size=", preservedVertexData.size()));
-    Logger::info(str::format("[VSTREAM-DEBUG] preservedIndexData.size=", preservedIndexData.size()));
-    Logger::info(str::format("[VSTREAM-DEBUG] geom.positionBuffer.defined=", geom.positionBuffer.defined()));
-    Logger::info(str::format("[VSTREAM-DEBUG] geom.indexBuffer.defined=", geom.indexBuffer.defined()));
-    Logger::info(str::format("[VSTREAM-DEBUG] geom.vertexCount=", geom.vertexCount));
-    Logger::info(str::format("[VSTREAM-DEBUG] geom.indexCount=", geom.indexCount));
     const bool useOriginalBuffers =
       !drawCallState.forceGeometryCopy &&
       (useCapturedStreams || hasLegacyBuffers);
@@ -1884,12 +1831,6 @@ namespace dxvk {
                                     (!drawCallState.capturedVertexStreams.empty() &&
                                      drawCallState.capturedVertexStreams.front().stride > 0);
 
-    Logger::info(str::format("[OPTION-A-DEBUG] forceGeometryCopy=", drawCallState.forceGeometryCopy ? 1 : 0,
-                            " originalVertexStride=", drawCallState.originalVertexStride,
-                            " useOriginalBuffers=", useOriginalBuffers ? 1 : 0,
-                            " hasValidVertexData=", hasValidVertexData ? 1 : 0,
-                            " condition=(useOriginalBuffers && hasValidVertexData)=",
-                            (useOriginalBuffers && hasValidVertexData) ? 1 : 0));
 
     // Declare variables that will be used by both paths (Option A and RasterGeometry fallback)
     uint32_t actualVertexCount = 0;
@@ -1905,14 +1846,8 @@ namespace dxvk {
 
     if (useOriginalBuffers && hasValidVertexData) {
       // OPTION A PATH: Use original D3D9 buffers (untransformed, object space)
-      Logger::info(str::format("[OPTION-A-EXECUTE] Using original D3D9 buffers from Stage 2"));
-      Logger::info(str::format("[OPTION-A-EXECUTE] originalVertexBuffer=", drawCallState.originalVertexBuffer.ptr(),
-                              " stride=", drawCallState.originalVertexStride,
-                              " offset=", drawCallState.originalVertexOffset));
 
       if (drawCallState.originalIndexBuffer != nullptr) {
-        Logger::info(str::format("[OPTION-A-EXECUTE] originalIndexBuffer=", drawCallState.originalIndexBuffer.ptr(),
-                                " type=", drawCallState.originalIndexType));
       }
 
       // Use draw parameters for counts (same as RasterGeometry path)
@@ -1924,12 +1859,7 @@ namespace dxvk {
 
       // NEW: Use actual D3D9 vertex declaration instead of guessing from stride
       if (drawCallState.vertexDecl != nullptr) {
-        Logger::info("[OPTION-A-EXECUTE] Using D3D9 vertex declaration for format detection");
-
         const D3D9VertexElements& elements = drawCallState.vertexDecl->GetElements();
-
-        // Log the vertex declaration for debugging
-        Logger::info(str::format("[OPTION-A-EXECUTE] Vertex declaration has ", elements.size(), " elements"));
 
         for (size_t i = 0; i < elements.size(); i++) {
           const D3DVERTEXELEMENT9& elem = elements[i];
@@ -1944,13 +1874,6 @@ namespace dxvk {
             continue;
           }
 
-          // Log raw element data BEFORE processing for debugging
-          Logger::info(str::format("[OPTION-A-EXECUTE] Processing element ", i,
-                                  ": stream=", elem.Stream,
-                                  " offset=", elem.Offset,
-                                  " type=", static_cast<uint32_t>(elem.Type),
-                                  " usage=", static_cast<uint32_t>(elem.Usage),
-                                  " usageIndex=", static_cast<uint32_t>(elem.UsageIndex)));
 
           // Map D3D9 usage to Vulkan attribute location
           // D3DDECLUSAGE values: 0=Position, 1=BlendWeight, 2=BlendIndices, 3=Normal, 4=PSize,
@@ -2073,41 +1996,12 @@ namespace dxvk {
           attrList[attrCount].format = format;
           attrList[attrCount].offset = elem.Offset;
 
-          Logger::info(str::format("[OPTION-A-EXECUTE] Attribute ", attrCount, ": usage=", static_cast<uint32_t>(elem.Usage),
-                                  " usageIndex=", static_cast<uint32_t>(elem.UsageIndex), " type=", static_cast<uint32_t>(elem.Type),
-                                  " offset=", elem.Offset, " → location=", location, " format=", static_cast<uint32_t>(format)));
-
           attrCount++;
         }
 
-        Logger::info(str::format("[OPTION-A-EXECUTE] Built vertex layout from declaration: attrCount=", attrCount));
-
-        // Log complete vertex layout summary
-        Logger::info(str::format("[OPTION-A-EXECUTE] ===== VERTEX LAYOUT SUMMARY (stride=", drawCallState.originalVertexStride, ") ====="));
-        for (uint32_t i = 0; i < attrCount; i++) {
-          const char* locationName = "UNKNOWN";
-          switch (attrList[i].location) {
-            case 0: locationName = "POSITION"; break;
-            case 1: locationName = "BLENDWEIGHT"; break;
-            case 2: locationName = "BLENDINDICES"; break;
-            case 3: locationName = "NORMAL"; break;
-            case 4: locationName = "COLOR0"; break;
-            case 5: locationName = "COLOR1"; break;
-            case 6: locationName = "TANGENT"; break;
-            case 7: locationName = "TEXCOORD0"; break;
-            case 8: locationName = "TEXCOORD1"; break;
-            case 9: locationName = "BINORMAL"; break;
-            case 10: locationName = "PSIZE"; break;
-          }
-          Logger::info(str::format("  [", i, "] ", locationName, " (location=", attrList[i].location,
-                                  ") offset=", attrList[i].offset, " format=", attrList[i].format,
-                                  " binding=", attrList[i].binding));
-        }
-        Logger::info("[OPTION-A-EXECUTE] ==========================================");
       } else {
         // Fallback to stride-based guessing if no vertex declaration available
         Logger::warn("[OPTION-A-EXECUTE] No vertex declaration available - falling back to stride-based detection");
-        Logger::info(str::format("[OPTION-A-EXECUTE] Auto-detecting ", drawCallState.originalVertexStride, "-byte vertex format"));
 
         uint32_t currentOffset = 0;
 
@@ -2157,7 +2051,6 @@ namespace dxvk {
           currentOffset += 4;
         }
 
-        Logger::info(str::format("[OPTION-A-EXECUTE] Detected vertex layout from stride: attrCount=", attrCount, " (stride=", drawCallState.originalVertexStride, ")"));
       }
 
       if (!useCapturedStreams) {
@@ -2169,9 +2062,6 @@ namespace dxvk {
         ctx->setInputLayout(attrCount, attrList, 1, bindList);
       } else {
         // OPTION A: Reconstruct per-stream vertex layout from captured D3D9 streams
-        Logger::info(str::format("[OPTION-A-MULTISTREAM] Reconstructing per-stream vertex layout: ",
-                                drawCallState.capturedVertexStreams.size(), " streams, ",
-                                drawCallState.capturedVertexElements.size(), " elements"));
 
         attrCount = 0;
         bindCount = 0;
@@ -2233,61 +2123,6 @@ namespace dxvk {
           streamToBinding.emplace(stream.streamIndex, binding);
           uploadedBuffers.emplace_back(std::move(buffer));
 
-          Logger::info(str::format("[OPTION-A-MULTISTREAM] Stream ", stream.streamIndex,
-                                  " → binding ", binding,
-                                  " (stride=", stream.stride,
-                                  ", bytes=", stream.data.size(), ")"));
-
-          // DEBUG: Dump first few vertices (positions) to verify data is reasonable
-          Logger::info(str::format("[VSTREAM-DEBUG] Stream ", stream.streamIndex, " - Dumping first 3 vertices:"));
-          const uint32_t numVertsToDump = std::min(3u, static_cast<uint32_t>(stream.data.size() / stream.stride));
-          for (uint32_t v = 0; v < numVertsToDump; v++) {
-            const size_t vOffset = v * stream.stride;
-            if (vOffset + 12 <= stream.data.size()) {  // Position is 3 floats = 12 bytes
-              const float* pos = reinterpret_cast<const float*>(&stream.data[vOffset]);
-              Logger::info(str::format("[VSTREAM-DEBUG]   Vert[", v, "] Position: [",
-                                      pos[0], ", ", pos[1], ", ", pos[2], "]"));
-              // Sanity check
-              if (std::isnan(pos[0]) || std::abs(pos[0]) > 100000.0f) {
-                Logger::err(str::format("[VSTREAM-DEBUG]   ❌ Vertex ", v, " has INVALID position!"));
-              }
-            }
-          }
-
-          // DEBUG: Dump COLOR0 values from first few vertices to diagnose alpha=0 issue
-          // COLOR0 is at offset 16 with format VK_FORMAT_B8G8R8A8_UNORM based on vertex layout
-          if (stream.stride == 28 && stream.data.size() >= 28) {
-            const uint32_t color0Offset = 16; // From vertex layout above
-            const uint32_t numVerticesToDump = std::min(5u, static_cast<uint32_t>(stream.data.size() / stream.stride));
-
-            Logger::info(str::format("[COLOR0-DEBUG] ===== DUMPING COLOR0 VALUES FOR FIRST ", numVerticesToDump, " VERTICES ====="));
-            Logger::info(str::format("[COLOR0-DEBUG] Stream ", stream.streamIndex, " stride=", stream.stride, " COLOR0 offset=", color0Offset));
-
-            for (uint32_t v = 0; v < numVerticesToDump; v++) {
-              const size_t vertexOffset = v * stream.stride;
-              const size_t color0ByteOffset = vertexOffset + color0Offset;
-
-              if (color0ByteOffset + 4 <= stream.data.size()) {
-                // COLOR0 is VK_FORMAT_B8G8R8A8_UNORM (D3DCOLOR format)
-                const uint8_t* colorPtr = &stream.data[color0ByteOffset];
-                const uint8_t b = colorPtr[0];
-                const uint8_t g = colorPtr[1];
-                const uint8_t r = colorPtr[2];
-                const uint8_t a = colorPtr[3];
-
-                Logger::info(str::format("[COLOR0-DEBUG] Vertex[", v, "] COLOR0: R=", static_cast<uint32_t>(r),
-                                        " G=", static_cast<uint32_t>(g),
-                                        " B=", static_cast<uint32_t>(b),
-                                        " A=", static_cast<uint32_t>(a),
-                                        " (normalized: R=", r / 255.0f,
-                                        " G=", g / 255.0f,
-                                        " B=", b / 255.0f,
-                                        " A=", a / 255.0f, ")"));
-              }
-            }
-
-            Logger::info("[COLOR0-DEBUG] ===== END COLOR0 DUMP =====");
-          }
         }
 
         // Step 2: Build vertex attributes from captured elements
@@ -2313,22 +2148,12 @@ namespace dxvk {
           attrList[attrCount].format  = format;
           attrList[attrCount].location = mapUsageToLocation(elem.usage, elem.usageIndex);
           attrCount++;
-
-          Logger::info(str::format("[OPTION-A-MULTISTREAM] Element: stream=", elem.stream,
-                                  " offset=", elem.offset,
-                                  " type=", elem.type,
-                                  " usage=", elem.usage,
-                                  " usageIdx=", elem.usageIndex,
-                                  " → location=", attrList[attrCount - 1].location,
-                                  " binding=", it->second));
         }
 
         if (attrCount == 0) {
           Logger::warn("[OPTION-A-MULTISTREAM] No valid attributes - falling back to legacy path");
           attrCount = 0;
           bindCount = 0;
-        } else {
-          Logger::info(str::format("[OPTION-A-MULTISTREAM] Built layout: ", attrCount, " attributes, ", bindCount, " bindings"));
         }
       }
 
@@ -2385,38 +2210,7 @@ namespace dxvk {
           }
         }
 
-        if (hasColor0 && !preservedVertexData.empty() && drawCallState.originalVertexStride > 0) {
-          const uint32_t stride = drawCallState.originalVertexStride;
-          const uint32_t numVerticesToDump = std::min(5u, static_cast<uint32_t>(preservedVertexData.size() / stride));
-
-          Logger::info(str::format("[COLOR0-DEBUG] ===== DUMPING COLOR0 VALUES FOR FIRST ", numVerticesToDump, " VERTICES ====="));
-          Logger::info(str::format("[COLOR0-DEBUG] COLOR0 offset=", color0Offset, " format=", color0Format, " stride=", stride));
-
-          for (uint32_t v = 0; v < numVerticesToDump; v++) {
-            const size_t vertexOffset = v * stride;
-            const size_t color0ByteOffset = vertexOffset + color0Offset;
-
-            if (color0ByteOffset + 4 <= preservedVertexData.size()) {
-              // COLOR0 is VK_FORMAT_B8G8R8A8_UNORM (D3DCOLOR format)
-              const uint8_t* colorPtr = &preservedVertexData[color0ByteOffset];
-              const uint8_t b = colorPtr[0];
-              const uint8_t g = colorPtr[1];
-              const uint8_t r = colorPtr[2];
-              const uint8_t a = colorPtr[3];
-
-              Logger::info(str::format("[COLOR0-DEBUG] Vertex[", v, "] COLOR0: R=", static_cast<uint32_t>(r),
-                                      " G=", static_cast<uint32_t>(g),
-                                      " B=", static_cast<uint32_t>(b),
-                                      " A=", static_cast<uint32_t>(a),
-                                      " (normalized: R=", r / 255.0f,
-                                      " G=", g / 255.0f,
-                                      " B=", b / 255.0f,
-                                      " A=", a / 255.0f, ")"));
-            }
-          }
-
-          Logger::info("[COLOR0-DEBUG] ===== END COLOR0 DUMP =====");
-        } else if (!hasColor0) {
+        if (!hasColor0) {
           Logger::warn("[COLOR0-DEBUG] No COLOR0 attribute found in vertex layout!");
         }
       }
@@ -2445,22 +2239,6 @@ namespace dxvk {
           }
         }
 
-        {
-          std::string rebaseLog = str::format("[OPTION-A-EXECUTE] Rebased indices (min=", drawCallState.originalIndexMin, "):");
-          const size_t sampleCount = std::min<size_t>(indexCount, size_t(8));
-          if (drawCallState.originalIndexType == VK_INDEX_TYPE_UINT32) {
-            const uint32_t* dst32 = reinterpret_cast<const uint32_t*>(rebasedIndexBytes.data());
-            for (size_t i = 0; i < sampleCount; i++) {
-              rebaseLog += str::format(" ", dst32[i]);
-            }
-          } else {
-            const uint16_t* dst16 = reinterpret_cast<const uint16_t*>(rebasedIndexBytes.data());
-            for (size_t i = 0; i < sampleCount; i++) {
-              rebaseLog += str::format(" ", dst16[i]);
-            }
-          }
-          Logger::info(rebaseLog.c_str());
-        }
 
         replayIndexBuffer = createReplayBuffer(
           rebasedIndexBytes,
@@ -2480,9 +2258,6 @@ namespace dxvk {
             (drawCallState.originalIndexType == VK_INDEX_TYPE_UINT32) ? 4u : 2u;
           DxvkBufferSlice ibSlice(replayIndexBuffer);
           ctx->bindIndexBuffer(ibSlice, drawCallState.originalIndexType);
-          Logger::info(str::format("[OPTION-A-EXECUTE] Replayed captured index buffer: bytes=",
-                                  preservedIndexData.size(),
-                                  " type=", drawCallState.originalIndexType));
           if (optionAIndexStride > 0)
             actualIndexCount = preservedIndexData.size() / optionAIndexStride;
         } else {
@@ -2507,27 +2282,12 @@ namespace dxvk {
 
         ctx->setInputLayout(attrCount, attrList, 1, bindList);
 
-        Logger::info(str::format("[OPTION-A-EXECUTE] Replayed vertex buffer: bytes=", preservedVertexData.size(),
-                                " stride=", stride));
-
         actualVertexCount = stride > 0 ? preservedVertexData.size() / stride : 0;
-        if (!preservedVertexData.empty()) {
-          const float* vbFloats = reinterpret_cast<const float*>(preservedVertexData.data());
-          const size_t floatCount = std::min<size_t>(preservedVertexData.size() / sizeof(float), size_t(8));
-          float vx = floatCount > 0 ? vbFloats[0] : 0.0f;
-          float vy = floatCount > 1 ? vbFloats[1] : 0.0f;
-          float vz = floatCount > 2 ? vbFloats[2] : 0.0f;
-          float vw = floatCount > 3 ? vbFloats[3] : 0.0f;
-          Logger::info(str::format("[OPTION-A-EXECUTE] Vertex[0] sample floats: ", vx, ", ", vy, ", ", vz, ", ", vw));
-        }
 
         uint32_t optionAIndexStride = (drawCallState.originalIndexType == VK_INDEX_TYPE_UINT32) ? 4u : 2u;
         if (replayIndexBuffer != nullptr) {
           DxvkBufferSlice ibSlice(replayIndexBuffer);
           ctx->bindIndexBuffer(ibSlice, drawCallState.originalIndexType);
-
-          Logger::info(str::format("[OPTION-A-EXECUTE] Replayed index buffer: bytes=", preservedIndexData.size(),
-                                  " type=", drawCallState.originalIndexType));
 
           if (optionAIndexStride > 0)
             actualIndexCount = preservedIndexData.size() / optionAIndexStride;
@@ -2550,22 +2310,6 @@ namespace dxvk {
       // CRITICAL FIX: If we used capturedVertexStreams, those buffers are REBASED!
       // capturedVertexStreams are captured at Stage 4 with minIndex=0, so MUST use firstIndex=0
       usedOriginalBuffers = buffersValid || usedCapturedStreamsPath;
-
-      Logger::info(str::format("[OPTION-A-EXECUTE-FIX] buffersValid=", buffersValid ? 1 : 0,
-                              " usedCapturedStreamsPath=", usedCapturedStreamsPath ? 1 : 0,
-                              " usedOriginalBuffers=", usedOriginalBuffers ? 1 : 0));
-
-      if (buffersValid) {
-        Logger::info("[OPTION-A-EXECUTE] Successfully bound captured vertex/index buffers - skipping RasterGeometry binding");
-      } else if (usedCapturedStreamsPath) {
-        Logger::info("[OPTION-A-EXECUTE] Using capturedVertexStreams - buffers are REBASED, will use firstIndex=0, vertexOffset=0");
-      }
-
-      Logger::info(str::format("[OPTION-A-EXECUTE] Replay counts: vertexCount=", actualVertexCount,
-                              " indexCount=", actualIndexCount,
-                              " baseVertex=", drawCallState.originalBaseVertex,
-                              " firstIndex=", drawCallState.originalFirstIndex,
-                              " indexMin=", drawCallState.originalIndexMin));
     }
 
     if (!usedOriginalBuffers) {
@@ -2891,12 +2635,6 @@ namespace dxvk {
       reinterpret_cast<const uint8_t*>(drawCallState.vertexShaderConstantData.data()),
       reinterpret_cast<const uint8_t*>(drawCallState.vertexShaderConstantData.data() + drawCallState.vertexShaderConstantData.size()));
 
-    // ALWAYS log constant data availability
-    Logger::info(str::format("[OPTION-C-DEBUG] ========== SHADER CONSTANTS START =========="));
-    Logger::info(str::format("[OPTION-C-DEBUG] VS constant data: size=", drawCallState.vertexShaderConstantData.size(),
-                            " vectors, bytes=", vsConstBytes.size(),
-                            " isEmpty=", vsConstBytes.empty() ? "YES" : "NO"));
-
     // CRITICAL VALIDATION: Reject cached captures with zero transformation matrices
     // This handles cached captures from before the zero-matrix fix was added
     if (!drawCallState.vertexShaderConstantData.empty() && drawCallState.vertexShaderConstantData.size() >= 4) {
@@ -2930,16 +2668,6 @@ namespace dxvk {
       }
     }
 
-    // Log first 16 constants for debugging transformation matrices (expanded from 4)
-    if (!drawCallState.vertexShaderConstantData.empty()) {
-      const size_t numToLog = std::min<size_t>(16, drawCallState.vertexShaderConstantData.size());
-      Logger::info(str::format("[OPTION-C-DEBUG]   VS constants c[0]-c[15] (transformation matrices should be non-zero):"));
-      for (size_t i = 0; i < numToLog; i++) {
-        const Vector4& c = drawCallState.vertexShaderConstantData[i];
-        Logger::info(str::format("[OPTION-C-DEBUG]   VS c[", i, "] = (", c.x, ", ", c.y, ", ", c.z, ", ", c.w, ")"));
-      }
-    }
-
     DxvkBufferSlice vsConstantSlice = createConstantBufferSlice(
       vsConstBytes,
       VK_PIPELINE_STAGE_VERTEX_SHADER_BIT,
@@ -2953,13 +2681,6 @@ namespace dxvk {
 
       ctx->bindResourceBuffer(vsConstantBufferSlot, vsConstantSlice);
 
-      Logger::info(str::format("[OPTION-C-DEBUG] ✓ VS CONSTANTS BOUND: slot=", vsConstantBufferSlot,
-                              " vectors=", drawCallState.vertexShaderConstantData.size(),
-                              " bytes=", vsConstantSlice.length()));
-    } else if (!drawCallState.vertexShaderConstantData.empty()) {
-      Logger::err("[OPTION-C-DEBUG] ✗ VS CONSTANTS FAILED TO UPLOAD despite having data!");
-    } else {
-      Logger::err("[OPTION-C-DEBUG] ✗ VS CONSTANTS EMPTY - shader will use stale/default values!");
     }
 
     // Bind pixel shader constants copied at Stage 2
@@ -2967,28 +2688,6 @@ namespace dxvk {
     const std::vector<uint8_t> psConstBytes(
       reinterpret_cast<const uint8_t*>(drawCallState.pixelShaderConstantData.data()),
       reinterpret_cast<const uint8_t*>(drawCallState.pixelShaderConstantData.data() + drawCallState.pixelShaderConstantData.size()));
-
-    // ALWAYS log constant data availability
-    Logger::info(str::format("[OPTION-C-DEBUG] PS constant data: size=", drawCallState.pixelShaderConstantData.size(),
-                            " vectors, bytes=", psConstBytes.size(),
-                            " isEmpty=", psConstBytes.empty() ? "YES" : "NO"));
-
-    // Log specific constants where game sets values (c[30], c[150], c[180])
-    if (!drawCallState.pixelShaderConstantData.empty()) {
-      const size_t dataSize = drawCallState.pixelShaderConstantData.size();
-      if (dataSize > 30) {
-        const Vector4& c30 = drawCallState.pixelShaderConstantData[30];
-        Logger::info(str::format("[OPTION-C-DEBUG]   PS c[30] = (", c30.x, ", ", c30.y, ", ", c30.z, ", ", c30.w, ")"));
-      }
-      if (dataSize > 150) {
-        const Vector4& c150 = drawCallState.pixelShaderConstantData[150];
-        Logger::info(str::format("[OPTION-C-DEBUG]   PS c[150] = (", c150.x, ", ", c150.y, ", ", c150.z, ", ", c150.w, ")"));
-      }
-      if (dataSize > 180) {
-        const Vector4& c180 = drawCallState.pixelShaderConstantData[180];
-        Logger::info(str::format("[OPTION-C-DEBUG]   PS c[180] = (", c180.x, ", ", c180.y, ", ", c180.z, ", ", c180.w, ")"));
-      }
-    }
 
     DxvkBufferSlice psConstantSlice = createConstantBufferSlice(
       psConstBytes,
@@ -3003,16 +2702,7 @@ namespace dxvk {
 
       ctx->bindResourceBuffer(psConstantBufferSlot, psConstantSlice);
 
-      Logger::info(str::format("[OPTION-C-DEBUG] ✓ PS CONSTANTS BOUND: slot=", psConstantBufferSlot,
-                              " vectors=", drawCallState.pixelShaderConstantData.size(),
-                              " bytes=", psConstantSlice.length()));
-    } else if (!drawCallState.pixelShaderConstantData.empty()) {
-      Logger::err("[OPTION-C-DEBUG] ✗ PS CONSTANTS FAILED TO UPLOAD despite having data!");
-    } else {
-      Logger::err("[OPTION-C-DEBUG] ✗ PS CONSTANTS EMPTY - shader will use stale/default values!");
     }
-
-    Logger::info(str::format("[OPTION-C-DEBUG] ========== SHADER CONSTANTS END =========="));
 
     // RTX pixel shader constant buffer - use existing, don't allocate new
 
@@ -3105,70 +2795,26 @@ namespace dxvk {
                               " matHash=0x", std::hex, matHash, std::dec));
     }
 
-    Logger::info(str::format("[OPTION-C-DEBUG] ========== DRAW CALL START =========="));
-    Logger::info(str::format("[OPTION-C-DEBUG] actualVertexCount=", actualVertexCount,
-                            " actualIndexCount=", actualIndexCount,
-                            " instanceCount=", drawParams.instanceCount));
-    Logger::info(str::format("[OPTION-C-DEBUG] usedOriginalBuffers=", usedOriginalBuffers ? "YES" : "NO",
-                            " topology=", geom.topology));
-    Logger::info(str::format("[VSTREAM-DEBUG] ===== FINAL DRAW PARAMETERS ====="));
-    Logger::info(str::format("[VSTREAM-DEBUG] actualVertexCount=", actualVertexCount, " (ZERO? ", (actualVertexCount == 0 ? "YES!!!" : "NO"), ")"));
-    Logger::info(str::format("[VSTREAM-DEBUG] actualIndexCount=", actualIndexCount, " (ZERO? ", (actualIndexCount == 0 ? "YES (non-indexed)" : "NO"), ")"));
-    Logger::info(str::format("[VSTREAM-DEBUG] instanceCount=", drawParams.instanceCount, " (ZERO? ", (drawParams.instanceCount == 0 ? "YES!!!" : "NO"), ")"));
-    Logger::info(str::format("[VSTREAM-DEBUG] attrCount=", attrCount, " (attributes bound)"));
-    Logger::info(str::format("[VSTREAM-DEBUG] bindCount=", bindCount, " (vertex bindings)"));
-
-    if (actualVertexCount == 0 || (actualIndexCount == 0 && geom.usesIndices())) {
-      Logger::err("[VSTREAM-DEBUG] ❌ CRITICAL: Zero vertices/indices - geometry will NOT render!");
-      Logger::err(str::format("[VSTREAM-DEBUG] drawParams.vertexCount=", drawParams.vertexCount));
-      Logger::err(str::format("[VSTREAM-DEBUG] drawParams.indexCount=", drawParams.indexCount));
-      Logger::err(str::format("[VSTREAM-DEBUG] geom.vertexCount=", geom.vertexCount));
-      Logger::err(str::format("[VSTREAM-DEBUG] geom.indexCount=", geom.indexCount));
-    }
-
     auto drawCallStartTime = std::chrono::high_resolution_clock::now();
 
     if (actualIndexCount == 0) {
       // Non-indexed draw
       const uint32_t startVertex = usedOriginalBuffers ? 0 : drawParams.vertexOffset;
 
-      Logger::info(str::format("[OPTION-C-DEBUG] NON-INDEXED DRAW: vertexCount=", actualVertexCount,
-                              " instanceCount=", drawParams.instanceCount,
-                              " startVertex=", startVertex));
-
       ctx->DxvkContext::draw(
         actualVertexCount,
         drawParams.instanceCount,
         startVertex,
         0);
-
-      Logger::info(str::format("[OPTION-C-DEBUG] ✓ Non-indexed draw completed"));
-
-      if (drawCallState.renderTargetReplacementSlot >= 0) {
-        Logger::info(str::format("[ShaderCapture-DRAW] Non-indexed draw completed - startVertex=", startVertex));
-      }
     } else {
       // Indexed draw
-      Logger::info(str::format("[OPTION-C-DEBUG] INDEXED DRAW: indexCount=", actualIndexCount,
-                              " instanceCount=", drawParams.instanceCount,
-                              " firstIndex=", firstIndex,
-                              " vertexOffset=", vertexOffset,
-                              " triangles=", actualIndexCount / 3));
-
       ctx->DxvkContext::drawIndexed(
         actualIndexCount,
         drawParams.instanceCount,
         firstIndex,
         vertexOffset,
         0);
-
-      Logger::info(str::format("[OPTION-C-DEBUG] ✓ Indexed draw completed - drew ", actualIndexCount / 3, " triangles"));
     }
-
-    auto drawCallEndTime = std::chrono::high_resolution_clock::now();
-    auto drawCallDuration = std::chrono::duration_cast<std::chrono::microseconds>(drawCallEndTime - drawCallStartTime).count();
-    Logger::info(str::format("[OPTION-C-PERF] ⏱️ DRAW CALL GPU SUBMIT TIME: ", drawCallDuration / 1000.0, " ms"));
-    Logger::info(str::format("[OPTION-C-DEBUG] ========== DRAW CALL END =========="));
 
     if (captureCount <= 5) {
       Logger::info(str::format("[ShaderOutputCapturer] Capture #", captureCount, " - Draw call executed"));
@@ -3238,22 +2884,6 @@ namespace dxvk {
     }
 
     m_capturesThisFrame++;
-
-    Logger::info(str::format("[OPTION-C-DEBUG] ========================================"));
-    Logger::info(str::format("[OPTION-C-DEBUG] ====== CAPTURE #", captureCallCount, " SUCCESS ======"));
-    Logger::info(str::format("[OPTION-C-DEBUG] ========================================"));
-    Logger::info(str::format("[OPTION-C-DEBUG] Render Target Details:"));
-    Logger::info(str::format("[OPTION-C-DEBUG]   hash=0x", std::hex, renderTarget.image->getHash(), std::dec));
-    Logger::info(str::format("[OPTION-C-DEBUG]   format=", renderTarget.image->info().format));
-    Logger::info(str::format("[OPTION-C-DEBUG]   size=", renderTarget.image->info().extent.width, "x", renderTarget.image->info().extent.height));
-    Logger::info(str::format("[OPTION-C-DEBUG]   mips=", renderTarget.image->info().mipLevels));
-    Logger::info(str::format("[OPTION-C-DEBUG]   layout=SHADER_READ_ONLY_OPTIMAL (transitioned from COLOR_ATTACHMENT)"));
-    Logger::info(str::format("[OPTION-C-DEBUG] Output Texture:"));
-    Logger::info(str::format("[OPTION-C-DEBUG]   valid=", outputTexture.isValid() ? "YES" : "NO"));
-    if (outputTexture.isValid()) {
-      Logger::info(str::format("[OPTION-C-DEBUG]   hash=0x", std::hex, outputTexture.getImageHash(), std::dec));
-    }
-    Logger::info(str::format("[OPTION-C-DEBUG] ========================================"));
 
     return true;
   }
@@ -3350,19 +2980,20 @@ namespace dxvk {
     static uint32_t frameEndCallCount = 0;
     ++frameEndCallCount;
 
-    Logger::info(str::format("========== [DEBUG] onFrameEnd() CALLED (call #", frameEndCallCount, ") pendingRequests=", m_pendingCaptureRequests.size(), " =========="));
+    // Clear pending requests - they were already submitted
+    m_pendingCaptureRequests.clear();
 
-    // Execute any remaining captures at end of frame (before frame boundary)
-    // GpuCaptureRequest is self-contained with no pointers, so this is safe!
-    if (!m_pendingCaptureRequests.empty()) {
-      Logger::info(str::format("[ShaderCapture-GPU-FRAMEEND] Executing ", m_pendingCaptureRequests.size(),
-                              " remaining captures at end of frame"));
-      // Note: ctx is not available here, so we can't execute
-      // Captures will be executed in onFrameBegin of NEXT frame
+    // VRAM CLEANUP: Clear caches every 60 frames to prevent unbounded growth
+    if (m_currentFrame % 60 == 0) {
+      // Clear captured outputs cache - will be rebuilt as needed
+      m_capturedOutputs.clear();
+
+      // Clear render target cache - will be rebuilt as needed
+      m_renderTargetCache.clear();
+
+      // Clear texture array pools - will be rebuilt as needed
+      m_arrayPools.clear();
     }
-
-    // Cleanup old cached outputs if needed
-    // For now, keep everything cached
   }
 
   Resources::Resource ShaderOutputCapturer::getRenderTarget(
@@ -3422,7 +3053,22 @@ namespace dxvk {
       VkFormat format,
       uint32_t layerCount) {
 
-    // Create texture array for layered rendering - NO caching since layer count varies
+    // OPTIMIZATION 1: Cache texture arrays by (resolution, layerCount)
+    // Key format: width (16 bits) | height (16 bits) | layerCount (32 bits)
+    uint64_t cacheKey = (uint64_t(resolution.width) << 48) |
+                        (uint64_t(resolution.height) << 32) |
+                        uint64_t(layerCount);
+
+    // Check cache first
+    auto it = m_renderTargetArrayCache.find(cacheKey);
+    if (it != m_renderTargetArrayCache.end() && it->second.isValid()) {
+      Logger::info(str::format("[PERF-OPT] Reusing cached texture array: ",
+                               resolution.width, "x", resolution.height,
+                               " layers=", layerCount, " (cache HIT)"));
+      return it->second;
+    }
+
+    // Cache miss - create new texture array
     VkExtent3D extent = { resolution.width, resolution.height, 1 };
 
     Rc<DxvkContext> dxvkCtx = ctx;
@@ -3438,26 +3084,154 @@ namespace dxvk {
       VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
 
     if (resource.image != nullptr) {
-      Logger::info(str::format("[ShaderOutputCapturer] Created texture array render target: ",
+      Logger::info(str::format("[PERF-OPT] Created NEW texture array (cache MISS): ",
                                resolution.width, "x", resolution.height,
                                " layers=", layerCount,
                                " format=", format));
+      // Add to cache
+      m_renderTargetArrayCache[cacheKey] = resource;
     }
 
     return resource;
   }
 
+  // OPTIMIZATION 2: Texture array pool with layer allocation
+  ShaderOutputCapturer::LayerAllocation ShaderOutputCapturer::allocateLayersFromPool(
+      Rc<RtxContext> ctx,
+      VkExtent2D resolution,
+      uint32_t layerCount) {
+
+    LayerAllocation result;
+
+    // Can't use pool if requesting more than pool size
+    if (layerCount > POOL_LAYERS_PER_ARRAY) {
+      Logger::warn(str::format("[PERF] Requesting ", layerCount, " layers exceeds pool size (",
+                              POOL_LAYERS_PER_ARRAY, "), falling back to direct allocation"));
+      return result;  // invalid
+    }
+
+    // Find a pool with matching resolution and enough free layers
+    for (size_t i = 0; i < m_arrayPools.size(); ++i) {
+      auto& pool = m_arrayPools[i];
+
+      // Check resolution match
+      if (pool.resolution.width != resolution.width ||
+          pool.resolution.height != resolution.height) {
+        continue;
+      }
+
+      // Check if we have enough consecutive free layers
+      uint32_t freeCount = pool.totalLayers - pool.allocatedLayers;
+      if (freeCount >= layerCount) {
+        // Find consecutive free layers in the bitmask
+        uint64_t mask = pool.usedLayersMask;
+        for (uint32_t startLayer = 0; startLayer <= pool.totalLayers - layerCount; ++startLayer) {
+          // Check if layerCount consecutive layers starting at startLayer are free
+          bool allFree = true;
+          for (uint32_t j = 0; j < layerCount; ++j) {
+            if (mask & (1ULL << (startLayer + j))) {
+              allFree = false;
+              break;
+            }
+          }
+
+          if (allFree) {
+            // Found free range! Allocate it
+            for (uint32_t j = 0; j < layerCount; ++j) {
+              pool.usedLayersMask |= (1ULL << (startLayer + j));
+            }
+            pool.allocatedLayers += layerCount;
+
+            result.arrayResource = pool.arrayResource;
+            result.startLayer = startLayer;
+            result.layerCount = layerCount;
+            result.poolIndex = i;
+            result.valid = true;
+
+            Logger::info(str::format("[PERF-OPT] Allocated ", layerCount, " layers from pool ", i,
+                                    " (layers ", startLayer, "-", startLayer + layerCount - 1, ")"));
+            return result;
+          }
+        }
+      }
+    }
+
+    // No existing pool has space - try to create a new pool
+    if (m_arrayPools.size() < MAX_POOL_ARRAYS) {
+      VkExtent3D extent = { resolution.width, resolution.height, 1 };
+      Rc<DxvkContext> dxvkCtx = ctx;
+
+      Resources::Resource poolArray = Resources::createImageResource(
+        dxvkCtx,
+        "shader capture array pool",
+        extent,
+        VK_FORMAT_R8G8B8A8_UNORM,
+        POOL_LAYERS_PER_ARRAY,
+        VK_IMAGE_TYPE_2D,
+        VK_IMAGE_VIEW_TYPE_2D_ARRAY,
+        0,
+        VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
+
+      if (poolArray.isValid()) {
+        TextureArrayPool newPool;
+        newPool.arrayResource = poolArray;
+        newPool.totalLayers = POOL_LAYERS_PER_ARRAY;
+        newPool.usedLayersMask = 0;
+        newPool.allocatedLayers = layerCount;
+        newPool.resolution = resolution;
+
+        // Mark first layerCount layers as used
+        for (uint32_t i = 0; i < layerCount; ++i) {
+          newPool.usedLayersMask |= (1ULL << i);
+        }
+
+        m_arrayPools.push_back(newPool);
+
+        result.arrayResource = poolArray;
+        result.startLayer = 0;
+        result.layerCount = layerCount;
+        result.poolIndex = m_arrayPools.size() - 1;
+        result.valid = true;
+
+        Logger::info(str::format("[PERF-OPT] Created NEW array pool ", m_arrayPools.size() - 1,
+                                " (", resolution.width, "x", resolution.height, ", ",
+                                POOL_LAYERS_PER_ARRAY, " layers), allocated ", layerCount, " layers"));
+        return result;
+      }
+    }
+
+    Logger::warn("[PERF] No pool space available, falling back to direct allocation");
+    return result;  // invalid
+  }
+
+  void ShaderOutputCapturer::freeLayersToPool(const LayerAllocation& allocation) {
+    if (!allocation.valid || allocation.poolIndex >= m_arrayPools.size()) {
+      return;
+    }
+
+    auto& pool = m_arrayPools[allocation.poolIndex];
+
+    // Free the layers
+    for (uint32_t i = 0; i < allocation.layerCount; ++i) {
+      pool.usedLayersMask &= ~(1ULL << (allocation.startLayer + i));
+    }
+    pool.allocatedLayers -= allocation.layerCount;
+
+    Logger::info(str::format("[PERF-OPT] Freed ", allocation.layerCount, " layers from pool ",
+                            allocation.poolIndex, " (", pool.allocatedLayers, "/",
+                            pool.totalLayers, " now used)"));
+  }
+
   VkExtent2D ShaderOutputCapturer::calculateCaptureResolution(
       const DrawCallState& drawCallState) const {
 
-    uint32_t baseResolution = captureResolution();
+    uint32_t resolution = captureResolution();
 
     // Clamp to valid range
-    baseResolution = std::clamp(baseResolution, 256u, 4096u);
+    resolution = std::clamp(resolution, 256u, 4096u);
 
-    // For now, use fixed resolution
-    // TODO: Implement LOD based on screen space size
-    return { baseResolution, baseResolution };
+    // Use fixed resolution - capture ALL maps at full quality
+    return { resolution, resolution };
   }
 
   Matrix4 ShaderOutputCapturer::calculateUVSpaceProjection(

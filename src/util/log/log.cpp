@@ -149,15 +149,15 @@ namespace dxvk {
       { "error", LogLevel::Error },
       { "none",  LogLevel::None  },
     } };
-    
+
     const std::string logLevelStr = env::getEnvVar("DXVK_LOG_LEVEL");
-    
+
     for (const auto& pair : logLevels) {
       if (logLevelStr == pair.first)
         return pair.second;
     }
-    
-    return LogLevel::Info;
+
+    return LogLevel::None;  // DISABLED: Changed from Info to None to disable all logging for performance
   }
   
   std::string Logger::getFilePath(const std::string& fileName) {
