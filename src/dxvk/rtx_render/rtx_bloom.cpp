@@ -94,11 +94,26 @@ namespace dxvk {
     ImGui::Unindent();
   }
 
-  void DxvkBloom::dispatch(Rc<RtxContext> ctx, 
-                           Rc<DxvkSampler> linearSampler, 
+  void DxvkBloom::dispatch(Rc<RtxContext> ctx,
+                           Rc<DxvkSampler> linearSampler,
                            const Resources::Resource& inOutColorBuffer) {
     ScopedGpuProfileZone(ctx, "Bloom");
     ctx->setFramePassStage(RtxFramePassStage::Bloom);
+
+    static uint32_t bloomDispatchCount = 0;
+    if (++bloomDispatchCount <= 20) {
+      XXH64_hash_t imgHash = inOutColorBuffer.image.ptr() ? inOutColorBuffer.image->getHash() : 0;
+      uint32_t imgWidth = inOutColorBuffer.image.ptr() ? inOutColorBuffer.image->info().extent.width : 0;
+      uint32_t imgHeight = inOutColorBuffer.image.ptr() ? inOutColorBuffer.image->info().extent.height : 0;
+      uint32_t imgFormat = inOutColorBuffer.image.ptr() ? (uint32_t)inOutColorBuffer.image->info().format : 0;
+
+      Logger::warn(str::format("[BLOOM-INPUT] #", bloomDispatchCount,
+                              " imagePtr=", (void*)inOutColorBuffer.image.ptr(),
+                              " viewPtr=", (void*)inOutColorBuffer.view.ptr(),
+                              " hash=0x", std::hex, imgHash, std::dec,
+                              " extent=", imgWidth, "x", imgHeight,
+                              " format=", imgFormat));
+    }
 
     ctx->setPushConstantBank(DxvkPushConstantBank::RTX);
 

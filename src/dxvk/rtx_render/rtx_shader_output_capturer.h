@@ -59,11 +59,18 @@ namespace dxvk {
       const DrawParameters& drawParams,
       TextureRef& outputTexture);
 
-    // Get previously captured texture for a material
-    TextureRef getCapturedTexture(XXH64_hash_t materialHash) const;
+    // Get previously captured texture for a material (public API - computes cache key from drawCallState)
+    TextureRef getCapturedTexture(const DrawCallState& drawCallState) const;
 
-    // Check if this material has been captured
-    bool hasCapturedTexture(XXH64_hash_t materialHash) const;
+    // Check if this material has been captured (public API - computes cache key from drawCallState)
+    bool hasCapturedTexture(const DrawCallState& drawCallState) const;
+
+  private:
+    // Internal versions that use pre-computed cache key for efficiency
+    TextureRef getCapturedTextureInternal(XXH64_hash_t cacheKey) const;
+    bool hasCapturedTextureInternal(XXH64_hash_t cacheKey) const;
+
+  public:
 
     // Check if we need to re-capture this draw call (for animated shaders)
     bool needsRecapture(const DrawCallState& drawCallState, uint32_t currentFrame) const;
@@ -117,10 +124,15 @@ namespace dxvk {
       "Enabled by default to ensure shader effects work properly.\n"
       "UI draws (pixel shader only, no vertex shader) are automatically excluded.");
 
-    RTX_OPTION("rtx.shaderCapture", uint32_t, maxVramMB, 2048,
+    RTX_OPTION("rtx.shaderCapture", uint32_t, maxVramMB, 512,
       "Maximum VRAM in MB for shader capture render target cache.\n"
       "When exceeded, least-recently-used RTs are evicted.\n"
-      "Default: 2048 MB (2 GB). Increase if you see frequent RT recreations.");
+      "Default: 512 MB. RT cache is now cleared every frame to prevent duplicate VRAM usage.");
+
+    RTX_OPTION("rtx.shaderCapture", uint32_t, maxCapturedOutputsVramMB, 1024,
+      "Maximum VRAM in MB for captured material outputs cache (the actual captured textures).\n"
+      "When exceeded, least-recently-used materials are evicted and will be recaptured if needed.\n"
+      "Default: 1024 MB (1 GB). Lowered from 4GB to prevent OOM on scenes with hundreds of materials.");
 
     RTX_OPTION_ENV("rtx.shaderCapture", fast_unordered_set, captureEnabledHashes, {},
       "RTX_SHADER_CAPTURE_ENABLED_HASHES",
@@ -138,20 +150,67 @@ namespace dxvk {
     // Returns a pair: (cacheKey, isValid)
     // isValid=false means the RT replacement texture is invalid and should be rejected
     std::pair<XXH64_hash_t, bool> getCacheKey(const DrawCallState& drawCallState) const {
+      static uint32_t logCount = 0;
+      const bool shouldLog = (++logCount <= 100);
+
       if (drawCallState.renderTargetReplacementSlot >= 0) {
         const TextureRef& replacementTexture = drawCallState.getMaterialData().getColorTexture();
+        if (shouldLog) {
+          Logger::info(str::format("[getCacheKey] RT REPLACEMENT CASE: slot=", drawCallState.renderTargetReplacementSlot,
+                                  " replacementValid=", replacementTexture.isValid() ? "YES" : "NO",
+                                  " replacementHash=0x", std::hex, (replacementTexture.isValid() ? replacementTexture.getImageHash() : 0), std::dec,
+                                  " originalRTHash=0x", std::hex, drawCallState.originalRenderTargetHash, std::dec));
+        }
         if (replacementTexture.isValid()) {
-          return {replacementTexture.getImageHash(), true};
+          // CRITICAL FIX: Cache key should only depend on WHAT is rendered (replacement texture + material hash),
+          // NOT on WHERE it's rendered (originalRT). Same replacement texture + same material = same shader output!
+          // This enables proper deduplication: 556 draws with same material share ONE cached texture.
+          XXH64_hash_t replacementHash = replacementTexture.getImageHash();
+          XXH64_hash_t materialHash = drawCallState.getMaterialData().getHash();
+
+          // Combine replacement texture with material hash for uniqueness
+          XXH64_hash_t combinedHash = XXH64(&materialHash, sizeof(XXH64_hash_t), replacementHash);
+
+          if (shouldLog) {
+            Logger::info(str::format("[getCacheKey] RT REPLACEMENT: replacement=0x", std::hex, replacementHash,
+                                    " material=0x", materialHash,
+                                    " = combined=0x", combinedHash, std::dec));
+          }
+          return {combinedHash, true};
+        }
+        if (shouldLog) {
+          Logger::warn(str::format("[getCacheKey] INVALID RT REPLACEMENT! Returning isValid=FALSE"));
         }
         return {0, false}; // Invalid RT replacement
       }
       // Check for render target feedback case: no replacement found but slot 0 was a render target
-      // Use the originalRT hash as cache key to differentiate draws to different RTs
+      // For RT feedback, the originalRT hash IS the relevant identifier (which RT is being read)
       if (drawCallState.originalRenderTargetHash != 0) {
-        return {drawCallState.originalRenderTargetHash, true};
+        XXH64_hash_t materialHash = drawCallState.getMaterialData().getHash();
+        // Combine originalRT with material to differentiate different materials using same RT
+        XXH64_hash_t combinedHash = XXH64(&materialHash, sizeof(XXH64_hash_t), drawCallState.originalRenderTargetHash);
+
+        if (shouldLog) {
+          Logger::info(str::format("[getCacheKey] RT FEEDBACK: originalRT=0x", std::hex, drawCallState.originalRenderTargetHash,
+                                  " material=0x", materialHash,
+                                  " = combined=0x", combinedHash, std::dec));
+        }
+        return {combinedHash, true};
       }
-      // For regular materials, hash can legitimately be 0, so it's always valid
-      return {drawCallState.getMaterialData().getHash(), true};
+      // For regular materials, combine geometry + material to prevent collisions
+      // CRITICAL FIX: Materials with hash=0 were colliding! Use vertex/index count as unique seed
+      // This ensures same geometry + different materials get different cache keys
+      XXH64_hash_t matHash = drawCallState.getMaterialData().getHash();
+      const auto& geom = drawCallState.getGeometryData();
+      uint64_t geomSeed = (uint64_t(geom.vertexCount) << 32) | uint64_t(geom.indexCount);
+      // Combine: hash material with geometry seed (vertexCount+indexCount never both zero)
+      XXH64_hash_t combinedHash = (geomSeed != 0) ? XXH64(&matHash, sizeof(XXH64_hash_t), geomSeed) : (matHash + 1);
+      if (shouldLog) {
+        Logger::info(str::format("[getCacheKey] REGULAR MATERIAL: matHash=0x", std::hex, matHash,
+                                " geomSeed=0x", geomSeed,
+                                " combined=0x", combinedHash, std::dec));
+      }
+      return {combinedHash, true};
     }
 
     struct CapturedShaderOutput {
@@ -168,6 +227,7 @@ namespace dxvk {
       VkExtent2D resolution;
       uint32_t arrayLayer = 0;          // Layer index if capturedTexture is an array (0 if individual)
       bool isArrayLayer = false;        // True if this references a layer in a texture array
+      size_t vramBytes = 0;              // VRAM size for LRU eviction
 
       // Material complexity flags for efficient detection
       bool hasNormals = false;
@@ -187,6 +247,7 @@ namespace dxvk {
     // GPU Capture Request - SELF-CONTAINED (no pointers, all data copied)
     // This struct owns all the data needed for capture, avoiding dangling pointer issues
     struct GpuCaptureRequest {
+      XXH64_hash_t cacheKey;          // CRITICAL: The actual cache key for lookup (may be combined hash for RT replacements!)
       XXH64_hash_t materialHash;      // Material to capture
       XXH64_hash_t geometryHash;      // Geometry hash
       XXH64_hash_t textureHash;       // Primary texture hash

@@ -4874,7 +4874,6 @@ namespace dxvk {
           if (res.imageView != nullptr && res.imageView->handle(binding.view) != VK_NULL_HANDLE) {
             descriptors[i].image.sampler     = VK_NULL_HANDLE;
             descriptors[i].image.imageView   = res.imageView->handle(binding.view);
-            // Storage images always use GENERAL layout
             descriptors[i].image.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
 
             if (m_rcTracked.set(binding.slot)) {

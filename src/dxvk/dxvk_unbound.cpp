@@ -23,12 +23,12 @@ namespace dxvk {
   void DxvkUnboundResources::clearResources(DxvkDevice* dev) {
     const Rc<DxvkContext> ctx = dev->createContext();
     ctx->beginRecording(dev->createCommandList());
-    
+
     this->clearBuffer(ctx, m_buffer);
     this->clearImage(ctx, m_image1D);
     this->clearImage(ctx, m_image2D);
     this->clearImage(ctx, m_image3D);
-    
+
     dev->submitCommandList(
       ctx->endRecording(),
       VK_NULL_HANDLE,
@@ -112,10 +112,10 @@ namespace dxvk {
     info.access      = VK_ACCESS_SHADER_READ_BIT;
     info.layout      = VK_IMAGE_LAYOUT_GENERAL;
     info.tiling      = VK_IMAGE_TILING_OPTIMAL;
-    
+
     if (type == VK_IMAGE_TYPE_2D)
       info.flags       |= VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
-    
+
     // NV-DXVK start: add debug names to VkImage objects
     return dev->createImage(info,
       VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, DxvkMemoryStats::Category::AppTexture, "unbound texture");

@@ -1198,7 +1198,7 @@ namespace dxvk {
     }
 
     bool shouldTryCapture = shaderCapturer.shouldCapture(drawCallState);
-    bool hasCachedCapture = shaderCapturer.hasCapturedTexture(matHash);
+    bool hasCachedCapture = shaderCapturer.hasCapturedTexture(drawCallState);
 
     if (shouldTryCapture || hasCachedCapture) {
       TextureRef capturedTexture;
@@ -1221,8 +1221,16 @@ namespace dxvk {
       }
 
       // If we didn't capture this frame, get the cached texture
+      // CRITICAL FIX: Pass drawCallState instead of matHash so RT replacements use correct combined key
       if (!capturedTexture.isValid()) {
-        capturedTexture = shaderCapturer.getCapturedTexture(matHash);
+        capturedTexture = shaderCapturer.getCapturedTexture(drawCallState);
+
+        static uint32_t cacheGetCount = 0;
+        if (++cacheGetCount <= 50) {
+          Logger::warn(str::format("[SCENE-MGR-CACHE-GET] #", cacheGetCount,
+                                  " Retrieved cached texture, isValid=", capturedTexture.isValid() ? "TRUE" : "FALSE",
+                                  " hash=0x", std::hex, (capturedTexture.isValid() ? capturedTexture.getImageHash() : 0), std::dec));
+        }
       }
 
       // Use the captured texture as albedo by modifying the material data
@@ -1232,6 +1240,24 @@ namespace dxvk {
         if (renderMaterialData.getType() == MaterialDataType::Opaque) {
           // Directly set the albedo texture - it will be tracked automatically later
           renderMaterialData.getOpaqueMaterialData().getAlbedoOpacityTexture() = capturedTexture;
+
+          static uint32_t albedoReplaceCount = 0;
+          if (++albedoReplaceCount <= 50) {
+            Logger::warn(str::format("[SCENE-MGR-ALBEDO-REPLACE] #", albedoReplaceCount,
+                                    " Replaced albedo with captured texture, hash=0x", std::hex, capturedTexture.getImageHash(), std::dec));
+          }
+        } else {
+          static uint32_t nonOpaqueCount = 0;
+          if (++nonOpaqueCount <= 20) {
+            Logger::warn(str::format("[SCENE-MGR-NON-OPAQUE] #", nonOpaqueCount,
+                                    " Material is not Opaque, type=", (int)renderMaterialData.getType()));
+          }
+        }
+      } else {
+        static uint32_t invalidTextureCount = 0;
+        if (++invalidTextureCount <= 50) {
+          Logger::warn(str::format("[SCENE-MGR-INVALID-TEX] #", invalidTextureCount,
+                                  " Captured texture is INVALID, not replacing albedo"));
         }
       }
     }

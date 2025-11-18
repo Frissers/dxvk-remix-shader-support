@@ -1951,6 +1951,19 @@ bool D3D9Rtx::shouldCaptureFramebuffer() const {
     m_captureTextureCache[cacheKey] = captureView;
     m_activeDrawCallState.capturedFramebufferOutput = captureView;
 
+    // VRAM TRACKING: Log when we create new capture texture
+    static uint32_t creationCount = 0;
+    ++creationCount;
+    const size_t estimatedVRAM = extent.width * extent.height * 4; // Assuming RGBA8
+    const size_t totalCacheSize = m_captureTextureCache.size();
+
+    Logger::warn(str::format("[VRAM-CAPTURE-TEXTURE] Created capture texture #", creationCount,
+                              "\n  Resolution: ", extent.width, "x", extent.height,
+                              "\n  Format: ", format,
+                              "\n  Estimated VRAM: ", (estimatedVRAM / 1024 / 1024), " MB",
+                              "\n  Total cached textures: ", totalCacheSize,
+                              "\n  Cache key: 0x", std::hex, cacheKey, std::dec));
+
     return captureView;
   }
 

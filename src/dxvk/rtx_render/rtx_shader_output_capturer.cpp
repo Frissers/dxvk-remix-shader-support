@@ -448,6 +448,35 @@ namespace dxvk {
       Logger::info("[RT-BATCH-DEBUG] NO RT transitions needed - all already in GENERAL layout or invalid");
     }
 
+    // CRITICAL FIX: Clear all render targets to prevent bloom from reading garbage data
+    // Uninitialized textures contain random values that bloom interprets as bright pixels
+    VkClearColorValue clearBlack = { { 0.0f, 0.0f, 0.0f, 0.0f } };
+    for (auto& group : captureGroups) {
+      if (group.renderTarget.isValid()) {
+        VkImageSubresourceRange clearRange;
+        clearRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        clearRange.baseMipLevel = 0;
+        clearRange.levelCount = 1;
+        clearRange.baseArrayLayer = 0;
+        clearRange.layerCount = group.renderTarget.image->info().numLayers;
+
+        static uint32_t clearLogCount = 0;
+        if (++clearLogCount <= 20) {
+          Logger::warn(str::format("[RT-CLEAR-BEFORE] #", clearLogCount,
+                                  " Clearing RT hash=0x", std::hex, group.renderTarget.image->getHash(), std::dec,
+                                  " layers=", clearRange.layerCount,
+                                  " format=", group.renderTarget.image->info().format,
+                                  " extent=", group.renderTarget.image->info().extent.width, "x", group.renderTarget.image->info().extent.height));
+        }
+
+        ctx->clearColorImage(group.renderTarget.image, clearBlack, clearRange);
+
+        if (clearLogCount <= 20) {
+          Logger::warn(str::format("[RT-CLEAR-AFTER] #", clearLogCount, " Clear completed"));
+        }
+      }
+    }
+
     auto tPreAllocEnd = std::chrono::high_resolution_clock::now();
     Logger::info(str::format("[ShaderCapture] Pre-allocation took ",
                             std::chrono::duration<double, std::micro>(tPreAllocEnd - tPreAllocStart).count(), " us]"));
@@ -853,7 +882,10 @@ namespace dxvk {
           group.renderTarget.image, layerViewInfo);
 
         // Store layer-specific view (acts like individual texture but shares VRAM!)
-        XXH64_hash_t cacheKey = request.materialHash;
+        // CRITICAL FIX: Use request.cacheKey instead of materialHash!
+        // For RT replacements, cacheKey is a COMBINED hash (originalRT + replacement)
+        // Using materialHash here was causing cache misses because lookup uses cacheKey!
+        XXH64_hash_t cacheKey = request.cacheKey;
         CapturedShaderOutput& output = m_capturedOutputs[cacheKey];
         output.capturedTexture.image = group.renderTarget.image;  // Share the array image
         output.capturedTexture.view = layerView;  // But use layer-specific view
@@ -866,6 +898,27 @@ namespace dxvk {
         output.isDynamic = request.isDynamic;
         output.isPending = false;
         output.resolution = request.resolution;
+
+        XXH64_hash_t storedImageHash = group.renderTarget.image->getHash();
+
+        static uint32_t batchStoreCount = 0;
+        if (++batchStoreCount <= 30) {
+          Logger::warn(str::format("[BATCH-STORE] #", batchStoreCount,
+                                  " cacheKey=0x", std::hex, cacheKey, std::dec,
+                                  " storedImageHash=0x", std::hex, storedImageHash, std::dec,
+                                  " layer=", layerIdx, "/", groupSize,
+                                  " rtExtent=", group.renderTarget.image->info().extent.width, "x", group.renderTarget.image->info().extent.height,
+                                  " imagePtr=", (void*)output.capturedTexture.image.ptr(),
+                                  " viewPtr=", (void*)output.capturedTexture.view.ptr(),
+                                  " format=", group.renderTarget.image->info().format));
+        }
+
+        // CRITICAL DIAGNOSTIC: Track ALL stored captured texture image pointers
+        static uint32_t detailedStoreCount = 0;
+        if (++detailedStoreCount <= 50) {
+          Logger::warn(str::format("[CAPTURE-TEX-STORED] RT image pointer ", (void*)group.renderTarget.image.ptr(),
+                                  " may conflict with bloom if bloom reads this pointer!"));
+        }
       }
     }
 
@@ -1097,7 +1150,29 @@ namespace dxvk {
 
     // Get cache key (uses texture hash for RT replacements, material hash otherwise)
     auto tCacheKeyStart = std::chrono::high_resolution_clock::now();
+
+    // DEBUG: Log RT replacement details - use same logging pattern as PERF-shouldCapture
+    const bool shouldLogCacheKey = shouldLog;  // Re-use the existing shouldLog from line 1086
+    if (shouldLogCacheKey) {
+      const bool hasRTRepl = (drawCallState.renderTargetReplacementSlot >= 0);
+      Logger::info(str::format("[GETCACHEKEY-CPP] BEFORE getCacheKey: rtReplacementSlot=", drawCallState.renderTargetReplacementSlot,
+                              " hasRTRepl=", hasRTRepl ? "YES" : "NO",
+                              " originalRTHash=0x", std::hex, drawCallState.originalRenderTargetHash, std::dec));
+      if (hasRTRepl) {
+        const TextureRef& replacementTexture = drawCallState.getMaterialData().getColorTexture();
+        Logger::info(str::format("[GETCACHEKEY-CPP] RT replacement texture isValid=", replacementTexture.isValid() ? "YES" : "NO",
+                                " hash=0x", std::hex, (replacementTexture.isValid() ? replacementTexture.getImageHash() : 0), std::dec));
+      }
+    }
+
     auto [cacheKey, isValidKey] = getCacheKey(drawCallState);
+
+    // DEBUG: Log result AFTER calling getCacheKey
+    if (shouldLogCacheKey) {
+      Logger::info(str::format("[GETCACHEKEY-CPP] AFTER getCacheKey: cacheKey=0x", std::hex, cacheKey, std::dec,
+                              " isValidKey=", isValidKey ? "YES" : "NO"));
+    }
+
     auto tCacheKeyEnd = std::chrono::high_resolution_clock::now();
     double cacheKeyTimeUs = std::chrono::duration<double, std::micro>(tCacheKeyEnd - tCacheKeyStart).count();
     const bool hasRenderTargetReplacement = (drawCallState.renderTargetReplacementSlot >= 0);
@@ -1409,6 +1484,17 @@ namespace dxvk {
 
       // Check if already captured
       auto it = m_capturedOutputs.find(cacheKey);
+
+      static uint32_t cacheLookupCount = 0;
+      if (++cacheLookupCount <= 100) {
+        bool found = (it != m_capturedOutputs.end());
+        bool valid = found && it->second.capturedTexture.isValid();
+        Logger::warn(str::format("[CACHE-LOOKUP] #", cacheLookupCount,
+                                " cacheKey=0x", std::hex, cacheKey, std::dec,
+                                " found=", found ? "YES" : "NO",
+                                " valid=", valid ? "YES" : "NO"));
+      }
+
       if (it != m_capturedOutputs.end() && it->second.capturedTexture.isValid()) {
         // Already have a cached texture - check if it's static or dynamic
         const bool isDynamic = isDynamicMaterial(cacheKey);
@@ -1418,12 +1504,12 @@ namespace dxvk {
           static uint32_t cachedHitCount = 0;
           ++cachedHitCount;
 
+          outputTexture = getCapturedTextureInternal(cacheKey);
           if (cachedHitCount <= 100) {
-            Logger::info(str::format("[GPU-CACHED-HIT-STATIC] #", cachedHitCount,
-                                    " Found cached texture for STATIC material cacheKey=0x",
-                                    std::hex, cacheKey, std::dec, " RETURNING CACHED"));
+            Logger::warn(str::format("[GPU-CACHED-HIT-STATIC] #", cachedHitCount,
+                                    " cacheKey=0x", std::hex, cacheKey, std::dec,
+                                    " outputTexture.isValid()=", outputTexture.isValid() ? "TRUE" : "FALSE"));
           }
-          outputTexture = getCapturedTexture(cacheKey);
           return outputTexture.isValid();
         }
 
@@ -1441,7 +1527,7 @@ namespace dxvk {
                                     " framesSince=", m_currentFrame - it->second.lastCaptureFrame,
                                     " interval=", recaptureInterval()));
           }
-          outputTexture = getCapturedTexture(cacheKey);
+          outputTexture = getCapturedTextureInternal(cacheKey);
           return outputTexture.isValid();
         }
 
@@ -1467,6 +1553,7 @@ namespace dxvk {
       GpuCaptureRequest request = {};
 
       // Hashes and metadata
+      request.cacheKey = cacheKey;  // CRITICAL: Store the computed cache key (may be combined hash for RT replacements!)
       request.materialHash = matHash;
       request.geometryHash = drawCallState.getGeometryData().getHashForRule<rules::FullGeometryHash>();
       const auto& materialData = drawCallState.getMaterialData();
@@ -1521,7 +1608,16 @@ namespace dxvk {
       }
 
       // Check if already cached from previous frame
-      outputTexture = getCapturedTexture(cacheKey);
+      outputTexture = getCapturedTextureInternal(cacheKey);
+
+      static uint32_t textureCheckCount = 0;
+      if (++textureCheckCount <= 100) {
+        Logger::warn(str::format("[GPU-TEXTURE-CHECK] #", textureCheckCount,
+                                " cacheKey=0x", std::hex, cacheKey, std::dec,
+                                " outputTexture.isValid()=", outputTexture.isValid() ? "TRUE" : "FALSE",
+                                " - returning true to queue capture"));
+      }
+
       // Return true even if texture not ready yet - prevents old SHADER-REEXEC fallback
       // Texture will be available next frame after batched execution
       return true;
@@ -1610,7 +1706,7 @@ namespace dxvk {
       // Use cached texture - get cache key for proper lookup
       auto [cacheKey, isValidKey] = getCacheKey(drawCallState);
       if (isValidKey) {
-        outputTexture = getCapturedTexture(cacheKey);
+        outputTexture = getCapturedTextureInternal(cacheKey);
       }
       const bool isValid = outputTexture.isValid();
 
@@ -3167,17 +3263,79 @@ namespace dxvk {
     return true;
   }
 
-  TextureRef ShaderOutputCapturer::getCapturedTexture(XXH64_hash_t materialHash) const {
-    auto it = m_capturedOutputs.find(materialHash);
+  // Public API - computes cache key from DrawCallState
+  TextureRef ShaderOutputCapturer::getCapturedTexture(const DrawCallState& drawCallState) const {
+    // CRITICAL FIX: Use same cache key as storage (combined hash for RT replacements)
+    auto [cacheKey, isValidKey] = getCacheKey(drawCallState);
+    if (!isValidKey) {
+      static uint32_t invalidKeyCount = 0;
+      if (++invalidKeyCount <= 50) {
+        Logger::warn(str::format("[GET-CACHED-TEX] #", invalidKeyCount, " Invalid key, returning empty"));
+      }
+      return TextureRef();
+    }
+
+    TextureRef result = getCapturedTextureInternal(cacheKey);
+
+    static uint32_t getCallCount = 0;
+    if (++getCallCount <= 50) {
+      Logger::warn(str::format("[GET-CACHED-TEX] #", getCallCount,
+                              " cacheKey=0x", std::hex, cacheKey, std::dec,
+                              " result.isValid()=", result.isValid() ? "TRUE" : "FALSE",
+                              " resultHash=0x", std::hex, (result.isValid() ? result.getImageHash() : 0), std::dec));
+    }
+
+    return result;
+  }
+
+  // Public API - computes cache key from DrawCallState
+  bool ShaderOutputCapturer::hasCapturedTexture(const DrawCallState& drawCallState) const {
+    // CRITICAL FIX: Use same cache key as storage (combined hash for RT replacements)
+    auto [cacheKey, isValidKey] = getCacheKey(drawCallState);
+    if (!isValidKey) {
+      return false;
+    }
+    return hasCapturedTextureInternal(cacheKey);
+  }
+
+  // Internal implementation - uses pre-computed cache key for efficiency
+  TextureRef ShaderOutputCapturer::getCapturedTextureInternal(XXH64_hash_t cacheKey) const {
+    auto it = m_capturedOutputs.find(cacheKey);
     if (it != m_capturedOutputs.end() && it->second.capturedTexture.isValid()) {
-      return TextureRef(it->second.capturedTexture.view);
+      // Update LRU tracking - this material was accessed this frame
+      // m_capturedOutputs is mutable, so we can update it from const function
+      const_cast<CapturedShaderOutput&>(it->second).lastCaptureFrame = m_currentFrame;
+
+      XXH64_hash_t imageHash = it->second.capturedTexture.image->getHash();
+
+      static uint32_t internalGetCount = 0;
+      if (++internalGetCount <= 30) {
+        Logger::warn(str::format("[GET-INTERNAL] #", internalGetCount,
+                                " cacheKey=0x", std::hex, cacheKey, std::dec,
+                                " imageHash=0x", std::hex, imageHash, std::dec,
+                                " USING cacheKey as uniqueKey since imageHash=0",
+                                " viewPtr=", (void*)it->second.capturedTexture.view.ptr(),
+                                " imagePtr=", (void*)it->second.capturedTexture.image.ptr()));
+      }
+
+      // CRITICAL FIX: Use cacheKey as uniqueKey instead of imageHash
+      // Image hash is 0 because the image hasn't been used yet (hash computed lazily)
+      // Using cacheKey ensures each material gets a unique TextureRef
+      return TextureRef(it->second.capturedTexture.view, cacheKey);
     }
     return TextureRef();
   }
 
-  bool ShaderOutputCapturer::hasCapturedTexture(XXH64_hash_t materialHash) const {
-    auto it = m_capturedOutputs.find(materialHash);
-    return it != m_capturedOutputs.end() && it->second.capturedTexture.isValid();
+  // Internal implementation - uses pre-computed cache key for efficiency
+  bool ShaderOutputCapturer::hasCapturedTextureInternal(XXH64_hash_t cacheKey) const {
+    auto it = m_capturedOutputs.find(cacheKey);
+    if (it != m_capturedOutputs.end() && it->second.capturedTexture.isValid()) {
+      // Update LRU tracking - this material was accessed this frame
+      // m_capturedOutputs is mutable, so we can update it from const function
+      const_cast<CapturedShaderOutput&>(it->second).lastCaptureFrame = m_currentFrame;
+      return true;
+    }
+    return false;
   }
 
   void ShaderOutputCapturer::onFrameBegin(Rc<RtxContext> ctx) {
@@ -3295,9 +3453,15 @@ namespace dxvk {
 
           auto evictIt = m_renderTargetCache.find(evictKey);
           if (evictIt != m_renderTargetCache.end()) {
+            // SAFETY: Skip RTs used within last 2 frames to avoid evicting actively-used render targets
+            uint32_t age = m_currentFrame - evictIt->second.lastUsedFrame;
+            if (age < 2) {
+              continue; // Skip very recent RTs that might still be in use
+            }
+
             freedBytes += evictIt->second.vramBytes;
             Logger::info(str::format("[LRU-EVICT] Freed ", evictIt->second.vramBytes / (1024 * 1024), " MB ",
-                                     "(frame ", evictFrame, ", age ", m_currentFrame - evictFrame, " frames) ",
+                                     "(frame ", evictFrame, ", age ", age, " frames) ",
                                      "Total VRAM: ", (currentVramBytes - freedBytes) / (1024 * 1024), " MB"));
             m_renderTargetCache.erase(evictIt);
           }
@@ -3305,15 +3469,97 @@ namespace dxvk {
       }
     }
 
-    // Periodic cleanup of captured outputs cache (not render targets!)
-    if (m_currentFrame % 60 == 0) {
-      // Clear captured outputs cache - will be rebuilt as needed
-      m_capturedOutputs.clear();
+    // PROACTIVE LRU VRAM CLEANUP FOR CAPTURED OUTPUTS - runs every frame
+    // This prevents OOM when loading scenes with hundreds of materials
+    // Evicts least-recently-used captured material outputs when VRAM limit is exceeded
+    {
+      size_t maxCapturedVramBytes = static_cast<size_t>(maxCapturedOutputsVramMB()) * 1024 * 1024;
+      size_t currentCapturedVramBytes = 0;
 
+      // Calculate current VRAM usage for captured outputs
+      for (const auto& pair : m_capturedOutputs) {
+        currentCapturedVramBytes += pair.second.vramBytes;
+      }
+
+      // Evict oldest captured outputs if we exceed VRAM limit
+      if (currentCapturedVramBytes > maxCapturedVramBytes) {
+        // Sort by lastCaptureFrame (oldest first)
+        std::vector<std::pair<XXH64_hash_t, uint32_t>> outputsByAge;
+        for (const auto& pair : m_capturedOutputs) {
+          outputsByAge.push_back({pair.first, pair.second.lastCaptureFrame});
+        }
+        std::sort(outputsByAge.begin(), outputsByAge.end(),
+                  [](const auto& a, const auto& b) { return a.second < b.second; });
+
+        // Evict oldest until we're under the limit
+        size_t freedBytes = 0;
+        uint32_t evictedCount = 0;
+        for (const auto& [evictKey, evictFrame] : outputsByAge) {
+          if (currentCapturedVramBytes - freedBytes <= maxCapturedVramBytes) {
+            break;
+          }
+
+          auto evictIt = m_capturedOutputs.find(evictKey);
+          if (evictIt != m_capturedOutputs.end()) {
+            // SAFETY: Skip pending textures (GPU still writing) and very recent captures
+            // Evicting these could cause corruption or missing textures
+            if (evictIt->second.isPending) {
+              continue; // Skip pending textures
+            }
+
+            // Skip textures captured within last 2 frames to avoid evicting actively-used materials
+            uint32_t age = m_currentFrame - evictIt->second.lastCaptureFrame;
+            if (age < 2) {
+              continue; // Skip very recent textures
+            }
+
+            freedBytes += evictIt->second.vramBytes;
+            ++evictedCount;
+
+            // Log first few evictions for debugging
+            static uint32_t evictLogCount = 0;
+            if (++evictLogCount <= 20) {
+              Logger::info(str::format("[LRU-EVICT-CAPTURE] #", evictLogCount,
+                                      " Freed ", evictIt->second.vramBytes / (1024 * 1024), " MB ",
+                                      "matHash=0x", std::hex, evictIt->second.materialHash, std::dec,
+                                      " (frame ", evictFrame, ", age ", age, " frames) ",
+                                      "Total: ", (currentCapturedVramBytes - freedBytes) / (1024 * 1024), " MB"));
+            }
+
+            m_capturedOutputs.erase(evictIt);
+          }
+        }
+
+        // Log summary of eviction
+        if (evictedCount > 0) {
+          static uint32_t summaryLogCount = 0;
+          if (++summaryLogCount <= 10 || (summaryLogCount % 60 == 0)) {
+            Logger::info(str::format("[LRU-EVICT-CAPTURE-SUMMARY] Evicted ", evictedCount, " materials, ",
+                                    "freed ", freedBytes / (1024 * 1024), " MB, ",
+                                    "remaining: ", m_capturedOutputs.size(), " materials, ",
+                                    (currentCapturedVramBytes - freedBytes) / (1024 * 1024), " MB"));
+          }
+        }
+      }
+
+      // Log VRAM usage periodically
+      static uint32_t vramLogCount = 0;
+      if (++vramLogCount % 60 == 0) {
+        Logger::info(str::format("[CAPTURED-OUTPUTS-VRAM] Frame ", m_currentFrame,
+                                " - Cached materials: ", m_capturedOutputs.size(),
+                                " | VRAM: ", currentCapturedVramBytes / (1024 * 1024), " MB / ",
+                                maxCapturedVramBytes / (1024 * 1024), " MB"));
+      }
+    }
+
+    // REMOVED: Don't clear entire RT cache - there's always at least one RT being actively used
+    // The LRU eviction above handles cleanup safely by checking age
+    // m_renderTargetCache.clear();
+
+    // Periodic cleanup of texture array pools (unchanged)
+    if (m_currentFrame % 60 == 0) {
       // Clear texture array pools - will be rebuilt as needed
       m_arrayPools.clear();
-
-      // NOTE: m_renderTargetCache is NOT cleared - managed by proactive LRU eviction above
     }
   }
 
@@ -3322,6 +3568,10 @@ namespace dxvk {
       VkExtent2D resolution,
       VkFormat format,
       XXH64_hash_t materialHash) {
+
+    // REMOVED OPTIMIZATION: Cannot reuse captured textures as render targets!
+    // Captured textures are READ-ONLY outputs - rendering into them corrupts the capture.
+    // We must always allocate fresh RTs for new captures, even if material was already captured.
 
     // Create cache key from resolution and format ONLY (NO material hash!)
     // This allows RT sharing between materials with same resolution = MASSIVE VRAM savings
@@ -3633,38 +3883,62 @@ namespace dxvk {
 
     // MATCH SOURCE TEXTURE RESOLUTION - don't waste VRAM on upscaling!
     // For 512x512 source -> 512x512 capture (not 1024x1024)
+    // CRITICAL: Preserve aspect ratio! Don't force square textures!
     const auto& materialData = drawCallState.getMaterialData();
     const TextureRef& sourceTexture = materialData.getColorTexture();
 
-    uint32_t resolution = captureResolution(); // Fallback if no source texture
+    uint32_t fallbackResolution = captureResolution(); // Fallback if no source texture
 
     if (sourceTexture.isValid() && sourceTexture.getImageView() != nullptr) {
-      // Use source texture resolution
+      // Use source texture resolution - PRESERVE ASPECT RATIO
       const auto& imageInfo = sourceTexture.getImageView()->imageInfo();
-      resolution = std::max(imageInfo.extent.width, imageInfo.extent.height);
+
+      // Clamp while preserving aspect ratio
+      uint32_t srcWidth = imageInfo.extent.width;
+      uint32_t srcHeight = imageInfo.extent.height;
+
+      // Find the maximum dimension
+      uint32_t maxDim = std::max(srcWidth, srcHeight);
+
+      // If maxDim is below minimum, scale uniformly to meet minimum
+      uint32_t width = srcWidth;
+      uint32_t height = srcHeight;
+
+      if (maxDim < 256u) {
+        // Scale up proportionally so max dimension is 256
+        float scale = 256.0f / static_cast<float>(maxDim);
+        width = static_cast<uint32_t>(srcWidth * scale);
+        height = static_cast<uint32_t>(srcHeight * scale);
+      } else if (maxDim > 4096u) {
+        // Scale down proportionally so max dimension is 4096
+        float scale = 4096.0f / static_cast<float>(maxDim);
+        width = static_cast<uint32_t>(srcWidth * scale);
+        height = static_cast<uint32_t>(srcHeight * scale);
+      }
 
       static uint32_t resolutionLogCount = 0;
       ++resolutionLogCount;
 
       if (resolutionLogCount <= 20) {
         Logger::info(str::format("[CAPTURE-RESOLUTION] #", resolutionLogCount,
-                                " Source texture: ", imageInfo.extent.width, "x", imageInfo.extent.height,
-                                " -> Using resolution: ", resolution, "x", resolution));
+                                " Source texture: ", srcWidth, "x", srcHeight,
+                                " -> Using resolution: ", width, "x", height));
       }
+
+      return { width, height };
     } else {
       static uint32_t noTextureLogCount = 0;
       ++noTextureLogCount;
 
       if (noTextureLogCount <= 20) {
         Logger::info(str::format("[CAPTURE-RESOLUTION-FALLBACK] #", noTextureLogCount,
-                                " No source texture, using fallback: ", resolution));
+                                " No source texture, using square fallback: ", fallbackResolution));
       }
+
+      // Fallback: use configured resolution as square
+      uint32_t resolution = std::clamp(fallbackResolution, 256u, 4096u);
+      return { resolution, resolution };
     }
-
-    // Clamp to valid range
-    resolution = std::clamp(resolution, 256u, 4096u);
-
-    return { resolution, resolution };
   }
 
   Matrix4 ShaderOutputCapturer::calculateUVSpaceProjection(
@@ -3738,6 +4012,19 @@ namespace dxvk {
     output.isPending = true;  // Mark as pending - GPU hasn't finished yet
     output.resolution = { texture.image->info().extent.width,
                           texture.image->info().extent.height };
+
+    static uint32_t storeCount = 0;
+    if (++storeCount <= 100) {
+      Logger::warn(str::format("[STORE-TEXTURE] #", storeCount,
+                              " cacheKey=0x", std::hex, cacheKey, std::dec,
+                              " texture.isValid()=", texture.isValid() ? "TRUE" : "FALSE",
+                              " resolution=", output.resolution.width, "x", output.resolution.height,
+                              " isPending=TRUE"));
+    }
+
+    // Calculate VRAM usage for LRU eviction (4 bytes per pixel for RGBA8)
+    output.vramBytes = static_cast<size_t>(output.resolution.width) *
+                       static_cast<size_t>(output.resolution.height) * 4;
 
     static uint32_t storeLogCount = 0;
     const bool shouldLog = (++storeLogCount <= 20) || (drawCallState.renderTargetReplacementSlot >= 0);

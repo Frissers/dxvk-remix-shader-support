@@ -66,36 +66,18 @@ namespace dxvk {
 
     assert(dstLayout != VK_IMAGE_LAYOUT_UNDEFINED);
 
-    // BARRIER ELIMINATION: VK_IMAGE_LAYOUT_GENERAL supports ALL operations (render+sample)
-    // If either layout is GENERAL, treat them as compatible - no transition needed
-    // This eliminates 92,000+ barriers (11+ seconds) for shader output capture!
-    bool layoutsCompatible = (srcLayout == dstLayout) ||
-                             (srcLayout == VK_IMAGE_LAYOUT_GENERAL) ||
-                             (dstLayout == VK_IMAGE_LAYOUT_GENERAL);
-
     if (srcStages == VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT
      || dstStages == VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT
-     || !layoutsCompatible)
+     || srcLayout != dstLayout)
       access.set(DxvkAccess::Write);
 
-    // BARRIER ELIMINATION COMPLETE: Skip ALL synchronization when layouts are compatible!
-    // When layouts are compatible (especially GENERAL), no barrier is needed at all.
-    // Previously we accumulated stages even when skipping barriers, causing 233,692 EMPTY
-    // barriers (93% of all barriers = 9+ seconds of pure overhead with ZERO benefit).
-    // Now we skip stages, access masks, AND image barriers - TRUE zero-cost elimination!
-    if (layoutsCompatible) {
-      // Layouts compatible (GENERAL or same) - NO barrier needed, skip EVERYTHING
-      // m_srcStages |= srcStages;  // ← DELETED: Was creating 233,692 empty barriers!
-      // m_dstStages |= dstStages;  // ← DELETED: Was creating 233,692 empty barriers!
-      // m_srcAccess |= srcAccess;  // ← Already deleted in previous optimization
-      // m_dstAccess |= dstAccess;  // ← Already deleted in previous optimization
-    } else {
-      // Layouts incompatible - need a real barrier, accumulate everything
-      m_srcStages |= srcStages;
-      m_dstStages |= dstStages;
+    m_srcStages |= srcStages;
+    m_dstStages |= dstStages;
+
+    if (srcLayout == dstLayout) {
       m_srcAccess |= srcAccess;
       m_dstAccess |= dstAccess;
-
+    } else {
       VkImageMemoryBarrier barrier;
       barrier.sType                       = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
       barrier.pNext                       = nullptr;

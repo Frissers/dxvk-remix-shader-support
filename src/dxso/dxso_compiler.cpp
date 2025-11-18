@@ -3342,10 +3342,19 @@ void DxsoCompiler::emitControlFlowGenericLoop(
         uint32_t isDepth = m_module.opBitFieldUExtract(typeId, m_depthSpecConstant, offset, bitCnt);
         isDepth = m_module.opIEqual(m_module.defBoolType(), isDepth, m_module.constu32(1));
 
-        // NV-DXVK start: Completely disable depth/shadow sampler path to prevent VUID-06479 errors
-        // Just use color sampler directly without branching
+        m_module.opSelectionMerge(endLabel, spv::SelectionControlMaskNone);
+        m_module.opBranchConditional(isDepth, depthLabel, colorLabel);
+
+        m_module.opLabel(colorLabel);
         SampleImage(texcoordVar, sampler.color[samplerType], false, samplerType, sampler.boundConst);
-        // NV-DXVK end
+        m_module.opBranch(endLabel);
+
+        m_module.opLabel(depthLabel);
+        // No spec constant as if we are unbound we always fall down the color path.
+        SampleImage(texcoordVar, sampler.depth[samplerType], true, samplerType, 0);
+        m_module.opBranch(endLabel);
+
+        m_module.opLabel(endLabel);
       }
       else
         SampleImage(texcoordVar, sampler.color[samplerType], false, samplerType, sampler.boundConst);
