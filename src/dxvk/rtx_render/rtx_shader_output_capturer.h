@@ -145,6 +145,17 @@ namespace dxvk {
       "These will be re-captured periodically based on recaptureInterval.");
 
   private:
+    // Dummy resources for robust binding
+    Rc<DxvkImageView> m_dummyTexture;
+    Rc<DxvkSampler>   m_dummySampler;
+    // Dummy depth texture for shadow/comparison samplers
+    Rc<DxvkImageView> m_dummyDepthTexture;
+    Rc<DxvkImage>     m_dummyDepthImage;  // Store the image for layout transitions
+    Rc<DxvkSampler>   m_dummyShadowSampler;
+    bool              m_dummyDepthLayoutInitialized = false;
+
+    void createDummyResources(const Rc<DxvkDevice>& device);
+
     // Helper to get cache key for a draw call
     // For RT replacements, use source texture hash; for RT feedback, use originalRT hash; otherwise use material hash
     // Returns a pair: (cacheKey, isValid)
@@ -273,6 +284,26 @@ namespace dxvk {
       // TEXTURE DATA (Rc-counted, safe to copy)
       TextureRef colorTexture;        // Primary color texture
 
+      // SHADER DATA (Rc-counted, safe to copy)
+      Rc<DxvkShader> vertexShader;    // Original vertex shader
+      Rc<DxvkShader> pixelShader;     // Original pixel shader
+      
+      // SHADER CONSTANT DATA (copied from DrawCallState)
+      std::vector<Vector4> vertexShaderConstantData;   // VS uniforms (transforms, etc.)
+      std::vector<Vector4> pixelShaderConstantData;    // PS uniforms (colors, etc.)
+
+      // TEXTURE AND SAMPLER DATA (copied from DrawCallState)
+      struct CapturedTexture {
+        TextureRef texture;         // Texture image view
+        Rc<DxvkSampler> sampler;   // Sampler state
+        uint32_t slot = 0;         // Texture slot (0-15)
+      };
+      std::vector<CapturedTexture> textures;  // All bound textures + samplers
+
+      // Bitmask of texture slots that require depth textures (shadow samplers)
+      // Bit N set = slot N expects depth comparison texture
+      uint32_t depthTextureMask = 0;
+
       // VIEWPORT/SCISSOR STATE
       VkViewport viewport;
       VkRect2D scissor;
@@ -285,6 +316,28 @@ namespace dxvk {
       uint32_t replacementVertexStride = 0;
       uint32_t replacementTexcoordStride = 0;
       VkIndexType replacementIndexType = VK_INDEX_TYPE_NONE_KHR;
+
+      // ORIGINAL VERTEX STREAM SUPPORT (for using original game shaders)
+      // When using original game VS, we need the original vertex layout, not separated buffers
+      struct OriginalVertexStream {
+        Rc<DxvkBuffer> buffer;       // GPU buffer with original vertex data
+        uint32_t streamIndex = 0;    // D3D9 stream index (binding slot)
+        uint32_t stride = 0;         // Bytes per vertex
+        uint32_t offset = 0;         // Offset into buffer
+      };
+      std::vector<OriginalVertexStream> originalVertexStreams;
+
+      // Vertex elements for building input layout (copied from CapturedVertexElement)
+      struct OriginalVertexElement {
+        uint16_t stream = 0;
+        uint16_t offset = 0;
+        uint8_t type = 0;       // D3DDECLTYPE
+        uint8_t method = 0;
+        uint8_t usage = 0;      // D3DDECLUSAGE
+        uint8_t usageIndex = 0;
+      };
+      std::vector<OriginalVertexElement> originalVertexElements;
+      bool useOriginalVertexLayout = false;  // If true, use originalVertexStreams instead of separated buffers
     };
 
     // Indirect Draw Args - filled by GPU compute shader
@@ -339,7 +392,8 @@ namespace dxvk {
     void executeMultiIndirectCaptures(Rc<RtxContext> ctx);
 
     // Helper functions for maximum performance batching
-    void setCommonPipelineState(Rc<RtxContext> ctx, const GpuCaptureRequest& request);
+    void setCommonPipelineState(Rc<RtxContext> ctx, const GpuCaptureRequest& request,
+                                uint32_t rtWidth, uint32_t rtHeight);
     void bindGeometryBuffers(Rc<RtxContext> ctx, const GpuCaptureRequest& request);
 
     // Per-frame capture counter

@@ -836,6 +836,19 @@ namespace dxvk {
   }
 
 
+  void DxvkContext::clearRenderPassBarriers() {
+    // Clear the barrier ops to ensure renderpass has minimal dependencies (1 dep)
+    // This is needed for shader capture where pipelines use the default renderpass
+    // which has only 1 subpass dependency (from renderStages being non-zero).
+    // Without this, the specialized renderpass would have 3 deps and cause
+    // "dependencyCount is incompatible" validation errors.
+    m_state.om.renderPassOps.barrier.srcStages = 0;
+    m_state.om.renderPassOps.barrier.srcAccess = 0;
+    m_state.om.renderPassOps.barrier.dstStages = 0;
+    m_state.om.renderPassOps.barrier.dstAccess = 0;
+  }
+
+
   void DxvkContext::copyBuffer(
     const Rc<DxvkBuffer>&       dstBuffer,
           VkDeviceSize          dstOffset,

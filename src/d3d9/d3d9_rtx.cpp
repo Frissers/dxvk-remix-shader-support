@@ -753,6 +753,7 @@ namespace dxvk {
     m_activeDrawCallState.capturedD3D9Textures.clear(); // Clear captured textures for new draw call
     m_activeDrawCallState.renderTargetReplacementSlot = -1; // Reset render target replacement slot
     m_activeDrawCallState.originalRenderTargetHash = 0; // Reset original RT hash
+    m_activeDrawCallState.depthTextureMask = m_parent->m_depthTextures; // Capture shadow sampler mask
 
     // Fetch all the legacy state (colour modes, alpha test, etc...)
     setLegacyMaterialState(m_parent, m_parent->m_alphaSwizzleRTs & (1 << kRenderTargetIndex), m_activeDrawCallState.materialData);
@@ -794,6 +795,30 @@ namespace dxvk {
     
     if (m_activeDrawCallState.usesPixelShader) {
       m_activeDrawCallState.programmablePixelShaderInfo = d3d9State().pixelShader->GetCommonShader()->GetInfo();
+    }
+    
+    // SHADER OUTPUT CAPTURE: Capture shader constants for re-execution
+    // Access constants directly from D3D9 device state (m_state.vsConsts/psConsts)
+    // NOTE: We capture ALL 224 constants, not just maxConstIndexF, because games often
+    // set constants beyond what the shader metadata declares (e.g., game sets c[30] but shader only declares using c[0-11])
+    if (m_activeDrawCallState.usesVertexShader) {
+      constexpr uint32_t kMaxD3D9VSConsts = 256; // D3D9 vertex shader constant limit
+      m_activeDrawCallState.vertexShaderConstantData.resize(kMaxD3D9VSConsts);
+      const Direct3DState9& state = d3d9State();
+      // Fast copy all constants
+      std::memcpy(m_activeDrawCallState.vertexShaderConstantData.data(),
+                  state.vsConsts.fConsts,
+                  kMaxD3D9VSConsts * sizeof(Vector4));
+    }
+    
+    if (m_activeDrawCallState.usesPixelShader) {
+      constexpr uint32_t kMaxD3D9PSConsts = 224; // D3D9 pixel shader constant limit
+      m_activeDrawCallState.pixelShaderConstantData.resize(kMaxD3D9PSConsts);
+      const Direct3DState9& state = d3d9State();
+      // Fast copy all constants
+      std::memcpy(m_activeDrawCallState.pixelShaderConstantData.data(),
+                  state.psConsts.fConsts,
+                  kMaxD3D9PSConsts * sizeof(Vector4));
     }
     
     m_activeDrawCallState.cameraType = CameraType::Unknown;
@@ -1321,6 +1346,7 @@ namespace dxvk {
       // This preserves the ORIGINAL game textures before RT replacement happens
       DrawCallState::CapturedD3D9Texture capturedTex;
       capturedTex.texture = TextureRef(pTexInfo->GetSampleView(srgb));
+      capturedTex.sampler = sampler;  // Capture sampler state
       capturedTex.slot = m_activeDrawCallState.materialData.colorTextureSlot[textureID];
       m_activeDrawCallState.capturedD3D9Textures.push_back(capturedTex);
 
@@ -1363,8 +1389,22 @@ namespace dxvk {
             auto shaderSampler = RemapStateSamplerShader(stage);
             uint32_t stageSlot = computeResourceSlotId(shaderSampler.first, DxsoBindingType::Image, uint32_t(shaderSampler.second));
 
+            // Create/get sampler for this stage
+            D3D9SamplerKey key = m_parent->CreateSamplerKey(stage);
+            XXH64_hash_t samplerHash = D3D9SamplerKeyHash{}(key);
+            Rc<DxvkSampler> sampler;
+            auto samplerIt = m_samplerCache.find(samplerHash);
+            if (samplerIt != m_samplerCache.end()) {
+              sampler = samplerIt->second;
+            } else {
+              const auto samplerInfo = m_parent->DecodeSamplerKey(key);
+              sampler = m_parent->GetDXVKDevice()->createSampler(samplerInfo);
+              m_samplerCache.insert(std::make_pair(samplerHash, sampler));
+            }
+
             DrawCallState::CapturedD3D9Texture capturedTex;
             capturedTex.texture = TextureRef(pTexInfo->GetSampleView(srgb));
+            capturedTex.sampler = sampler;  // Capture sampler state
             capturedTex.slot = stageSlot;
             m_activeDrawCallState.capturedD3D9Textures.push_back(capturedTex);
           }
@@ -1580,33 +1620,91 @@ namespace dxvk {
       const uint32_t vsConstantCount = caps::MaxFloatConstantsVS; // 256 constants
       m_activeDrawCallState.vertexShaderConstantData.resize(vsConstantCount);
 
-      // DEBUG: Log VS constants BEFORE copy - check c[0]-c[15] where transformation matrices should be
+      // DEBUG: Scan ALL VS constants to find non-zero values (game may use unexpected registers)
       static uint32_t vsConstLogCount = 0;
       if (++vsConstLogCount <= 5) {
-        Logger::info(str::format("[VS-CONST-CAPTURE] #", vsConstLogCount, " BEFORE memcpy:"));
-        Logger::info(str::format("[VS-CONST-CAPTURE]   Transformation matrices (should be non-zero):"));
-        for (uint32_t i = 0; i < 16 && i < vsConstantCount; i++) {
-          Logger::info(str::format("[VS-CONST-CAPTURE]   state.vsConsts.fConsts[", i, "] = (",
-                                  state.vsConsts.fConsts[i].x, ", ", state.vsConsts.fConsts[i].y, ", ",
-                                  state.vsConsts.fConsts[i].z, ", ", state.vsConsts.fConsts[i].w, ")"));
+        Logger::info(str::format("[VS-CONST-CAPTURE] #", vsConstLogCount, " Scanning ALL ", vsConstantCount, " VS constants for non-zero values:"));
+        uint32_t nonZeroCount = 0;
+        for (uint32_t i = 0; i < vsConstantCount; i++) {
+          const auto& c = state.vsConsts.fConsts[i];
+          if (c.x != 0.0f || c.y != 0.0f || c.z != 0.0f || c.w != 0.0f) {
+            nonZeroCount++;
+            Logger::info(str::format("[VS-CONST-CAPTURE]   c[", i, "] = (", c.x, ", ", c.y, ", ", c.z, ", ", c.w, ") <-- NON-ZERO!"));
+          }
         }
-        Logger::info(str::format("[VS-CONST-CAPTURE]   vsConstantCount=", vsConstantCount));
+        if (nonZeroCount == 0) {
+          Logger::warn("[VS-CONST-CAPTURE]   ALL 256 VS CONSTANTS ARE ZERO! Game may use fixed-function transforms.");
+        } else {
+          Logger::info(str::format("[VS-CONST-CAPTURE]   Found ", nonZeroCount, " non-zero constants"));
+        }
       }
 
       // Copy from fConsts array (float constants)
       memcpy(m_activeDrawCallState.vertexShaderConstantData.data(), state.vsConsts.fConsts, vsConstantCount * sizeof(Vector4));
 
-      // DEBUG: Log VS constants AFTER copy
-      if (vsConstLogCount <= 5) {
-        Logger::info(str::format("[VS-CONST-CAPTURE] #", vsConstLogCount, " AFTER memcpy:"));
-        Logger::info(str::format("[VS-CONST-CAPTURE]   Copied transformation matrices:"));
-        for (uint32_t i = 0; i < 16 && i < vsConstantCount; i++) {
-          Logger::info(str::format("[VS-CONST-CAPTURE]   vertexShaderConstantData[", i, "] = (",
-                                  m_activeDrawCallState.vertexShaderConstantData[i].x, ", ",
-                                  m_activeDrawCallState.vertexShaderConstantData[i].y, ", ",
-                                  m_activeDrawCallState.vertexShaderConstantData[i].z, ", ",
-                                  m_activeDrawCallState.vertexShaderConstantData[i].w, ")"));
+      // CRITICAL FIX: If VS constants c[0]-c[3] are all zeros but fixed-function transforms are set,
+      // inject the WVP matrix into c[0]-c[3]. Many D3D9 games rely on the driver to do this.
+      // Check if c[0]-c[3] are all zeros (transformation matrix would be zero)
+      bool c0to3AllZeros = true;
+      for (int i = 0; i < 4 && c0to3AllZeros; i++) {
+        const auto& c = state.vsConsts.fConsts[i];
+        if (c.x != 0.0f || c.y != 0.0f || c.z != 0.0f || c.w != 0.0f) {
+          c0to3AllZeros = false;
         }
+      }
+
+      if (c0to3AllZeros) {
+        // Get fixed-function transforms
+        const Matrix4& world = d3d9State().transforms[GetTransformIndex(D3DTS_WORLD)];
+        const Matrix4& view = d3d9State().transforms[GetTransformIndex(D3DTS_VIEW)];
+        const Matrix4& proj = d3d9State().transforms[GetTransformIndex(D3DTS_PROJECTION)];
+
+        // Check if fixed-function transforms are valid (not identity or zero)
+        bool hasValidTransforms = proj[0][0] != 0.0f || proj[1][1] != 0.0f || proj[2][2] != 0.0f;
+
+        if (hasValidTransforms) {
+          // Compute WVP = World * View * Projection (row-major for D3D9)
+          Matrix4 wvp = world * view * proj;
+
+          // Inject WVP matrix into c[0]-c[3] (each row is one constant register)
+          // D3D9 uses row-major matrices, so row 0 goes to c[0], etc.
+          for (int row = 0; row < 4; row++) {
+            m_activeDrawCallState.vertexShaderConstantData[row].x = wvp[row][0];
+            m_activeDrawCallState.vertexShaderConstantData[row].y = wvp[row][1];
+            m_activeDrawCallState.vertexShaderConstantData[row].z = wvp[row][2];
+            m_activeDrawCallState.vertexShaderConstantData[row].w = wvp[row][3];
+          }
+
+          static uint32_t wvpInjectLogCount = 0;
+          if (++wvpInjectLogCount <= 10) {
+            Logger::info(str::format("[VS-CONST-INJECT] #", wvpInjectLogCount,
+              " Injected WVP matrix into c[0]-c[3] (was all zeros)"));
+            Logger::info(str::format("[VS-CONST-INJECT]   c[0] = (",
+              m_activeDrawCallState.vertexShaderConstantData[0].x, ", ",
+              m_activeDrawCallState.vertexShaderConstantData[0].y, ", ",
+              m_activeDrawCallState.vertexShaderConstantData[0].z, ", ",
+              m_activeDrawCallState.vertexShaderConstantData[0].w, ")"));
+          }
+        }
+      }
+
+      // DEBUG: Also log fixed-function transforms for comparison
+      if (vsConstLogCount <= 5) {
+        const Matrix4& world = d3d9State().transforms[GetTransformIndex(D3DTS_WORLD)];
+        const Matrix4& view = d3d9State().transforms[GetTransformIndex(D3DTS_VIEW)];
+        const Matrix4& proj = d3d9State().transforms[GetTransformIndex(D3DTS_PROJECTION)];
+
+        bool worldNonZero = world[0][0] != 0.0f || world[1][1] != 0.0f || world[2][2] != 0.0f;
+        bool viewNonZero = view[0][0] != 0.0f || view[1][1] != 0.0f || view[2][2] != 0.0f;
+        bool projNonZero = proj[0][0] != 0.0f || proj[1][1] != 0.0f || proj[2][2] != 0.0f;
+
+        Logger::info(str::format("[VS-CONST-CAPTURE] Fixed-function transforms:"));
+        Logger::info(str::format("[VS-CONST-CAPTURE]   D3DTS_WORLD non-zero: ", worldNonZero ? "YES" : "NO",
+                                " diagonal=(", world[0][0], ",", world[1][1], ",", world[2][2], ")"));
+        Logger::info(str::format("[VS-CONST-CAPTURE]   D3DTS_VIEW non-zero: ", viewNonZero ? "YES" : "NO",
+                                " diagonal=(", view[0][0], ",", view[1][1], ",", view[2][2], ")"));
+        Logger::info(str::format("[VS-CONST-CAPTURE]   D3DTS_PROJECTION non-zero: ", projNonZero ? "YES" : "NO",
+                                " diagonal=(", proj[0][0], ",", proj[1][1], ",", proj[2][2], ")"));
       }
 
     } else {

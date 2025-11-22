@@ -361,8 +361,17 @@ namespace dxvk {
             VkClearValue          clearValue);
     
     /**
+     * \brief Clears render pass barrier ops
+     *
+     * Clears the barrier ops in render pass state to ensure
+     * the renderpass created has minimal dependencies (1 dep).
+     * This is needed for shader capture to match pipeline's default renderpass.
+     */
+    void clearRenderPassBarriers();
+
+    /**
      * \brief Clears an image view
-     * 
+     *
      * Can be used to clear sub-regions of storage images
      * that are not going to be used as render targets.
      * Implicit format conversion will be applied.

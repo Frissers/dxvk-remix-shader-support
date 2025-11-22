@@ -3667,8 +3667,12 @@ void DxsoCompiler::emitControlFlowGenericLoop(
         str::format("in_", elem.semantic.usage, elem.semantic.usageIndex);
       m_module.setDebugName(inputPtr.id, name.c_str());
 
-      if (elem.centroid)
-        m_module.decorate(inputPtr.id, spv::DecorationCentroid);
+      // DISABLED: Centroid decoration causes SPIRV validation errors after spec constant substitution
+      // The validation error: "Centroid decoration on target storage class must be Input or Output"
+      // This happens because SPIRV specialization can copy variables to different storage classes
+      // while keeping decorations, which breaks validation.
+      // if (elem.centroid)
+      //   m_module.decorate(inputPtr.id, spv::DecorationCentroid);
 
       m_entryPointInterfaces.push_back(inputPtr.id);
 
