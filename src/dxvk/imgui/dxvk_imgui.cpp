@@ -55,6 +55,7 @@
 #include "../util/rc/util_rc_ptr.h"
 #include "../util/util_math.h"
 #include "../util/util_globaltime.h"
+#include "../rtx_render/rtx_shader_compatibility_manager.h"
 #include "rtx_render/rtx_opacity_micromap_manager.h"
 #include "rtx_render/rtx_bridge_message_channel.h"
 #include "dxvk_imgui_about.h"
@@ -1703,6 +1704,16 @@ namespace dxvk {
       const auto compilationText = str::format("Compiling shaders (", asyncShaderCompilationCount, " remaining)");
 
       hudMessages.emplace_back(std::move(compilationText), "This may take some time if shaders are not cached yet.\nRemix will not render properly until compilation is finished.");
+    }
+
+    // Show shader decompilation progress
+    if (auto* compatManager = ShaderCompatibilityManager::getInstance()) {
+      uint32_t pendingCount = compatManager->getPendingAnalysisCount();
+      uint32_t analyzedCount = compatManager->getAnalyzedCount();
+      if (pendingCount > 0) {
+        const auto analysisText = str::format("Analyzing game shaders (", pendingCount, " remaining, ", analyzedCount, " done)");
+        hudMessages.emplace_back(std::move(analysisText), "Decompiling shaders to analyze compatibility.\nDecompiled shaders are saved to rtx-remix/decompiled_shaders/");
+      }
     }
 
     // Add Enhancement Loading HUD messages

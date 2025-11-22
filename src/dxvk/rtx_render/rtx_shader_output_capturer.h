@@ -287,7 +287,9 @@ namespace dxvk {
       // SHADER DATA (Rc-counted, safe to copy)
       Rc<DxvkShader> vertexShader;    // Original vertex shader
       Rc<DxvkShader> pixelShader;     // Original pixel shader
-      
+
+      // Shader bytecode is now analyzed by ShaderCompatibilityManager at shader creation time
+
       // SHADER CONSTANT DATA (copied from DrawCallState)
       std::vector<Vector4> vertexShaderConstantData;   // VS uniforms (transforms, etc.)
       std::vector<Vector4> pixelShaderConstantData;    // PS uniforms (colors, etc.)

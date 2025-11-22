@@ -16,6 +16,8 @@
 #include "d3d9_surface.h"
 #include "../dxvk/rtx_render/rtx_terrain_baker.h"
 #include "../dxvk/rtx_render/rtx_shader_output_capturer.h"
+#include "../dxvk/rtx_render/rtx_shader_compatibility_manager.h"
+#include "../util/xxHash/xxhash.h"
 #include <algorithm>
 #include <cstring>
 #include <unordered_map>
@@ -44,10 +46,15 @@ namespace dxvk {
     : m_rtStagingData(d3d9Device->GetDXVKDevice(), "RtxStagingDataAlloc: D3D9", (VkMemoryPropertyFlagBits) (VK_MEMORY_PROPERTY_HOST_CACHED_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT))
     , m_parent(d3d9Device)
     , m_enableDrawCallConversion(enableDrawCallConversion)
-    , m_pGeometryWorkers(enableDrawCallConversion ? std::make_unique<GeometryProcessor>(numGeometryProcessingThreads(), "geometry-processing") : nullptr) {
+    , m_pGeometryWorkers(enableDrawCallConversion ? std::make_unique<GeometryProcessor>(numGeometryProcessingThreads(), "geometry-processing") : nullptr)
+    , m_shaderCompatibilityManager(std::make_unique<ShaderCompatibilityManager>()) {
 
     // Add space for 256 objects skinned with 256 bones each.
     m_stagedBones.resize(256 * 256);
+  }
+
+  D3D9Rtx::~D3D9Rtx() {
+    // ShaderCompatibilityManager destructor handles cleanup
   }
 
   void D3D9Rtx::Initialize() {
@@ -1196,8 +1203,42 @@ namespace dxvk {
 
     // RENDER TARGET REPLACEMENT: Check if slot 0 contains a render target and find alternative texture
     int recommendedAlbedoSampler = -1;
+
+    // AUTO-DETECT: Query decompiler for the correct albedo sampler binding
     if constexpr (!FixedFunction) {
-      auto isCategorizedRenderTarget = [](const D3D9CommonTexture* texture) {
+      if (d3d9State().pixelShader.ptr() != nullptr) {
+        const auto* commonShader = d3d9State().pixelShader->GetCommonShader();
+        if (commonShader != nullptr) {
+          const auto& bytecode = commonShader->GetBytecode();
+          if (!bytecode.empty()) {
+            const uint64_t psHash = XXH64(bytecode.data(), bytecode.size(), 0);
+            if (auto* compatManager = m_shaderCompatibilityManager.get()) {
+              int decompilerSampler = compatManager->getRecommendedAlbedoSampler(psHash);
+              if (decompilerSampler >= 0) {
+                recommendedAlbedoSampler = decompilerSampler;
+                static int logCount = 0;
+                if (++logCount <= 20) {
+                  Logger::info(str::format("[RTX-AutoDetect] PS hash=0x", std::hex, psHash, std::dec,
+                                          " decompiler says albedo is at slot ", decompilerSampler));
+                }
+                // AUTO-DETECT RENDER TARGET: If albedo is NOT at slot 0, and slot 0 has a texture,
+                // then slot 0's texture is likely a render target
+                if (decompilerSampler > 0 && d3d9State().textures[0] != nullptr) {
+                  D3D9CommonTexture* tex0 = GetCommonTexture(d3d9State().textures[0]);
+                  if (tex0 != nullptr) {
+                    const XXH64_hash_t tex0Hash = tex0->GetImage()->getHash();
+                    compatManager->registerDetectedRenderTarget(tex0Hash);
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+
+    if constexpr (!FixedFunction) {
+      auto isCategorizedRenderTarget = [this](const D3D9CommonTexture* texture) {
         if (texture == nullptr)
           return false;
         const auto& manualRenderTargets = RtxOptions::renderTargetReplacementTextures();
@@ -1214,6 +1255,13 @@ namespace dxvk {
         const XXH64_hash_t imageHash = texture->GetImage()->getHash();
         if (matchesManualTag(imageHash)) {
           return true;
+        }
+
+        // Check auto-detected render targets from decompiler analysis
+        if (auto* compatManager = m_shaderCompatibilityManager.get()) {
+          if (compatManager->isDetectedRenderTarget(imageHash)) {
+            return true;
+          }
         }
 
         if (const Rc<DxvkImageView> sampleView = texture->GetSampleView(true); sampleView != nullptr) {
@@ -1256,7 +1304,10 @@ namespace dxvk {
                 const XXH64_hash_t texHash = tex->GetImage()->getHash();
 
                 if (!isRT && !isDepthStencil && !isTinyTexture) {
-                  recommendedAlbedoSampler = slot;
+                  // Only override if decompiler didn't provide an answer
+                  if (recommendedAlbedoSampler < 0) {
+                    recommendedAlbedoSampler = slot;
+                  }
                   // CRITICAL: Set renderTargetReplacementSlot so shader capturer knows this is a RT replacement
                   m_activeDrawCallState.renderTargetReplacementSlot = slot;
 

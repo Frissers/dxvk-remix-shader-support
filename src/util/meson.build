@@ -54,6 +54,9 @@ util_src = files([
   'util_watchdog.h',
 
   'util_globaltime.h',
+
+  'hlsl_decompiler_bridge.h',
+  'hlsl_decompiler_bridge.cpp',
 ])
 
 util_lib = static_library('util', util_src,

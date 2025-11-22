@@ -37,8 +37,10 @@
 #include "../../d3d9/d3d9_shader.h" // For D3D9CommonShader, GetShader()
 #include "../../d3d9/d3d9_shader_permutations.h" // For D3D9ShaderPermutations
 #include "../../dxso/dxso_util.h" // For computeResourceSlotId
+// Shader decompilation is handled by ShaderCompatibilityManager
 #include <algorithm>
 #include <cstring>
+#include <fstream>
 #include <unordered_map>
 #include <unordered_set>
 #include <chrono>
@@ -693,6 +695,9 @@ namespace dxvk {
       } else {
         Logger::err("[SHADER-BIND] NO pixel shader in request! Will render incorrectly!");
       }
+
+      // Shader decompilation is now handled by ShaderCompatibilityManager in d3d9_shader.cpp
+      // Decompiled shaders are saved to rtx-remix/decompiled_shaders/
 
       // VS constants are bound below AFTER the createConstantBufferSlice lambda is defined
 
