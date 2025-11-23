@@ -211,6 +211,8 @@ namespace dxvk {
     const bool m_enableDrawCallConversion;
     bool m_rtxInjectTriggered = false;
     bool m_forceGeometryCopy = false;
+    bool m_shaderLightsInjectedThisFrame = false;
+    uint64_t m_lastShaderLightInjectionFrame = 0;
     DWORD m_texcoordIndex = 0;
 
     int m_activeOcclusionQueries = 0;

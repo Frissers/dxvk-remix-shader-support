@@ -272,7 +272,10 @@ namespace dxvk {
                                  "\n  fov=", decomposeProjectionParams.fov,
                                  "\n  aspectRatio=", decomposeProjectionParams.aspectRatio,
                                  "\n  nearPlane=", decomposeProjectionParams.nearPlane,
-                                 "\n  farPlane=", decomposeProjectionParams.farPlane));
+                                 "\n  farPlane=", decomposeProjectionParams.farPlane,
+                                 "\n  isLHS=", decomposeProjectionParams.isLHS,
+                                 "\n  shearX=", decomposeProjectionParams.shearX,
+                                 "\n  shearY=", decomposeProjectionParams.shearY));
       }
       // NV-DXVK end
 

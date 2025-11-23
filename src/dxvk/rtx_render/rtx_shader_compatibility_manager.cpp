@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <fstream>
 #include <filesystem>
+#include <regex>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -17,10 +18,128 @@ namespace dxvk {
 ShaderCompatibilityManager::ShaderCompatibilityManager() {
   s_instance = this;
 
+  // Pre-scan decompiled_shaders directory to get fallback matrix registers
+  prescanDecompiledShaders();
+
   // Start background worker threads for async shader analysis
   startBackgroundProcessing();
 
   Logger::info("[ShaderCompat] Shader compatibility manager initialized with async processing");
+}
+
+void ShaderCompatibilityManager::prescanDecompiledShaders() {
+  // Build path to decompiled_shaders directory
+  std::filesystem::path exePath = env::getExePath();
+  std::filesystem::path decompiledDir = exePath.parent_path() / "rtx-remix" / "decompiled_shaders";
+
+  if (!std::filesystem::exists(decompiledDir)) {
+    Logger::info(str::format("[ShaderCompat] No decompiled_shaders directory found at ", decompiledDir.string()));
+    return;
+  }
+
+  Logger::info(str::format("[ShaderCompat] Pre-scanning decompiled shaders from ", decompiledDir.string()));
+
+  int scannedCount = 0;
+  int foundMatrixCount = 0;
+
+  // Regex to parse matrix register info from shader header comments
+  // Format: "// Matrix Registers: world=N view=N proj=N wvp=N"
+  std::regex headerRegex(R"(Matrix Registers:\s*world=(-?\d+)\s+view=(-?\d+)\s+proj=(-?\d+)\s+wvp=(-?\d+))");
+
+  // Regex to parse register declarations in HLSL
+  // Format: "float4x4 vs_view : register(c4);"
+  std::regex registerRegex(R"(float4x4\s+(\w+)\s*:\s*register\s*\(\s*c(\d+)\s*\))", std::regex::icase);
+
+  for (const auto& entry : std::filesystem::directory_iterator(decompiledDir)) {
+    if (!entry.is_regular_file()) continue;
+
+    std::string filename = entry.path().filename().string();
+    if (filename.substr(0, 3) != "vs_" || filename.substr(filename.length() - 4) != ".txt") continue;
+
+    // Extract hash from filename: vs_0xHASH.txt
+    std::string hashStr = filename.substr(3, filename.length() - 7); // Remove "vs_" and ".txt"
+    uint64_t shaderHash = 0;
+    try {
+      shaderHash = std::stoull(hashStr, nullptr, 16);
+    } catch (...) {
+      continue; // Invalid hash format
+    }
+
+    // Read file content
+    std::ifstream file(entry.path());
+    if (!file.is_open()) continue;
+
+    std::string content((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+    file.close();
+
+    scannedCount++;
+
+    // Try to find matrix registers
+    ShaderCompatInfo info;
+    info.analyzed = true;
+    info.analysisResult.success = true;
+
+    // First try header comment format
+    std::smatch headerMatch;
+    if (std::regex_search(content, headerMatch, headerRegex)) {
+      info.analysisResult.matrixInfo.worldMatrixRegister = std::stoi(headerMatch[1].str());
+      info.analysisResult.matrixInfo.viewMatrixRegister = std::stoi(headerMatch[2].str());
+      info.analysisResult.matrixInfo.projectionMatrixRegister = std::stoi(headerMatch[3].str());
+      info.analysisResult.matrixInfo.worldViewProjMatrixRegister = std::stoi(headerMatch[4].str());
+    }
+
+    // Also parse HLSL register declarations for more specific names
+    std::string::const_iterator searchStart = content.cbegin();
+    std::smatch match;
+    while (std::regex_search(searchStart, content.cend(), match, registerRegex)) {
+      std::string varName = match[1].str();
+      int regNum = std::stoi(match[2].str());
+
+      // Convert to lowercase for matching
+      std::transform(varName.begin(), varName.end(), varName.begin(), ::tolower);
+
+      if (varName.find("viewproj") != std::string::npos || varName.find("worldviewproj") != std::string::npos) {
+        info.analysisResult.matrixInfo.worldViewProjMatrixRegister = regNum;
+      } else if (varName.find("worldview") != std::string::npos) {
+        info.analysisResult.matrixInfo.worldViewMatrixRegister = regNum;
+      } else if (varName.find("world") != std::string::npos && varName.find("cam") == std::string::npos) {
+        info.analysisResult.matrixInfo.worldMatrixRegister = regNum;
+      } else if (varName.find("view") != std::string::npos && varName.find("proj") == std::string::npos) {
+        info.analysisResult.matrixInfo.viewMatrixRegister = regNum;
+      } else if (varName.find("proj") != std::string::npos) {
+        info.analysisResult.matrixInfo.projectionMatrixRegister = regNum;
+      }
+
+      searchStart = match.suffix().first;
+    }
+
+    // Only add if we found some matrix info
+    bool hasMatrixInfo = info.analysisResult.matrixInfo.viewMatrixRegister >= 0 ||
+                         info.analysisResult.matrixInfo.worldMatrixRegister >= 0 ||
+                         info.analysisResult.matrixInfo.projectionMatrixRegister >= 0 ||
+                         info.analysisResult.matrixInfo.worldViewProjMatrixRegister >= 0;
+
+    if (hasMatrixInfo) {
+      foundMatrixCount++;
+      std::lock_guard<std::mutex> lock(m_databaseMutex);
+      m_shaderDatabase[shaderHash] = info;
+
+      // Update default fallback registers if we found better values
+      if (info.analysisResult.matrixInfo.viewMatrixRegister >= 0 && m_defaultViewReg < 0) {
+        m_defaultViewReg = info.analysisResult.matrixInfo.viewMatrixRegister;
+      }
+      if (info.analysisResult.matrixInfo.worldMatrixRegister >= 0 && m_defaultWorldReg < 0) {
+        m_defaultWorldReg = info.analysisResult.matrixInfo.worldMatrixRegister;
+      }
+      if (info.analysisResult.matrixInfo.worldViewProjMatrixRegister >= 0 && m_defaultWvpReg < 0) {
+        m_defaultWvpReg = info.analysisResult.matrixInfo.worldViewProjMatrixRegister;
+      }
+    }
+  }
+
+  Logger::info(str::format("[ShaderCompat] Pre-scan complete: ", scannedCount, " shaders scanned, ",
+    foundMatrixCount, " with matrix info. Defaults: view=c", m_defaultViewReg,
+    " world=c", m_defaultWorldReg, " wvp=c", m_defaultWvpReg));
 }
 
 ShaderCompatibilityManager::~ShaderCompatibilityManager() {
@@ -132,7 +251,7 @@ void ShaderCompatibilityManager::processShaderAnalysis(
     info.analysisResult.success = true;
     info.analysisResult.albedoSamplerIndex = -1;  // Default to unknown
 
-    // Parse the cached file to extract albedoSampler value
+    // Parse the cached file to extract albedoSampler and matrix register values
     try {
       std::ifstream inFile(cachePath);
       if (inFile.is_open()) {
@@ -144,10 +263,43 @@ void ShaderCompatibilityManager::processShaderAnalysis(
             pos += 14;  // Length of "albedoSampler="
             int samplerIndex = std::stoi(line.substr(pos));
             info.analysisResult.albedoSamplerIndex = samplerIndex;
-            Logger::info(str::format("[ShaderCompat] Loaded cached shader ", std::hex, shaderHash, std::dec,
-                                    " albedoSampler=", samplerIndex));
-            break;
           }
+
+          // Parse "Matrix Registers: world=N view=N proj=N wvp=N"
+          pos = line.find("Matrix Registers:");
+          if (pos != std::string::npos) {
+            // Parse world=
+            size_t worldPos = line.find("world=", pos);
+            if (worldPos != std::string::npos) {
+              worldPos += 6;
+              info.analysisResult.matrixInfo.worldMatrixRegister = std::stoi(line.substr(worldPos));
+            }
+            // Parse view=
+            size_t viewPos = line.find("view=", pos);
+            if (viewPos != std::string::npos) {
+              viewPos += 5;
+              info.analysisResult.matrixInfo.viewMatrixRegister = std::stoi(line.substr(viewPos));
+            }
+            // Parse proj=
+            size_t projPos = line.find("proj=", pos);
+            if (projPos != std::string::npos) {
+              projPos += 5;
+              info.analysisResult.matrixInfo.projectionMatrixRegister = std::stoi(line.substr(projPos));
+            }
+            // Parse wvp=
+            size_t wvpPos = line.find("wvp=", pos);
+            if (wvpPos != std::string::npos) {
+              wvpPos += 4;
+              info.analysisResult.matrixInfo.worldViewProjMatrixRegister = std::stoi(line.substr(wvpPos));
+            }
+
+            Logger::info(str::format("[ShaderCompat] Loaded cached shader ", std::hex, shaderHash, std::dec,
+              " matrixRegs: world=", info.analysisResult.matrixInfo.worldMatrixRegister,
+              " view=", info.analysisResult.matrixInfo.viewMatrixRegister,
+              " proj=", info.analysisResult.matrixInfo.projectionMatrixRegister,
+              " wvp=", info.analysisResult.matrixInfo.worldViewProjMatrixRegister));
+          }
+
           // Stop parsing after first few lines (header only)
           if (line.find("// ===") != std::string::npos) {
             break;
@@ -270,6 +422,120 @@ void ShaderCompatibilityManager::registerDetectedRenderTarget(uint64_t textureHa
 bool ShaderCompatibilityManager::isDetectedRenderTarget(uint64_t textureHash) const {
   std::lock_guard<std::mutex> lock(m_detectedRTMutex);
   return m_detectedRenderTargets.count(textureHash) > 0;
+}
+
+bool ShaderCompatibilityManager::findAnyShaderWithMatrixRegisters(int& outViewReg, int& outProjReg, int& outWorldReg, int& outWvpReg) const {
+  // Cache the result to avoid repeated scanning
+  static int s_cachedViewReg = -1;
+  static int s_cachedProjReg = -1;
+  static int s_cachedWorldReg = -1;
+  static int s_cachedWvpReg = -1;
+  static bool s_cacheValid = false;
+  static bool s_loggedOnce = false;
+  static uint32_t s_scanLogCount = 0;
+
+  if (s_cacheValid) {
+    outViewReg = s_cachedViewReg;
+    outProjReg = s_cachedProjReg;
+    outWorldReg = s_cachedWorldReg;
+    outWvpReg = s_cachedWvpReg;
+    return s_cachedViewReg >= 0;
+  }
+
+  std::lock_guard<std::mutex> lock(m_databaseMutex);
+
+  // Log database stats periodically
+  if (s_scanLogCount++ < 10) {
+    uint32_t totalShaders = m_shaderDatabase.size();
+    uint32_t analyzedShaders = 0;
+    uint32_t successfulShaders = 0;
+    uint32_t withViewMatrix = 0;
+    uint32_t withProjMatrix = 0;
+    for (const auto& [hash, info] : m_shaderDatabase) {
+      if (info.analyzed) {
+        analyzedShaders++;
+        if (info.analysisResult.success) {
+          successfulShaders++;
+          if (info.analysisResult.matrixInfo.viewMatrixRegister >= 0) {
+            withViewMatrix++;
+          }
+          if (info.analysisResult.matrixInfo.projectionMatrixRegister >= 0) {
+            withProjMatrix++;
+          }
+        }
+      }
+    }
+    Logger::info(str::format("[MATRIX-SCAN] Database: total=", totalShaders,
+      " analyzed=", analyzedShaders, " successful=", successfulShaders,
+      " withViewMatrix=", withViewMatrix, " withProjMatrix=", withProjMatrix));
+  }
+
+  // Scan for view and projection separately - they may be in different shaders
+  int foundViewReg = -1;
+  int foundProjReg = -1;
+  int foundWorldReg = -1;
+  int foundWvpReg = -1;
+
+  for (const auto& [hash, info] : m_shaderDatabase) {
+    if (info.analyzed && info.analysisResult.success) {
+      const auto& matrixInfo = info.analysisResult.matrixInfo;
+
+      // Track best view register found
+      if (matrixInfo.viewMatrixRegister >= 0 && foundViewReg < 0) {
+        foundViewReg = matrixInfo.viewMatrixRegister;
+      }
+
+      // Track best projection register found
+      if (matrixInfo.projectionMatrixRegister >= 0 && foundProjReg < 0) {
+        foundProjReg = matrixInfo.projectionMatrixRegister;
+      }
+
+      // Track best world register found
+      if (matrixInfo.worldMatrixRegister >= 0 && foundWorldReg < 0) {
+        foundWorldReg = matrixInfo.worldMatrixRegister;
+      }
+
+      // Track best worldViewProj register found
+      if (matrixInfo.worldViewProjMatrixRegister >= 0 && foundWvpReg < 0) {
+        foundWvpReg = matrixInfo.worldViewProjMatrixRegister;
+      }
+
+      // Early exit if we found everything
+      if (foundViewReg >= 0 && foundProjReg >= 0 && foundWorldReg >= 0 && foundWvpReg >= 0) {
+        break;
+      }
+    }
+  }
+
+  // If we found a view register, cache and return
+  if (foundViewReg >= 0) {
+    s_cachedViewReg = foundViewReg;
+    s_cachedProjReg = foundProjReg;
+    s_cachedWorldReg = foundWorldReg;
+    s_cachedWvpReg = foundWvpReg;
+    s_cacheValid = true;
+
+    if (!s_loggedOnce) {
+      Logger::info(str::format("[ShaderCompat] Found matrix registers from shader analysis:",
+        " view=c", s_cachedViewReg,
+        " proj=c", s_cachedProjReg,
+        " world=c", s_cachedWorldReg,
+        " wvp=c", s_cachedWvpReg));
+      s_loggedOnce = true;
+    }
+
+    outViewReg = s_cachedViewReg;
+    outProjReg = s_cachedProjReg;
+    outWorldReg = s_cachedWorldReg;
+    outWvpReg = s_cachedWvpReg;
+    return true;
+  }
+
+  outViewReg = -1;
+  outProjReg = -1;
+  outWorldReg = -1;
+  outWvpReg = -1;
+  return false;
 }
 
 void ShaderCompatibilityManager::startBackgroundProcessing() {

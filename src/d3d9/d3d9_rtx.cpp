@@ -23,13 +23,36 @@
 #include <unordered_map>
 
 namespace dxvk {
+  // Global matrix cache from SetVertexShaderConstantF
+  // Stores matrices by their starting register number (e.g., c4 -> index 4)
+  // Used by processRenderState to get view/proj matrices based on shader analysis
+  std::array<Matrix4, 256> g_cachedMatricesByRegister;
+  std::array<bool, 256> g_hasMatrixAtRegister = {};  // Initialize all to false
+
+  // Transform cache from SetTransform (D3DTS_VIEW, D3DTS_PROJECTION)
+  // Games using vertex shaders often still use SetTransform for camera matrices
+  Matrix4 g_cachedViewTransform;
+  Matrix4 g_cachedProjectionTransform;
+  bool g_hasViewTransform = false;
+  bool g_hasProjectionTransform = false;
+
+  // Track the view matrix register identified by shader analysis
+  // This is set by DrawIndexedPrimitive when it finds a shader with view matrix info
+  // processRenderState will check this register FIRST before scanning others
+  int g_shaderAnalyzedViewReg = -1;
+
+  // Camera position from c8 (vs_worldCamPos) - some games store camera position separately
+  // from the view matrix. We cache it here to construct proper view matrices.
+  Vector4 g_cachedCameraPosition = Vector4(0, 0, 0, 1);
+  bool g_hasCachedCameraPosition = false;
+
   // Forward declaration for global shader registry (defined in dxvk_imgui.cpp)
   struct VertexShaderInfo {
     uint64_t hash;
     uint32_t drawCallCount;
     std::string name;
   };
-  
+
   // Extern declarations for global shader registry
   extern std::unordered_map<uint64_t, VertexShaderInfo> g_vertexShaderRegistry;
   extern std::mutex g_vertexShaderRegistryMutex;
@@ -403,20 +426,514 @@ namespace dxvk {
 
     transformData.worldToView = d3d9State().transforms[GetTransformIndex(D3DTS_VIEW)];
     transformData.viewToProjection = d3d9State().transforms[GetTransformIndex(D3DTS_PROJECTION)];
+
+    // NV-DXVK start: Extract camera matrices from vertex shader constants when using programmable VS
+    // This is needed for games that use vertex shaders for transforms instead of fixed-function
+    //
+    // ONE CLEAR PATH: Shader analysis tells us registers, cache from SetVertexShaderConstantF gives us values
+    // - No fallbacks, no guessing - deterministic extraction
+    // - If this shader has valid matrix registers, extract and cache
+    // - If not, use cached camera from a previous shader that did have matrices
+    bool extractedFromShader = false;
+    static Matrix4 s_cachedView;
+    static Matrix4 s_cachedProj;
+    static bool s_hasCachedCamera = false;
+    static bool s_hasReliableProj = false;  // True if projection was extracted via Z-translation (more accurate)
+    static int s_cachedViewReg = -1;  // Remember which registers worked
+    static int s_cachedProjReg = -1;
+    static uint32_t s_cameraExtractLogCount = 0;
+
+    // UNLIMITED per-frame logging
+    static uint32_t s_lastDebugFrame = UINT32_MAX;
+    uint32_t currentDebugFrame = m_parent->GetDXVKDevice()->getCurrentFrameId();
+    bool logThisFrame = (currentDebugFrame != s_lastDebugFrame);
+    if (logThisFrame) s_lastDebugFrame = currentDebugFrame;
+
+    if (m_parent->UseProgrammableVS()) {
+      // Read transforms directly from D3D9 state (not our cache, which may be empty if SetTransform wasn't called)
+      const Matrix4& ffView = d3d9State().transforms[GetTransformIndex(D3DTS_VIEW)];
+      const Matrix4& ffProj = d3d9State().transforms[GetTransformIndex(D3DTS_PROJECTION)];
+      const Matrix4& ffWorld = d3d9State().transforms[GetTransformIndex(D3DTS_WORLD)];
+
+      bool ffViewValid = ffView[0][0] != 0.0f || ffView[1][1] != 0.0f || ffView[2][2] != 0.0f;
+      bool ffProjValid = ffProj[0][0] != 0.0f || ffProj[1][1] != 0.0f || ffProj[2][2] != 0.0f;
+      bool ffWorldValid = ffWorld[0][0] != 0.0f || ffWorld[1][1] != 0.0f || ffWorld[2][2] != 0.0f;
+
+      if (logThisFrame) {
+        Logger::info(str::format("[EXTRACT-DEBUG] Frame=", currentDebugFrame, " UseProgrammableVS=TRUE"));
+        Logger::info(str::format("[EXTRACT-DEBUG] Fixed-function transforms: ffViewValid=", ffViewValid, " ffProjValid=", ffProjValid, " ffWorldValid=", ffWorldValid));
+        if (ffViewValid) {
+          Logger::info(str::format("[EXTRACT-DEBUG] ffView row0=[", ffView[0][0], ",", ffView[0][1], ",", ffView[0][2], ",", ffView[0][3], "]"));
+          Logger::info(str::format("[EXTRACT-DEBUG] ffView row3=[", ffView[3][0], ",", ffView[3][1], ",", ffView[3][2], ",", ffView[3][3], "]"));
+        }
+        if (ffProjValid) {
+          Logger::info(str::format("[EXTRACT-DEBUG] ffProj row0=[", ffProj[0][0], ",", ffProj[0][1], ",", ffProj[0][2], ",", ffProj[0][3], "]"));
+        }
+      }
+
+      // Validation: check matrix is not all zeros and has finite values
+      auto isValidMatrix = [](const Matrix4& m) -> bool {
+        bool allZero = true;
+        for (int i = 0; i < 4 && allZero; i++) {
+          if (m[i][0] != 0.0f || m[i][1] != 0.0f || m[i][2] != 0.0f || m[i][3] != 0.0f)
+            allZero = false;
+        }
+        if (allZero) return false;
+        for (int i = 0; i < 4; i++) {
+          if (!std::isfinite(m[i][0]) || !std::isfinite(m[i][1]) ||
+              !std::isfinite(m[i][2]) || !std::isfinite(m[i][3])) return false;
+        }
+        return true;
+      };
+
+      // ONE CLEAR PATH: Get matrix from cache OR read directly from D3D9 state
+      // The cache may be empty if game sets constants in a different order than expected
+      // Direct reading ensures we get the actual current values
+      auto getMatrixFromCache = [this, logThisFrame](int reg) -> std::pair<Matrix4, bool> {
+        if (reg < 0 || reg >= 256) return {Matrix4(), false};
+
+        // First try the cache
+        if (g_hasMatrixAtRegister[reg]) {
+          return {g_cachedMatricesByRegister[reg], true};
+        }
+
+        // Cache miss - try reading directly from D3D9 VS constant state
+        // This handles cases where the game sets constants but our cache wasn't populated
+        float matrixData[16];
+        const auto& vsConsts = d3d9State().vsConsts;
+        if (reg + 4 <= 256) {  // Need 4 consecutive registers for a 4x4 matrix
+          // Read 4 float4 registers (c[reg] through c[reg+3])
+          for (int i = 0; i < 4; i++) {
+            const auto& vec = vsConsts.fConsts[reg + i];
+            matrixData[i*4 + 0] = vec.x;
+            matrixData[i*4 + 1] = vec.y;
+            matrixData[i*4 + 2] = vec.z;
+            matrixData[i*4 + 3] = vec.w;
+          }
+
+          Matrix4 directMatrix(
+            matrixData[0], matrixData[1], matrixData[2], matrixData[3],
+            matrixData[4], matrixData[5], matrixData[6], matrixData[7],
+            matrixData[8], matrixData[9], matrixData[10], matrixData[11],
+            matrixData[12], matrixData[13], matrixData[14], matrixData[15]
+          );
+
+          // Check if it's a valid (non-zero, non-identity) matrix
+          float sum = std::abs(matrixData[0]) + std::abs(matrixData[5]) + std::abs(matrixData[10]);
+
+          // DEBUG: Always log what we found for key registers (NO LIMIT)
+          if (logThisFrame && (reg == 0 || reg == 4 || reg == 48)) {
+            Logger::info(str::format("[MATRIX-D3D9-STATE] c", reg, " sum=", sum, " valid=", (sum > 0.01f),
+              "\n  row0=[", matrixData[0], ",", matrixData[1], ",", matrixData[2], ",", matrixData[3], "]",
+              "\n  row1=[", matrixData[4], ",", matrixData[5], ",", matrixData[6], ",", matrixData[7], "]",
+              "\n  row3=[", matrixData[12], ",", matrixData[13], ",", matrixData[14], ",", matrixData[15], "]"));
+          }
+
+          if (sum > 0.01f) {
+            // Cache it for future use
+            g_cachedMatricesByRegister[reg] = directMatrix;
+            g_hasMatrixAtRegister[reg] = true;
+            return {directMatrix, true};
+          }
+        }
+
+        return {Matrix4(), false};
+      };
+
+      // First, try to get matrix registers from current shader's analysis
+      int viewReg = -1;
+      int projReg = -1;
+      int wvpReg = -1;  // viewProj or worldViewProj - need to derive projection from this
+      int worldReg = -1;  // World matrix register for objectToWorld transform
+      static uint32_t s_shaderLookupLogCount = 0;
+
+      // PRIMARY: Use pre-scanned defaults from decompiled_shaders directory
+      // These are available immediately at startup - no async delay
+      if (auto* compatManager = m_shaderCompatibilityManager.get()) {
+        if (compatManager->hasDefaultMatrixRegisters()) {
+          compatManager->getDefaultMatrixRegisters(viewReg, projReg, worldReg, wvpReg);
+
+          static bool s_loggedDefaults = false;
+          if (!s_loggedDefaults) {
+            Logger::info(str::format("[MATRIX-REGS] Using pre-scanned defaults: view=c", viewReg,
+              " proj=c", projReg, " world=c", worldReg, " wvp=c", wvpReg));
+            s_loggedDefaults = true;
+          }
+        }
+      }
+
+      // ONE CLEAR PATH: Extract all matrices from cache
+      // Shader analysis tells us registers, SetVertexShaderConstantF populates the cache
+      if (viewReg >= 0 || wvpReg >= 0) {
+        auto [viewMatrix, hasView] = getMatrixFromCache(viewReg);
+        auto [viewProjMatrix, hasViewProj] = getMatrixFromCache(wvpReg);
+        auto [projMatrix, hasProj] = getMatrixFromCache(projReg);
+
+        if (logThisFrame) {
+          Logger::info(str::format("[MATRIX-EXTRACT] viewReg=c", viewReg, " hasView=", hasView,
+            " wvpReg=c", wvpReg, " hasViewProj=", hasViewProj,
+            " projReg=c", projReg, " hasProj=", hasProj));
+        }
+
+        // View matrix extraction
+        // Some games store camera position separately at c8 (vs_worldCamPos)
+        // If view matrix has no translation but we have cached camera position, use it
+        // Check if view matrix is TRUE identity (all 4 rows must match identity)
+        // row0=[1,0,0,0], row1=[0,1,0,0], row2=[0,0,1,0], row3=[0,0,0,1]
+        // IMPORTANT: row3 must be (0,0,0,1) - any Z translation means it's a real view transform!
+        bool isIdentityLikeView = (
+          // Row 0: [1, 0, 0, 0]
+          std::abs(viewMatrix[0][0] - 1.0f) < 0.01f &&
+          std::abs(viewMatrix[0][1]) < 0.01f &&
+          std::abs(viewMatrix[0][2]) < 0.01f &&
+          std::abs(viewMatrix[0][3]) < 0.01f &&
+          // Row 1: [0, 1, 0, 0]
+          std::abs(viewMatrix[1][0]) < 0.01f &&
+          std::abs(viewMatrix[1][1] - 1.0f) < 0.01f &&
+          std::abs(viewMatrix[1][2]) < 0.01f &&
+          std::abs(viewMatrix[1][3]) < 0.01f &&
+          // Row 2: [0, 0, 1, 0]
+          std::abs(viewMatrix[2][0]) < 0.01f &&
+          std::abs(viewMatrix[2][1]) < 0.01f &&
+          std::abs(viewMatrix[2][2] - 1.0f) < 0.01f &&
+          std::abs(viewMatrix[2][3]) < 0.01f &&
+          // Row 3: [0, 0, 0, 1] - translation must be zero!
+          std::abs(viewMatrix[3][0]) < 0.01f &&
+          std::abs(viewMatrix[3][1]) < 0.01f &&
+          std::abs(viewMatrix[3][2]) < 0.01f &&
+          std::abs(viewMatrix[3][3] - 1.0f) < 0.01f
+        );
+
+        if (hasView && isValidMatrix(viewMatrix) && !isIdentityLikeView) {
+          // Real view matrix with camera transform
+          Matrix4 finalView = viewMatrix;
+
+          // Check if view matrix has minimal translation and we have camera position
+          float viewTransMag = std::sqrt(viewMatrix[3][0]*viewMatrix[3][0] +
+                                         viewMatrix[3][1]*viewMatrix[3][1] +
+                                         viewMatrix[3][2]*viewMatrix[3][2]);
+
+          if (viewTransMag < 10.0f && g_hasCachedCameraPosition) {
+            // View matrix is rotation-only, incorporate camera position from c8
+            // View = Rotation * Translate(-camPos)
+            Vector3 camPos(g_cachedCameraPosition.x, g_cachedCameraPosition.y, g_cachedCameraPosition.z);
+
+            // Build translation matrix for -camPos
+            Matrix4 translateNeg(
+              1, 0, 0, 0,
+              0, 1, 0, 0,
+              0, 0, 1, 0,
+              -camPos.x, -camPos.y, -camPos.z, 1
+            );
+
+            // Final view = rotation (from c4) * translate(-camPos)
+            finalView = viewMatrix * translateNeg;
+
+            if (logThisFrame) {
+              Logger::info(str::format("[VIEW-CAMPOS] Using camera pos from c8: (", camPos.x, ", ", camPos.y, ", ", camPos.z, ")",
+                "\n  Original view trans: ", viewTransMag,
+                "\n  Final view row3: ", finalView[3]));
+            }
+          }
+
+          transformData.worldToView = finalView;
+          s_cachedView = finalView;
+          s_cachedViewReg = viewReg;
+          extractedFromShader = true;
+        } else if (isIdentityLikeView && hasViewProj && isValidMatrix(viewProjMatrix)) {
+          // View is identity - use identity view matrix
+          // This is common when game uses combined viewProj at c0 without separate view matrix
+          transformData.worldToView = Matrix4(
+            1, 0, 0, 0,
+            0, 1, 0, 0,
+            0, 0, 1, 0,
+            0, 0, 0, 1
+          );
+          s_cachedView = transformData.worldToView;
+          s_cachedViewReg = viewReg;
+          extractedFromShader = true;
+
+          if (logThisFrame) {
+            Logger::info("[VIEW-IDENTITY] Using identity view matrix (view register contains identity)");
+          }
+        }
+
+        // Projection extraction - either direct, from viewProj, or use viewProj directly
+        bool gotProjection = false;
+        if (hasProj && isValidMatrix(projMatrix)) {
+          // Direct projection matrix available
+          transformData.viewToProjection = projMatrix;
+          s_cachedProj = projMatrix;
+          s_cachedProjReg = projReg;
+          gotProjection = true;
+        } else if (hasViewProj && isValidMatrix(viewProjMatrix)) {
+          // No direct projection - derive from viewProj
+
+          // Check if view is identity-like - if so, viewProj IS the projection matrix
+          // viewProj = view * proj, and if view = identity, then viewProj = proj
+          if (isIdentityLikeView || !extractedFromShader) {
+            // Use viewProj directly as projection since view is identity
+            transformData.viewToProjection = viewProjMatrix;
+            s_cachedProj = viewProjMatrix;
+            s_cachedProjReg = wvpReg;
+            gotProjection = true;
+
+            if (logThisFrame) {
+              Logger::info(str::format("[PROJ-DIRECT] Using viewProj directly as projection (view is identity)",
+                "\n  viewProj row0=", viewProjMatrix[0],
+                "\n  viewProj row1=", viewProjMatrix[1],
+                "\n  viewProj row2=", viewProjMatrix[2],
+                "\n  viewProj row3=", viewProjMatrix[3]));
+            }
+          } else {
+            // View is not identity - need to extract projection from viewProj
+            // viewProj = view * proj, so proj = inverse(view) * viewProj
+            // IMPORTANT: Use the ORIGINAL viewMatrix, not the camera-position-modified one!
+            // The viewProj was built as (raw_view * proj), so we need inverse(raw_view)
+
+            // Check if RAW view is a pure Z-translation matrix: [1,0,0,0], [0,1,0,0], [0,0,1,0], [0,0,tz,1]
+            // This is common in games where camera is offset along view axis
+            float tz = viewMatrix[3][2];  // Z-translation from ORIGINAL view matrix
+            bool isZTranslation = (
+              std::abs(viewMatrix[0][0] - 1.0f) < 0.01f &&
+              std::abs(viewMatrix[1][1] - 1.0f) < 0.01f &&
+              std::abs(viewMatrix[2][2] - 1.0f) < 0.01f &&
+              std::abs(viewMatrix[3][3] - 1.0f) < 0.01f &&
+              std::abs(viewMatrix[3][0]) < 0.01f &&
+              std::abs(viewMatrix[3][1]) < 0.01f
+            );
+
+            Matrix4 extractedProj;
+
+            if (isZTranslation && std::abs(tz) > 0.001f) {
+              // View is a Z-translation matrix with tz offset
+              // inverse(view) has [3][2] = -tz
+              // proj = inverse(view) * viewProj
+              // For Z-translation: proj[i] = viewProj[i] for i<3, proj[3] = viewProj[3] - tz*viewProj[2]
+
+              // Get actual screen aspect ratio and correct scaleX to match
+              // The game's projection may be built for a different internal aspect ratio
+              float screenAspect = (m_activePresentParams && m_activePresentParams->BackBufferHeight > 0)
+                ? (float)m_activePresentParams->BackBufferWidth / (float)m_activePresentParams->BackBufferHeight
+                : 16.0f / 9.0f;
+
+              // Correct scaleX based on actual screen aspect ratio
+              // Keep scaleY (vertical FOV), recalculate scaleX = scaleY / screenAspect
+              float scaleY = std::abs(viewProjMatrix[1][1]);
+              float correctedScaleX = scaleY / screenAspect;
+
+              extractedProj = Matrix4(
+                correctedScaleX, viewProjMatrix[0][1], viewProjMatrix[0][2], viewProjMatrix[0][3],
+                viewProjMatrix[1][0], viewProjMatrix[1][1], viewProjMatrix[1][2], viewProjMatrix[1][3],
+                viewProjMatrix[2][0], viewProjMatrix[2][1], viewProjMatrix[2][2], viewProjMatrix[2][3],
+                viewProjMatrix[3][0] - tz*viewProjMatrix[2][0],
+                viewProjMatrix[3][1] - tz*viewProjMatrix[2][1],
+                viewProjMatrix[3][2] - tz*viewProjMatrix[2][2],
+                viewProjMatrix[3][3] - tz*viewProjMatrix[2][3]
+              );
+
+              // Mark this as reliable since Z-translation extraction is accurate
+              s_hasReliableProj = true;
+
+              if (logThisFrame) {
+                Logger::info(str::format("[PROJ-EXTRACTED] Extracted from Z-translation view (tz=", tz, ") - RELIABLE",
+                  "\n  screenAspect=", screenAspect, " origScaleX=", viewProjMatrix[0][0], " correctedScaleX=", correctedScaleX,
+                  "\n  proj row0=", extractedProj[0],
+                  "\n  proj row1=", extractedProj[1],
+                  "\n  proj row2=", extractedProj[2],
+                  "\n  proj row3=", extractedProj[3]));
+              }
+            } else if (s_hasReliableProj) {
+              // We have a reliable projection from a previous Z-translation extraction
+              // Use it instead of constructing a potentially wrong one
+              extractedProj = s_cachedProj;
+
+              if (logThisFrame) {
+                Logger::info(str::format("[PROJ-REUSED] Using cached reliable projection from Z-translation",
+                  "\n  proj row0=", extractedProj[0],
+                  "\n  proj row1=", extractedProj[1]));
+              }
+            } else {
+              // General case: view is a rotation matrix, need to extract proj properly
+              // For viewProj = view * proj where view is orthonormal rotation:
+              // viewProj column length = proj scale (since rotation preserves length)
+              // scaleX = length(viewProj column 0), scaleY = length(viewProj column 1)
+
+              // Column 0: [viewProj[0][0], viewProj[1][0], viewProj[2][0]]
+              float col0LenSq = viewProjMatrix[0][0]*viewProjMatrix[0][0] +
+                                viewProjMatrix[1][0]*viewProjMatrix[1][0] +
+                                viewProjMatrix[2][0]*viewProjMatrix[2][0];
+              // Column 1: [viewProj[0][1], viewProj[1][1], viewProj[2][1]]
+              float col1LenSq = viewProjMatrix[0][1]*viewProjMatrix[0][1] +
+                                viewProjMatrix[1][1]*viewProjMatrix[1][1] +
+                                viewProjMatrix[2][1]*viewProjMatrix[2][1];
+
+              float scaleX = std::sqrt(col0LenSq);
+              float scaleY = std::sqrt(col1LenSq);
+
+              // Sanity bounds
+              if (scaleX < 0.1f || scaleX > 100.0f) scaleX = 1.7f;
+              if (scaleY < 0.1f || scaleY > 100.0f) scaleY = 2.4f;
+
+              // Extract near/far from viewProj row 2 and row 3
+              // viewProj[2][2] = view_rotated * [0,0,zf/(zf-zn),0] -> length = zf/(zf-zn)
+              // viewProj[3][2] = translation contribution - harder to extract
+              // Use reasonable defaults but try to get near from viewProj[3][2]/viewProj[2][2]
+              float nearPlane = 0.1f;
+              float farPlane = 10000.0f;
+
+              // For row2 column2, we need the length of column 2 which has the z scale
+              float col2LenSq = viewProjMatrix[0][2]*viewProjMatrix[0][2] +
+                                viewProjMatrix[1][2]*viewProjMatrix[1][2] +
+                                viewProjMatrix[2][2]*viewProjMatrix[2][2];
+              float zScale = std::sqrt(col2LenSq);  // = far/(far-near)
+
+              // row3 col2 contains: -(near*far)/(far-near) transformed by view translation
+              // For simplicity, estimate from the ratio if zScale is reasonable
+              if (zScale > 0.5f && zScale < 10.0f) {
+                // zScale = far/(far-near), typical for far=10000, near=0.1 -> zScale ~= 1.00001
+                // Can't easily extract near/far without more info, keep defaults
+              }
+
+              extractedProj = Matrix4(
+                scaleX, 0, 0, 0,
+                0, scaleY, 0, 0,
+                0, 0, farPlane / (farPlane - nearPlane), 1,
+                0, 0, -nearPlane * farPlane / (farPlane - nearPlane), 0
+              );
+
+              if (logThisFrame) {
+                Logger::info(str::format("[PROJ-CONSTRUCTED] scaleX=", scaleX, " scaleY=", scaleY,
+                  " from col0Len=", std::sqrt(col0LenSq), " col1Len=", std::sqrt(col1LenSq),
+                  " viewProj[0][0]=", viewProjMatrix[0][0], " viewProj[1][1]=", viewProjMatrix[1][1]));
+              }
+            }
+
+            transformData.viewToProjection = extractedProj;
+            s_cachedProj = extractedProj;
+            s_cachedProjReg = wvpReg;
+            gotProjection = true;
+          }
+        }
+
+        // If extraction succeeded, update cache flag
+        // If extraction failed BUT we have previously cached camera, use that
+        if (extractedFromShader || gotProjection) {
+          s_hasCachedCamera = true;
+        } else if (s_hasCachedCamera) {
+          // Cache was empty this frame but we have previously cached camera - use it
+          transformData.worldToView = s_cachedView;
+          transformData.viewToProjection = s_cachedProj;
+          extractedFromShader = true;
+          gotProjection = true;
+        }
+
+        if (logThisFrame) {
+          Logger::info(str::format("[CAMERA-EXTRACTED] extractedView=", extractedFromShader, " gotProj=", gotProjection,
+            " usedCached=", s_hasCachedCamera,
+            "\n  view row3=", transformData.worldToView[3],
+            "\n  proj row0=", transformData.viewToProjection[0]));
+        }
+      }
+
+      // Extract world matrix for per-object transform (changes per draw call)
+      if (worldReg >= 0) {
+        auto [worldMatrix, hasWorld] = getMatrixFromCache(worldReg);
+
+        if (hasWorld && isValidMatrix(worldMatrix)) {
+          // Check if this is an aspect-ratio-baked scale matrix
+          // Some games (like Lego Batman 2) bake aspect ratio into the world matrix
+          // e.g., X=1.4, Y=0.79 gives ratio 1.77 ≈ 16:9
+          // RTX Remix's projection already handles aspect ratio, so we need to remove it
+
+          float scaleX = std::abs(worldMatrix[0][0]);
+          float scaleY = std::abs(worldMatrix[1][1]);
+          float scaleZ = std::abs(worldMatrix[2][2]);
+
+          // Check if this is a scale-only matrix (no rotation in off-diagonals)
+          bool isScaleOnly =
+            std::abs(worldMatrix[0][1]) < 0.001f && std::abs(worldMatrix[0][2]) < 0.001f &&
+            std::abs(worldMatrix[1][0]) < 0.001f && std::abs(worldMatrix[1][2]) < 0.001f &&
+            std::abs(worldMatrix[2][0]) < 0.001f && std::abs(worldMatrix[2][1]) < 0.001f;
+
+          // Check if translation is zero
+          bool noTranslation =
+            std::abs(worldMatrix[3][0]) < 0.001f &&
+            std::abs(worldMatrix[3][1]) < 0.001f &&
+            std::abs(worldMatrix[3][2]) < 0.001f;
+
+          // Check if X/Y ratio matches common aspect ratios (16:9 ≈ 1.77, 4:3 ≈ 1.33)
+          float xyRatio = (scaleY > 0.001f) ? scaleX / scaleY : 0.0f;
+          bool isAspectRatioScale = (xyRatio > 1.7f && xyRatio < 1.85f) ||  // 16:9
+                                    (xyRatio > 1.28f && xyRatio < 1.38f);   // 4:3
+
+          Matrix4 finalWorld = worldMatrix;
+
+          // RE-ENABLED: RTX Remix's projection already handles aspect ratio
+          // So we need to remove the aspect ratio from world matrix to avoid double-application
+          if (isScaleOnly && noTranslation && isAspectRatioScale) {
+            finalWorld = Matrix4(
+              1.0f, 0.0f, 0.0f, 0.0f,
+              0.0f, 1.0f, 0.0f, 0.0f,
+              0.0f, 0.0f, 1.0f, 0.0f,
+              0.0f, 0.0f, 0.0f, 1.0f
+            );
+
+            static uint32_t s_aspectFixLogCount = 0;
+            if (s_aspectFixLogCount++ < 50) {
+              Logger::info(str::format("[WORLD-ASPECT-FIX] Removed aspect scale: X=", scaleX, " Y=", scaleY, " ratio=", xyRatio));
+            }
+          }
+
+          transformData.objectToWorld = finalWorld;
+
+          static uint32_t s_worldLogCount = 0;
+          if (s_worldLogCount++ < 20) {
+            Logger::info(str::format("[WORLD-MATRIX] Extracted from c", worldReg,
+              "\n  row0=", worldMatrix[0],
+              "\n  row3=", worldMatrix[3]));
+          }
+        }
+      }
+
+      // FALLBACK: If shader constant extraction failed, use fixed-function transforms
+      // The game may use identity matrices in D3D9 state but have real camera elsewhere
+      if (!extractedFromShader && ffViewValid && !isIdentityExact(ffView)) {
+        transformData.worldToView = ffView;
+        extractedFromShader = true;
+        if (logThisFrame) {
+          Logger::info(str::format("[FALLBACK] Using fixed-function VIEW matrix"));
+        }
+      }
+
+      if (ffProjValid && !isIdentityExact(ffProj)) {
+        // Check if projection looks real (not identity)
+        if (ffProj[0][0] != 1.0f || ffProj[1][1] != 1.0f) {
+          transformData.viewToProjection = ffProj;
+          if (logThisFrame) {
+            Logger::info(str::format("[FALLBACK] Using fixed-function PROJECTION matrix"));
+          }
+        }
+      }
+
+    }
+
+    // NV-DXVK end
+
     transformData.objectToView = transformData.worldToView * transformData.objectToWorld;
 
-    // NV-DXVK start: Debug camera matrix capture
-    static uint32_t s_cameraMatrixLogCount = 0;
-    if (s_cameraMatrixLogCount++ < 5) {
-      Logger::info(str::format("[CAMERA-MATRIX-CAPTURE] Frame ", s_cameraMatrixLogCount,
-                               "\n  worldToView[0]=", transformData.worldToView[0],
-                               "\n  worldToView[1]=", transformData.worldToView[1],
-                               "\n  worldToView[2]=", transformData.worldToView[2],
-                               "\n  worldToView[3]=", transformData.worldToView[3],
-                               "\n  viewToProjection[0]=", transformData.viewToProjection[0],
-                               "\n  viewToProjection[1]=", transformData.viewToProjection[1],
-                               "\n  viewToProjection[2]=", transformData.viewToProjection[2],
-                               "\n  viewToProjection[3]=", transformData.viewToProjection[3]));
+    // NV-DXVK start: UNLIMITED per-frame logging
+    static uint32_t s_lastLoggedFrame = UINT32_MAX;
+    uint32_t currentFrame = m_parent->GetDXVKDevice()->getCurrentFrameId();
+    if (currentFrame != s_lastLoggedFrame) {
+      s_lastLoggedFrame = currentFrame;
+      Logger::info(str::format("[FRAME-MATRICES] Frame=", currentFrame,
+        " extracted=", extractedFromShader,
+        "\n  VIEW row0=[", transformData.worldToView[0][0], ",", transformData.worldToView[0][1], ",", transformData.worldToView[0][2], ",", transformData.worldToView[0][3], "]",
+        "\n  VIEW row3=[", transformData.worldToView[3][0], ",", transformData.worldToView[3][1], ",", transformData.worldToView[3][2], ",", transformData.worldToView[3][3], "]",
+        "\n  PROJ row0=[", transformData.viewToProjection[0][0], ",", transformData.viewToProjection[0][1], ",", transformData.viewToProjection[0][2], ",", transformData.viewToProjection[0][3], "]",
+        "\n  PROJ row1=[", transformData.viewToProjection[1][0], ",", transformData.viewToProjection[1][1], ",", transformData.viewToProjection[1][2], ",", transformData.viewToProjection[1][3], "]",
+        "\n  WORLD row0=[", transformData.objectToWorld[0][0], ",", transformData.objectToWorld[0][1], ",", transformData.objectToWorld[0][2], ",", transformData.objectToWorld[0][3], "]"));
     }
     // NV-DXVK end
 
@@ -573,10 +1090,17 @@ namespace dxvk {
 
     if (!s_isDxvkResolutionEnvVarSet) {
       // NOTE: This can fail when setting DXVK_RESOLUTION_WIDTH or HEIGHT
-      const bool isPrimary = isRenderTargetPrimary(*m_activePresentParams, d3d9State().renderTargets[kRenderTargetIndex]->GetCommonTexture()->Desc());
+      const auto* rtDesc = d3d9State().renderTargets[kRenderTargetIndex]->GetCommonTexture()->Desc();
+      const bool isPrimary = isRenderTargetPrimary(*m_activePresentParams, rtDesc);
+
+      Logger::info(str::format("[RT-PRIMARY-CHECK] BackBuffer=", m_activePresentParams->BackBufferWidth, "x", m_activePresentParams->BackBufferHeight,
+                               " RenderTarget=", rtDesc->Width, "x", rtDesc->Height,
+                               " PrimCount=", drawContext.PrimitiveCount,
+                               " PrimType=", (int)drawContext.PrimitiveType,
+                               " isPrimary=", isPrimary ? "YES" : "NO"));
 
       if (!isPrimary) {
-        ONCE(Logger::info("[RTX-Compatibility-Info] Found a draw call to a non-primary, non-raytraced render target. Falling back to rasterization"));
+        Logger::info(str::format("[RT-RASTERIZE-FALLBACK] Rasterizing ", drawContext.PrimitiveCount, " primitives to ", rtDesc->Width, "x", rtDesc->Height));
         return { RtxGeometryStatus::Rasterized, false };
       }
     }
@@ -1436,6 +1960,17 @@ namespace dxvk {
         if (!alreadyCaptured) {
           D3D9CommonTexture* pTexInfo = GetCommonTexture(d3d9State().textures[stage]);
           if (pTexInfo && (pTexInfo->GetType() == D3DRTYPE_TEXTURE || pTexInfo->GetType() == D3DRTYPE_CUBETEXTURE)) {
+            // Skip depth/stencil textures - they produce black when sampled as color
+            const VkFormat texFormat = pTexInfo->GetImage()->info().format;
+            const bool isDepthFormat = (texFormat == VK_FORMAT_D16_UNORM ||
+                                       texFormat == VK_FORMAT_D24_UNORM_S8_UINT ||
+                                       texFormat == VK_FORMAT_D32_SFLOAT ||
+                                       texFormat == VK_FORMAT_D32_SFLOAT_S8_UINT ||
+                                       texFormat == VK_FORMAT_D16_UNORM_S8_UINT);
+            if (isDepthFormat) {
+              continue;  // Skip depth textures for shader capture
+            }
+
             const bool srgb = d3d9State().samplerStates[stage][D3DSAMP_SRGBTEXTURE] & 0x1;
             auto shaderSampler = RemapStateSamplerShader(stage);
             uint32_t stageSlot = computeResourceSlotId(shaderSampler.first, DxsoBindingType::Image, uint32_t(shaderSampler.second));
@@ -1805,6 +2340,97 @@ namespace dxvk {
                                 m_activeDrawCallState.pixelShaderConstantData[180].z, ", ",
                                 m_activeDrawCallState.pixelShaderConstantData[180].w, ")"));
       }
+      // SHADER-BASED LIGHT INJECTION
+      // LEGO Batman 2 shaders expect lighting in c32-35 but game never calls SetLight
+      // Detect these constants and inject RTX lights automatically
+      static uint64_t shaderLightFrameCounter = 0;
+      static uint64_t lastInjectionFrame = UINT64_MAX;
+      shaderLightFrameCounter++;
+
+      // Reset injection flag every 1000 draw calls (approximate frame boundary)
+      if (shaderLightFrameCounter - lastInjectionFrame > 1000) {
+        m_shaderLightsInjectedThisFrame = false;
+      }
+
+      if (!m_shaderLightsInjectedThisFrame && m_activeDrawCallState.pixelShaderConstantData.size() > 35) {
+        const Vector4& lightColor0 = m_activeDrawCallState.pixelShaderConstantData[32];
+        const Vector4& lightColor1 = m_activeDrawCallState.pixelShaderConstantData[33];
+        const Vector4& lightDir0 = m_activeDrawCallState.pixelShaderConstantData[34];
+        const Vector4& lightDir1 = m_activeDrawCallState.pixelShaderConstantData[35];
+
+        auto isZero = [](const Vector4& v) {
+          return v.x == 0.0f && v.y == 0.0f && v.z == 0.0f;
+        };
+
+        // Check if game has NO D3D9 lights enabled
+        bool hasD3D9Lights = false;
+        for (auto idx : d3d9State().enabledLightIndices) {
+          if (idx != UINT32_MAX) {
+            hasD3D9Lights = true;
+            break;
+          }
+        }
+
+        // If no D3D9 lights and shader expects lighting, inject synthetic lights
+        if (!hasD3D9Lights) {
+          std::vector<D3DLIGHT9> syntheticLights;
+
+          // Create light 0 - main directional light
+          D3DLIGHT9 light0 = {};
+          light0.Type = D3DLIGHT_DIRECTIONAL;
+          if (!isZero(lightColor0) && !isZero(lightDir0)) {
+            // Use shader constants if available
+            light0.Diffuse = { lightColor0.x, lightColor0.y, lightColor0.z, lightColor0.w };
+            light0.Direction = { lightDir0.x, lightDir0.y, lightDir0.z };
+            Logger::info(str::format("[SHADER-LIGHT] Using shader constants for light0: color=(",
+              lightColor0.x, ",", lightColor0.y, ",", lightColor0.z, ") dir=(",
+              lightDir0.x, ",", lightDir0.y, ",", lightDir0.z, ")"));
+          } else {
+            // Default sun-like light from above-front
+            light0.Diffuse = { 1.0f, 0.95f, 0.9f, 1.0f };
+            light0.Direction = { -0.3f, -0.8f, 0.5f };
+            Logger::info("[SHADER-LIGHT] Injecting default light0 (sun-like directional)");
+          }
+          light0.Ambient = { 0.1f, 0.1f, 0.15f, 1.0f };
+          light0.Specular = { 0.8f, 0.8f, 0.8f, 1.0f };
+          syntheticLights.push_back(light0);
+
+          // Create light 1 - fill light
+          D3DLIGHT9 light1 = {};
+          light1.Type = D3DLIGHT_DIRECTIONAL;
+          if (!isZero(lightColor1) && !isZero(lightDir1)) {
+            light1.Diffuse = { lightColor1.x, lightColor1.y, lightColor1.z, lightColor1.w };
+            light1.Direction = { lightDir1.x, lightDir1.y, lightDir1.z };
+            Logger::info(str::format("[SHADER-LIGHT] Using shader constants for light1: color=(",
+              lightColor1.x, ",", lightColor1.y, ",", lightColor1.z, ") dir=(",
+              lightDir1.x, ",", lightDir1.y, ",", lightDir1.z, ")"));
+          } else {
+            // Default fill light from the side
+            light1.Diffuse = { 0.3f, 0.35f, 0.4f, 1.0f };
+            light1.Direction = { 0.7f, -0.2f, -0.6f };
+            Logger::info("[SHADER-LIGHT] Injecting default light1 (fill directional)");
+          }
+          light1.Ambient = { 0.05f, 0.05f, 0.08f, 1.0f };
+          light1.Specular = { 0.3f, 0.3f, 0.3f, 1.0f };
+          syntheticLights.push_back(light1);
+
+          // Add the lights to RTX
+          if (!syntheticLights.empty()) {
+            m_parent->EmitCs([syntheticLights](DxvkContext* ctx) {
+              static_cast<RtxContext*>(ctx)->addLights(syntheticLights.data(), syntheticLights.size());
+            });
+            m_shaderLightsInjectedThisFrame = true;
+            lastInjectionFrame = shaderLightFrameCounter;
+            Logger::info(str::format("[SHADER-LIGHT] Injected ", syntheticLights.size(), " synthetic lights at draw #", shaderLightFrameCounter));
+          }
+        } else {
+          // Log why we didn't inject (only first few times)
+          static uint32_t noInjectLogCount = 0;
+          if (noInjectLogCount++ < 5) {
+            Logger::info(str::format("[SHADER-LIGHT] Not injecting: hasD3D9Lights=", hasD3D9Lights));
+          }
+        }
+      }
     } else {
       m_activeDrawCallState.pixelShaderConstantData.clear();
       Logger::info("[PS-CONST-CAPTURE] No pixel shader - constants cleared");
@@ -1949,14 +2575,32 @@ namespace dxvk {
       }
     }
 
+    // DEBUG: Log capture result BEFORE validation
+    static uint32_t captureResultLog = 0;
+    const uint32_t finalVertCount = m_activeDrawCallState.geometryData.vertexCount;
+    const size_t streamCount = m_activeDrawCallState.capturedVertexStreams.size();
+    if (finalVertCount > 6 && captureResultLog++ < 50) {
+      Logger::info(str::format("[CAPTURE-RESULT] verts=", finalVertCount, " capturedStreams=", streamCount,
+        " BEFORE shouldCaptureStatic check"));
+    }
+
     // CRITICAL FIX: Validate VS constants AFTER vertex buffer capture completes
     // If matrices are invalid (all zeros), clear ALL captured data to mark it as invalid
     // But DON'T return early - we've already done the capture work
     if (!ShaderOutputCapturer::shouldCaptureStatic(m_activeDrawCallState)) {
+      if (finalVertCount > 6 && captureResultLog < 100) {
+        Logger::warn(str::format("[CAPTURE-CLEARED] verts=", finalVertCount, " streamCount=", streamCount,
+          " - shouldCaptureStatic returned FALSE, clearing captured data!"));
+      }
       m_activeDrawCallState.vertexShaderConstantData.clear();
       m_activeDrawCallState.capturedVertexStreams.clear();
       m_activeDrawCallState.capturedVertexElements.clear();
       m_activeDrawCallState.originalIndexData.clear();
+    } else {
+      if (finalVertCount > 6 && captureResultLog < 100) {
+        Logger::info(str::format("[CAPTURE-KEPT] verts=", finalVertCount, " streamCount=", streamCount,
+          " - shouldCaptureStatic returned TRUE, keeping captured data"));
+      }
     }
   }
 
@@ -1964,13 +2608,26 @@ namespace dxvk {
     // OPTIMIZATION: Quick check before expensive buffer copies
     // Only copy buffers if this draw call will actually be captured for shader re-execution
 
+    // DEBUG: Log all calls with geometry info
+    static uint32_t shouldCaptureLog = 0;
+    const uint32_t vertCount = m_activeDrawCallState.geometryData.vertexCount;
+    const bool logThis = (vertCount > 6 && shouldCaptureLog++ < 50);
+
     // Requirement 1: Must have both vertex and pixel shaders
     if (state.vertexShader == nullptr || state.pixelShader == nullptr) {
+      if (logThis) {
+        Logger::info(str::format("[SHOULD-CAPTURE-BUFFERS] verts=", vertCount,
+          " REJECTED: missing shader (VS=", state.vertexShader != nullptr,
+          " PS=", state.pixelShader != nullptr, ")"));
+      }
       return false;
     }
 
     // Requirement 2: Must have vertex declaration
     if (state.vertexDecl == nullptr) {
+      if (logThis) {
+        Logger::info(str::format("[SHOULD-CAPTURE-BUFFERS] verts=", vertCount, " REJECTED: no vertex declaration"));
+      }
       return false;
     }
 
@@ -1979,7 +2636,14 @@ namespace dxvk {
     // This prevents hundreds of expensive buffer locks/copies per frame for cached materials.
     const bool needsCapture = ShaderOutputCapturer::shouldCaptureStatic(m_activeDrawCallState);
     if (!needsCapture) {
+      if (logThis) {
+        Logger::info(str::format("[SHOULD-CAPTURE-BUFFERS] verts=", vertCount, " REJECTED: shouldCaptureStatic=false"));
+      }
       return false;
+    }
+
+    if (logThis) {
+      Logger::info(str::format("[SHOULD-CAPTURE-BUFFERS] verts=", vertCount, " ACCEPTED!"));
     }
 
     // All checks passed - worth capturing buffers

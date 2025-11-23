@@ -244,16 +244,24 @@ namespace dxvk {
   ShaderMatrixInfo HlslDecompilerBridge::parseMatrixUsage(const std::string& hlsl, const std::string& asm_code) {
     ShaderMatrixInfo info;
 
-    // Common matrix naming patterns in shaders
+    static uint32_t s_parseLogCount = 0;
+    bool shouldLog = (s_parseLogCount++ < 5);
+
+    if (shouldLog) {
+      Logger::info(str::format("[PARSE-MATRIX] HLSL length=", hlsl.length(), " ASM length=", asm_code.length()));
+    }
+
+    // Common matrix naming patterns in shaders - ORDER MATTERS! More specific first
     std::vector<std::tuple<std::string, int*>> matrixPatterns = {
-      {"world", &info.worldMatrixRegister},
-      {"view", &info.viewMatrixRegister},
-      {"projection", &info.projectionMatrixRegister},
-      {"proj", &info.projectionMatrixRegister},
-      {"worldview", &info.worldViewMatrixRegister},
       {"worldviewproj", &info.worldViewProjMatrixRegister},
       {"worldviewprojection", &info.worldViewProjMatrixRegister},
       {"wvp", &info.worldViewProjMatrixRegister},
+      {"worldview", &info.worldViewMatrixRegister},
+      {"viewproj", &info.worldViewProjMatrixRegister},  // viewProj goes to wvp slot
+      {"projection", &info.projectionMatrixRegister},
+      {"proj", &info.projectionMatrixRegister},
+      {"world", &info.worldMatrixRegister},
+      {"view", &info.viewMatrixRegister},
     };
 
     // Parse constant declarations to find matrices
@@ -272,17 +280,51 @@ namespace dxvk {
 
       int registerNum = registerStr.empty() ? -1 : std::stoi(registerStr);
 
+      if (shouldLog) {
+        Logger::info(str::format("[PARSE-MATRIX] Found float4x4 '", matrixName, "' at register c", registerNum));
+      }
+
       // Match against known patterns
       for (const auto& [pattern, targetReg] : matrixPatterns) {
         if (matrixNameLower.find(pattern) != std::string::npos) {
           if (*targetReg == -1) {
             *targetReg = registerNum;
+            if (shouldLog) {
+              Logger::info(str::format("[PARSE-MATRIX]   -> Matched pattern '", pattern, "', set to c", registerNum));
+            }
           }
           break;
         }
       }
 
       searchStart = match.suffix().first;
+    }
+
+    // Detect viewProj from ASM: look for 4-register matrix multiply that outputs to o0 (position)
+    // Pattern: mul/mad with c0-c3 followed by mov o0, result
+    if (info.worldViewProjMatrixRegister == -1) {
+      // Look for pattern: mad/mul operations followed by "mov o0"
+      // The register block used right before "mov o0" is likely viewProj
+      std::regex positionOutput(R"((?:mul|mad)\s+(\w+),.*c(\d+).*\n(?:(?:mul|mad)\s+\1,.*c(\d+).*\n)*.*mov\s+o0,\s*\1)", std::regex::icase);
+      std::smatch posMatch;
+
+      if (std::regex_search(asm_code, posMatch, positionOutput)) {
+        int reg = std::stoi(posMatch[2].str());
+        int alignedReg = reg / 4 * 4;  // Align to 4-register boundary
+        info.worldViewProjMatrixRegister = alignedReg;
+        if (shouldLog) {
+          Logger::info(str::format("[PARSE-MATRIX] Detected viewProj at c", alignedReg, " from position output pattern"));
+        }
+      } else {
+        // Fallback: look for c0-c3 usage pattern (common viewProj location)
+        std::regex c0c3Pattern(R"((?:mul|mad)\s+\w+,.*c0.*\n.*(?:mul|mad)\s+\w+,.*c1.*\n.*(?:mul|mad)\s+\w+,.*c2.*\n.*(?:mul|mad)\s+\w+,.*c3)", std::regex::icase);
+        if (std::regex_search(asm_code, c0c3Pattern)) {
+          info.worldViewProjMatrixRegister = 0;
+          if (shouldLog) {
+            Logger::info("[PARSE-MATRIX] Detected viewProj at c0 from c0-c3 consecutive usage pattern");
+          }
+        }
+      }
     }
 
     // If we couldn't find matrices by name, try to infer from ASM

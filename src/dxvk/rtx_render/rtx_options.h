@@ -471,7 +471,7 @@ namespace dxvk {
     RTX_OPTION_ENV("rtx", float, cameraAnimationAmplitude, 2.0f, "RTX_FREE_CAMERA_ANIMATION_AMPLITUDE", "Amplitude of the free camera's animation.");
     RTX_OPTION("rtx", bool, skipObjectsWithUnknownCamera, false, "");
     RTX_OPTION("rtx", bool, forceCameraValid, false, "Force camera validation to always succeed, bypassing all camera checks. Use when Remix fails to detect valid camera matrices.");
-    RTX_OPTION("rtx", bool, injectFakeCamera, false, "Inject a fake default camera when no valid camera is detected. Useful for games with non-standard camera setups.");
+    RTX_OPTION("rtx", bool, injectFakeCamera, true, "Inject a fake default camera when no valid camera is detected. Useful for games with non-standard camera setups.");
     RTX_OPTION("rtx", bool, allowFreeCameraOverride, false, "When enabled, allows manual adjustment of free camera settings while fake camera is active. Otherwise, free camera is locked with default position.");
     
     // Fake camera parameters
@@ -480,7 +480,7 @@ namespace dxvk {
     RTX_OPTION("rtx", float, fakeCameraPitch, 0.0f, "Pitch rotation of the fake camera in radians. Positive values look up.");
     RTX_OPTION("rtx", float, fakeCameraRoll, 0.0f, "Roll rotation of the fake camera in radians. Positive values tilt clockwise.");
     RTX_OPTION("rtx", float, fakeCameraFOV, 1.5708f, "Field of view of the fake camera in radians (default: 90 degrees = 1.5708 radians).");
-    RTX_OPTION("rtx", float, fakeCameraAspectRatio, 1.0f, "Aspect ratio of the fake camera (default: 16:9 = 1.7778).");
+    RTX_OPTION("rtx", float, fakeCameraAspectRatio, 1.7778f, "Aspect ratio of the fake camera (default: 16:9 = 1.7778).");
     RTX_OPTION("rtx", float, fakeCameraNearPlane, 0.1f, "Near plane distance of the fake camera.");
     RTX_OPTION("rtx", float, fakeCameraFarPlane, 1000.0f, "Far plane distance of the fake camera.");
     

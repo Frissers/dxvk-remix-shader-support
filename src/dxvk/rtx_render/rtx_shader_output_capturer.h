@@ -156,6 +156,18 @@ namespace dxvk {
 
     void createDummyResources(const Rc<DxvkDevice>& device);
 
+    // Shadow sampler detection from decompiled shaders
+    // Maps shader hash -> bitmask of sampler stages that use texldp (shadow/projective sampling)
+    mutable std::unordered_map<uint64_t, uint32_t> m_shadowSamplerCache;
+    mutable std::mutex m_shadowSamplerCacheMutex;
+
+    // Parse decompiled shader file to find shadow sampler stages (texldp instructions)
+    // Returns bitmask where bit N = 1 means sampler sN uses shadow/projective sampling
+    uint32_t parseShadowSamplersFromDecompiledShader(uint64_t shaderHash) const;
+
+    // Get shadow sampler mask for a shader (cached)
+    uint32_t getShadowSamplerMask(uint64_t shaderHash) const;
+
     // Helper to get cache key for a draw call
     // For RT replacements, use source texture hash; for RT feedback, use originalRT hash; otherwise use material hash
     // Returns a pair: (cacheKey, isValid)
@@ -287,6 +299,7 @@ namespace dxvk {
       // SHADER DATA (Rc-counted, safe to copy)
       Rc<DxvkShader> vertexShader;    // Original vertex shader
       Rc<DxvkShader> pixelShader;     // Original pixel shader
+      uint64_t pixelShaderBytecodeHash = 0;  // XXH64 hash of D3D9 PS bytecode (for decompiler lookup)
 
       // Shader bytecode is now analyzed by ShaderCompatibilityManager at shader creation time
 

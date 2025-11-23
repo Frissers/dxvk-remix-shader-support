@@ -99,6 +99,31 @@ public:
    */
   bool isDetectedRenderTarget(uint64_t textureHash) const;
 
+  /**
+   * \brief Get cached matrix registers from any analyzed shader with valid matrices
+   * Scans all analyzed shaders and returns the first one with viewMatrixRegister >= 0
+   * \param outViewReg Output: view matrix register (or -1 if none found)
+   * \param outProjReg Output: projection matrix register (or -1 if none found)
+   * \param outWorldReg Output: world matrix register (or -1 if none found)
+   * \param outWvpReg Output: worldViewProj matrix register (or -1 if none found)
+   * \returns true if a shader with valid matrix registers was found
+   */
+  bool findAnyShaderWithMatrixRegisters(int& outViewReg, int& outProjReg, int& outWorldReg, int& outWvpReg) const;
+
+  /**
+   * \brief Get default matrix registers from pre-scanned shaders
+   */
+  void getDefaultMatrixRegisters(int& outViewReg, int& outProjReg, int& outWorldReg, int& outWvpReg) const {
+    outViewReg = m_defaultViewReg;
+    outProjReg = m_defaultProjReg;
+    outWorldReg = m_defaultWorldReg;
+    outWvpReg = m_defaultWvpReg;
+  }
+
+  bool hasDefaultMatrixRegisters() const {
+    return m_defaultViewReg >= 0 || m_defaultWorldReg >= 0 || m_defaultWvpReg >= 0;
+  }
+
 private:
   struct PendingShader {
     uint64_t hash;
@@ -135,6 +160,15 @@ private:
   // Start/stop background processing
   void startBackgroundProcessing();
   void stopBackgroundProcessing();
+
+  // Pre-scan decompiled shaders on startup
+  void prescanDecompiledShaders();
+
+  // Default matrix registers from pre-scanned shaders
+  int m_defaultViewReg = -1;
+  int m_defaultProjReg = -1;
+  int m_defaultWorldReg = -1;
+  int m_defaultWvpReg = -1;
 };
 
 } // namespace dxvk

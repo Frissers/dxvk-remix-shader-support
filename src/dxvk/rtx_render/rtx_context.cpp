@@ -1009,6 +1009,31 @@ namespace dxvk {
       const MaterialData* overrideMaterialData = nullptr;
       bakeTerrain(params, drawCallState, &overrideMaterialData);
 
+      // DEBUG: Log ALL draws to understand what's reaching this point
+      {
+        static uint32_t allDrawsLog = 0;
+        const uint32_t vertCount = drawCallState.getGeometryData().vertexCount;
+        const uint32_t idxCount = drawCallState.getGeometryData().indexCount;
+        const bool hasVS = drawCallState.vertexShader != nullptr;
+        const bool hasPS = drawCallState.pixelShader != nullptr;
+        const bool hasCapturedStreams = !drawCallState.capturedVertexStreams.empty();
+        const bool hasOverride = overrideMaterialData != nullptr;
+
+        // Log all draws with significant geometry (more than 6 verts = not fullscreen)
+        if (vertCount > 6 && allDrawsLog++ < 100) {
+          Logger::info(str::format("[ALL-DRAWS-DEBUG] verts=", vertCount, " idx=", idxCount,
+            " hasVS=", hasVS, " hasPS=", hasPS,
+            " hasCapturedStreams=", hasCapturedStreams, " hasOverride=", hasOverride,
+            " streamCount=", drawCallState.capturedVertexStreams.size()));
+        }
+
+        // Also log if we have captured streams but something else is blocking
+        if (hasCapturedStreams && allDrawsLog < 150) {
+          Logger::info(str::format("[CAPTURED-STREAM-DEBUG] verts=", vertCount,
+            " hasOverride=", hasOverride, " willEnterCapture=", (!hasOverride && hasVS && hasPS)));
+        }
+      }
+
       // Check if shader re-execution is needed for captured buffers
       // Skip re-execution for UI shaders (they should pass through without processing)
       if (overrideMaterialData == nullptr &&
