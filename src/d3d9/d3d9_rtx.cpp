@@ -295,6 +295,7 @@ namespace dxvk {
     // Upload
     auto& data = *reinterpret_cast<D3D9RtxVertexCaptureData*>(constants.mapPtr);
 
+    /* COMMENTED OUT - new aspect ratio fix not in Bored commit
     // ASPECT RATIO FIX FOR SHADER CAPTURE:
     // When shader reexecution is enabled, we need to inverse-transform clip-space positions
     // back to object space. If the game's projection has wrong aspect ratio, the captured
@@ -335,6 +336,9 @@ namespace dxvk {
     }
 
     data.invProj = inverse(correctedProj);
+    */
+    // OLD CODE from Bored commit:
+    data.invProj = inverse(m_activeDrawCallState.transformData.viewToProjection);
     data.viewToWorld = inverseAffine(m_activeDrawCallState.transformData.worldToView);
     data.worldToObject = inverseAffine(m_activeDrawCallState.transformData.objectToWorld);
     data.normalTransform = m_activeDrawCallState.transformData.objectToWorld;
@@ -467,6 +471,7 @@ namespace dxvk {
     transformData.worldToView = d3d9State().transforms[GetTransformIndex(D3DTS_VIEW)];
     transformData.viewToProjection = d3d9State().transforms[GetTransformIndex(D3DTS_PROJECTION)];
 
+    /* COMMENTED OUT - matrix extraction not in Bored commit
     // NV-DXVK start: Extract camera matrices from vertex shader constants when using programmable VS
     // This is needed for games that use vertex shaders for transforms instead of fixed-function
     //
@@ -961,9 +966,11 @@ namespace dxvk {
     }
 
     // NV-DXVK end
+    */
 
     transformData.objectToView = transformData.worldToView * transformData.objectToWorld;
 
+    /* ALSO COMMENTED OUT - logging references extractedFromShader
     // NV-DXVK start: UNLIMITED per-frame logging
     static uint32_t s_lastLoggedFrame = UINT32_MAX;
     uint32_t currentFrame = m_parent->GetDXVKDevice()->getCurrentFrameId();
@@ -978,6 +985,7 @@ namespace dxvk {
         "\n  WORLD row0=[", transformData.objectToWorld[0][0], ",", transformData.objectToWorld[0][1], ",", transformData.objectToWorld[0][2], ",", transformData.objectToWorld[0][3], "]"));
     }
     // NV-DXVK end
+    */
 
     // Some games pass invalid matrices which D3D9 apparently doesnt care about.
     // since we'll be doing inversions and other matrix operations, we need to 
