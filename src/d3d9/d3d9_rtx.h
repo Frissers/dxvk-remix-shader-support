@@ -3,6 +3,7 @@
 #include "d3d9_state.h"
 #include "../dxvk/dxvk_buffer.h"
 #include "../util/util_threadpool.h"
+#include "../dxvk/rtx_render/rtx_shader_compatibility_manager.h"
 
 #include <vector>
 #include <optional>
@@ -34,6 +35,12 @@ namespace dxvk {
     friend class ImGUI; // <-- we want to modify these values directly.
 
     D3D9Rtx(D3D9DeviceEx* d3d9Device, bool enableDrawCallConversion = true);
+    ~D3D9Rtx();
+
+    /**
+     * \brief Get the shader compatibility manager (for shader decompilation)
+     */
+    ShaderCompatibilityManager* getShaderCompatibilityManager() { return m_shaderCompatibilityManager.get(); }
 
     RTX_OPTION("rtx", bool, orthographicIsUI, true, "When enabled, draw calls that are orthographic will be considered as UI.");
     RTX_OPTION("rtx", bool, allowCubemaps, false, "When enabled, cubemaps from the game are processed through Remix, but they may not render correctly.");
@@ -175,10 +182,11 @@ namespace dxvk {
       return m_reflexFrameId;
     }
 
-  private: 
+  private:
     inline static const uint32_t kMaxConcurrentDraws = 6 * 1024; // some games issuing >3000 draw calls per frame...  account for some consumer thread lag with x2
     using GeometryProcessor = WorkerThreadPool<kMaxConcurrentDraws>;
     const std::unique_ptr<GeometryProcessor> m_pGeometryWorkers;
+    std::unique_ptr<ShaderCompatibilityManager> m_shaderCompatibilityManager;
     AtomicQueue<DrawCallState, kMaxConcurrentDraws> m_drawCallStateQueue;
 
     DrawCallState m_activeDrawCallState;
@@ -203,6 +211,8 @@ namespace dxvk {
     const bool m_enableDrawCallConversion;
     bool m_rtxInjectTriggered = false;
     bool m_forceGeometryCopy = false;
+    bool m_shaderLightsInjectedThisFrame = false;
+    uint64_t m_lastShaderLightInjectionFrame = 0;
     DWORD m_texcoordIndex = 0;
 
     int m_activeOcclusionQueries = 0;

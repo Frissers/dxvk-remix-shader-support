@@ -4,6 +4,7 @@
 #include "d3d9_device.h"
 #include "d3d9_util.h"
 #include "../dxvk/dxvk_scoped_annotation.h"
+#include "../dxvk/rtx_render/rtx_shader_compatibility_manager.h"
 
 
 namespace dxvk {
@@ -24,7 +25,13 @@ namespace dxvk {
 
     const std::string name = Key.toString();
     Logger::debug(str::format("Compiling shader ", name));
-    
+
+    // Submit shader for async compatibility analysis (processed by background workers)
+    auto shaderHash = XXH64(pShaderBytecode, bytecodeLength, 0);
+    if (auto* manager = pDevice->RTX().getShaderCompatibilityManager()) {
+      manager->submitShaderForAsyncAnalysis(shaderHash, pShaderBytecode, bytecodeLength, ShaderStage);
+    }
+
     // If requested by the user, dump both the raw DXBC
     // shader and the compiled SPIR-V module to a file.
     const std::string dumpPath = env::getEnvVar("DXVK_SHADER_DUMP_PATH");

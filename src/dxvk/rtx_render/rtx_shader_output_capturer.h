@@ -87,7 +87,8 @@ namespace dxvk {
     bool hasReplacementTexture(XXH64_hash_t originalTextureHash) const;
 
     // Called at start of frame
-    void onFrameBegin(Rc<RtxContext> ctx);
+    // isCameraValid: only execute captures when camera is valid to avoid capturing with garbage matrices
+    void onFrameBegin(Rc<RtxContext> ctx, bool isCameraValid);
 
     // Called at end of frame
     void onFrameEnd();
@@ -145,6 +146,29 @@ namespace dxvk {
       "These will be re-captured periodically based on recaptureInterval.");
 
   private:
+    // Dummy resources for robust binding
+    Rc<DxvkImageView> m_dummyTexture;
+    Rc<DxvkSampler>   m_dummySampler;
+    // Dummy depth texture for shadow/comparison samplers
+    Rc<DxvkImageView> m_dummyDepthTexture;
+    Rc<DxvkImage>     m_dummyDepthImage;  // Store the image for layout transitions
+    Rc<DxvkSampler>   m_dummyShadowSampler;
+    bool              m_dummyDepthLayoutInitialized = false;
+
+    void createDummyResources(const Rc<DxvkDevice>& device);
+
+    // Shadow sampler detection from decompiled shaders
+    // Maps shader hash -> bitmask of sampler stages that use texldp (shadow/projective sampling)
+    mutable std::unordered_map<uint64_t, uint32_t> m_shadowSamplerCache;
+    mutable std::mutex m_shadowSamplerCacheMutex;
+
+    // Parse decompiled shader file to find shadow sampler stages (texldp instructions)
+    // Returns bitmask where bit N = 1 means sampler sN uses shadow/projective sampling
+    uint32_t parseShadowSamplersFromDecompiledShader(uint64_t shaderHash) const;
+
+    // Get shadow sampler mask for a shader (cached)
+    uint32_t getShadowSamplerMask(uint64_t shaderHash) const;
+
     // Helper to get cache key for a draw call
     // For RT replacements, use source texture hash; for RT feedback, use originalRT hash; otherwise use material hash
     // Returns a pair: (cacheKey, isValid)
@@ -162,18 +186,16 @@ namespace dxvk {
                                   " originalRTHash=0x", std::hex, drawCallState.originalRenderTargetHash, std::dec));
         }
         if (replacementTexture.isValid()) {
-          // CRITICAL FIX: Cache key should only depend on WHAT is rendered (replacement texture + material hash),
-          // NOT on WHERE it's rendered (originalRT). Same replacement texture + same material = same shader output!
-          // This enables proper deduplication: 556 draws with same material share ONE cached texture.
+          // CRITICAL FIX: Use full geometry hash to differentiate draws with same replacement texture
           XXH64_hash_t replacementHash = replacementTexture.getImageHash();
-          XXH64_hash_t materialHash = drawCallState.getMaterialData().getHash();
+          XXH64_hash_t geomHash = drawCallState.getGeometryData().getHashForRule<rules::FullGeometryHash>();
 
-          // Combine replacement texture with material hash for uniqueness
-          XXH64_hash_t combinedHash = XXH64(&materialHash, sizeof(XXH64_hash_t), replacementHash);
+          // Combine replacement texture with geometry hash for uniqueness
+          XXH64_hash_t combinedHash = XXH64(&geomHash, sizeof(geomHash), replacementHash);
 
           if (shouldLog) {
             Logger::info(str::format("[getCacheKey] RT REPLACEMENT: replacement=0x", std::hex, replacementHash,
-                                    " material=0x", materialHash,
+                                    " geomHash=0x", geomHash,
                                     " = combined=0x", combinedHash, std::dec));
           }
           return {combinedHash, true};
@@ -184,30 +206,27 @@ namespace dxvk {
         return {0, false}; // Invalid RT replacement
       }
       // Check for render target feedback case: no replacement found but slot 0 was a render target
-      // For RT feedback, the originalRT hash IS the relevant identifier (which RT is being read)
+      // For RT feedback, use full geometry hash to differentiate draws
       if (drawCallState.originalRenderTargetHash != 0) {
-        XXH64_hash_t materialHash = drawCallState.getMaterialData().getHash();
-        // Combine originalRT with material to differentiate different materials using same RT
-        XXH64_hash_t combinedHash = XXH64(&materialHash, sizeof(XXH64_hash_t), drawCallState.originalRenderTargetHash);
+        XXH64_hash_t geomHash = drawCallState.getGeometryData().getHashForRule<rules::FullGeometryHash>();
+        // Combine originalRT with geometry hash to differentiate draws
+        XXH64_hash_t combinedHash = XXH64(&geomHash, sizeof(geomHash), drawCallState.originalRenderTargetHash);
 
         if (shouldLog) {
           Logger::info(str::format("[getCacheKey] RT FEEDBACK: originalRT=0x", std::hex, drawCallState.originalRenderTargetHash,
-                                  " material=0x", materialHash,
+                                  " geomHash=0x", geomHash,
                                   " = combined=0x", combinedHash, std::dec));
         }
         return {combinedHash, true};
       }
-      // For regular materials, combine geometry + material to prevent collisions
-      // CRITICAL FIX: Materials with hash=0 were colliding! Use vertex/index count as unique seed
-      // This ensures same geometry + different materials get different cache keys
+      // For regular materials, combine geometry hash + material hash
       XXH64_hash_t matHash = drawCallState.getMaterialData().getHash();
-      const auto& geom = drawCallState.getGeometryData();
-      uint64_t geomSeed = (uint64_t(geom.vertexCount) << 32) | uint64_t(geom.indexCount);
-      // Combine: hash material with geometry seed (vertexCount+indexCount never both zero)
-      XXH64_hash_t combinedHash = (geomSeed != 0) ? XXH64(&matHash, sizeof(XXH64_hash_t), geomSeed) : (matHash + 1);
+      XXH64_hash_t geomHash = drawCallState.getGeometryData().getHashForRule<rules::FullGeometryHash>();
+      // Combine: geometry hash with material hash for uniqueness
+      XXH64_hash_t combinedHash = XXH64(&matHash, sizeof(XXH64_hash_t), geomHash);
       if (shouldLog) {
         Logger::info(str::format("[getCacheKey] REGULAR MATERIAL: matHash=0x", std::hex, matHash,
-                                " geomSeed=0x", geomSeed,
+                                " geomHash=0x", geomHash,
                                 " combined=0x", combinedHash, std::dec));
       }
       return {combinedHash, true};
@@ -260,6 +279,7 @@ namespace dxvk {
       VkExtent2D resolution;          // Capture resolution
       uint32_t flags;                 // Capture flags (indexed, dynamic, etc.)
       bool isDynamic = false;         // Is this a dynamic material?
+      bool isRTReplacement = false;   // Is this an RT replacement (view-dependent, never cache)?
 
       // GEOMETRY DATA (Rc-counted, safe to copy)
       DxvkBufferSlice vertexBuffer;   // Position buffer
@@ -273,6 +293,29 @@ namespace dxvk {
       // TEXTURE DATA (Rc-counted, safe to copy)
       TextureRef colorTexture;        // Primary color texture
 
+      // SHADER DATA (Rc-counted, safe to copy)
+      Rc<DxvkShader> vertexShader;    // Original vertex shader
+      Rc<DxvkShader> pixelShader;     // Original pixel shader
+      uint64_t pixelShaderBytecodeHash = 0;  // XXH64 hash of D3D9 PS bytecode (for decompiler lookup)
+
+      // Shader bytecode is now analyzed by ShaderCompatibilityManager at shader creation time
+
+      // SHADER CONSTANT DATA (copied from DrawCallState)
+      std::vector<Vector4> vertexShaderConstantData;   // VS uniforms (transforms, etc.)
+      std::vector<Vector4> pixelShaderConstantData;    // PS uniforms (colors, etc.)
+
+      // TEXTURE AND SAMPLER DATA (copied from DrawCallState)
+      struct CapturedTexture {
+        TextureRef texture;         // Texture image view
+        Rc<DxvkSampler> sampler;   // Sampler state
+        uint32_t slot = 0;         // Texture slot (0-15)
+      };
+      std::vector<CapturedTexture> textures;  // All bound textures + samplers
+
+      // Bitmask of texture slots that require depth textures (shadow samplers)
+      // Bit N set = slot N expects depth comparison texture
+      uint32_t depthTextureMask = 0;
+
       // VIEWPORT/SCISSOR STATE
       VkViewport viewport;
       VkRect2D scissor;
@@ -285,6 +328,28 @@ namespace dxvk {
       uint32_t replacementVertexStride = 0;
       uint32_t replacementTexcoordStride = 0;
       VkIndexType replacementIndexType = VK_INDEX_TYPE_NONE_KHR;
+
+      // ORIGINAL VERTEX STREAM SUPPORT (for using original game shaders)
+      // When using original game VS, we need the original vertex layout, not separated buffers
+      struct OriginalVertexStream {
+        Rc<DxvkBuffer> buffer;       // GPU buffer with original vertex data
+        uint32_t streamIndex = 0;    // D3D9 stream index (binding slot)
+        uint32_t stride = 0;         // Bytes per vertex
+        uint32_t offset = 0;         // Offset into buffer
+      };
+      std::vector<OriginalVertexStream> originalVertexStreams;
+
+      // Vertex elements for building input layout (copied from CapturedVertexElement)
+      struct OriginalVertexElement {
+        uint16_t stream = 0;
+        uint16_t offset = 0;
+        uint8_t type = 0;       // D3DDECLTYPE
+        uint8_t method = 0;
+        uint8_t usage = 0;      // D3DDECLUSAGE
+        uint8_t usageIndex = 0;
+      };
+      std::vector<OriginalVertexElement> originalVertexElements;
+      bool useOriginalVertexLayout = false;  // If true, use originalVertexStreams instead of separated buffers
     };
 
     // Indirect Draw Args - filled by GPU compute shader
@@ -339,7 +404,8 @@ namespace dxvk {
     void executeMultiIndirectCaptures(Rc<RtxContext> ctx);
 
     // Helper functions for maximum performance batching
-    void setCommonPipelineState(Rc<RtxContext> ctx, const GpuCaptureRequest& request);
+    void setCommonPipelineState(Rc<RtxContext> ctx, const GpuCaptureRequest& request,
+                                uint32_t rtWidth, uint32_t rtHeight);
     void bindGeometryBuffers(Rc<RtxContext> ctx, const GpuCaptureRequest& request);
 
     // Per-frame capture counter
