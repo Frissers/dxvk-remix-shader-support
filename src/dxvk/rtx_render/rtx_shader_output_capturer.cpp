@@ -894,35 +894,48 @@ namespace dxvk {
           }
         }
 
-        // CRITICAL FIX: If c[0]-c[3] is identity, inject orthographic projection
-        // The game's vertices are in range ~(-5 to +5) but identity matrix means they
-        // pass through unchanged and get clipped (NDC is -1 to +1).
-        // Inject a scale matrix to map vertex range to NDC.
+        // Copy constants
         std::vector<Vector4> modifiedConstants = firstRequest.vertexShaderConstantData;
 
-        // DEBUG: Log what we're checking
-        static uint32_t orthoCheckCount = 0;
-        if (++orthoCheckCount <= 5 && modifiedConstants.size() >= 2) {
-          Logger::info(str::format("[VS-CONST-FIX-CHECK] c[0]=(",
-            modifiedConstants[0].x, ",", modifiedConstants[0].y, ",", modifiedConstants[0].z, ",", modifiedConstants[0].w,
-            ") c[1]=(", modifiedConstants[1].x, ",", modifiedConstants[1].y, ",", modifiedConstants[1].z, ",", modifiedConstants[1].w, ")"));
+        // For RT replacement (view-dependent) draws: DON'T adjust c81
+        // We're rendering at original viewport resolution, so c81 should stay at original values
+        // For non-RT replacement draws: adjust c81 to match capture RT size
+        if (!firstRequest.isRTReplacement && modifiedConstants.size() > 81) {
+          const float rtWidth = static_cast<float>(group.resolution.width);
+          const float rtHeight = static_cast<float>(group.resolution.height);
+          Vector4 oldC81 = modifiedConstants[81];
+          modifiedConstants[81] = Vector4(rtWidth, rtHeight, 1.0f / rtWidth, 1.0f / rtHeight);
+
+          static uint32_t c81FixCount = 0;
+          if (++c81FixCount <= 20) {
+            Logger::info(str::format("[C81-FIX] Adjusted viewport constant: old=(", oldC81.x, ",", oldC81.y, ",", oldC81.z, ",", oldC81.w,
+              ") -> new=(", modifiedConstants[81].x, ",", modifiedConstants[81].y, ",", modifiedConstants[81].z, ",", modifiedConstants[81].w, ")"));
+          }
+        } else if (firstRequest.isRTReplacement) {
+          static uint32_t rtRepC81Log = 0;
+          if (++rtRepC81Log <= 10) {
+            const Vector4 c81 = (modifiedConstants.size() > 81) ? modifiedConstants[81] : Vector4(0,0,0,0);
+            Logger::info(str::format("[RT-REP-C81] Keeping original c81=(", c81.x, ",", c81.y, ",", c81.z, ",", c81.w,
+              ") for view-dependent draw, rtSize=", group.resolution.width, "x", group.resolution.height));
+          }
         }
 
-        bool c0IsIdentity = (modifiedConstants.size() >= 2 &&
-                            modifiedConstants[0].x == 1.0f && modifiedConstants[0].y == 0.0f &&
-                            modifiedConstants[1].x == 0.0f && modifiedConstants[1].y == 1.0f);
-        if (c0IsIdentity && modifiedConstants.size() >= 4) {
-          // Scale matrix: map ~(-6 to +6) to (-1 to +1) => scale by 1/6
-          // Also flip Y for D3D9 coordinate system
-          const float scale = 0.15f;  // ~1/6.5 to ensure coverage
-          modifiedConstants[0] = Vector4(scale, 0.0f, 0.0f, 0.0f);   // Row 0
-          modifiedConstants[1] = Vector4(0.0f, -scale, 0.0f, 0.0f);  // Row 1 (Y flipped)
-          modifiedConstants[2] = Vector4(0.0f, 0.0f, 1.0f, 0.0f);    // Row 2
-          modifiedConstants[3] = Vector4(0.0f, 0.0f, 0.0f, 1.0f);    // Row 3
-          static uint32_t orthoInjectCount = 0;
-          if (++orthoInjectCount <= 5) {
-            Logger::info(str::format("[VS-CONST-FIX] Injected orthographic projection scale=", scale,
-              " to map vertex range to NDC"));
+        // DIAGNOSTIC: Log the constants we're using
+        static uint32_t ovalDiagCount = 0;
+        if (++ovalDiagCount <= 50) {
+          const Vector4 c81 = (modifiedConstants.size() > 81) ? modifiedConstants[81] : Vector4(0,0,0,0);
+          Logger::info(str::format("[OVAL-DIAG] texHash=0x", std::hex, group.textureHash, std::dec,
+            " c81=(", c81.x, ",", c81.y, ",", c81.z, ",", c81.w, ")",
+            " isRTRep=", firstRequest.isRTReplacement ? "YES" : "NO",
+            " rtSize=", group.resolution.width, "x", group.resolution.height));
+
+          // Log first few VS constants (transform matrix)
+          if (modifiedConstants.size() >= 4) {
+            Logger::info(str::format("[OVAL-DIAG] c[0-3] transform: ",
+              "c0=(", modifiedConstants[0].x, ",", modifiedConstants[0].y, ",", modifiedConstants[0].z, ",", modifiedConstants[0].w, ") ",
+              "c1=(", modifiedConstants[1].x, ",", modifiedConstants[1].y, ",", modifiedConstants[1].z, ",", modifiedConstants[1].w, ") ",
+              "c2=(", modifiedConstants[2].x, ",", modifiedConstants[2].y, ",", modifiedConstants[2].z, ",", modifiedConstants[2].w, ") ",
+              "c3=(", modifiedConstants[3].x, ",", modifiedConstants[3].y, ",", modifiedConstants[3].z, ",", modifiedConstants[3].w, ")"));
           }
         }
 
@@ -2097,7 +2110,18 @@ namespace dxvk {
     // In executeGpuCaptureBatched(), we detect this case and build a proper
     // screen-to-clip orthographic projection matrix instead.
 
-    // Always capture draws with render target replacement
+    // CRITICAL: Skip full-screen triangles (post-processing passes) FIRST
+    // These have 3 vertices and are used for screen-space effects, not actual geometry
+    const auto& geom = drawCallState.getGeometryData();
+    if (geom.vertexCount == 3 && geom.indexCount == 0) {
+      static uint32_t fsTriSkipLog = 0;
+      if (++fsTriSkipLog <= 10) {
+        Logger::info("[SKIP-FULLSCREEN] Skipping 3-vertex triangle (likely full-screen post-process pass)");
+      }
+      return false;
+    }
+
+    // Capture draws with render target replacement (but not full-screen passes)
     const bool hasRenderTargetReplacement = (drawCallState.renderTargetReplacementSlot >= 0);
     if (hasRenderTargetReplacement) {
       return true;
@@ -2114,12 +2138,77 @@ namespace dxvk {
       return true; // Capture all non-UI draws
     }
 
+    // CRITICAL FIX: Skip fullscreen quad / screen-space effects (vignettes, post-processing)
+    // These effects are rendered with screen-space UVs, but when captured and applied to
+    // 3D geometry with object-space UVs, they cause "sliding texture" artifacts when the
+    // camera moves. Detection criteria:
+    // 1. Identity viewToProjection matrix = no proper camera/projection (screen-space rendering)
+    // 2. Identity objectToWorld matrix = no world transform (direct screen rendering)
+    // 3. Very few vertices with no depth test = fullscreen quad overlay
+    // 4. Exactly 4 vertices with no depth write = fullscreen quad overlay (vignette pattern)
+    // 5. Material hash 0x0 = null/invalid material (often post-processing)
+    // 6. Low vertex count (<=24) = likely screen quad or simple overlay
+    {
+      const auto& transforms = drawCallState.getTransformData();
+      const bool hasIdentityProjection = isIdentityExact(transforms.viewToProjection);
+      const bool hasIdentityWorldTransform = isIdentityExact(transforms.objectToWorld);
+      const uint32_t vertexCount = drawCallState.getGeometryData().vertexCount;
+      const bool isLowVertexCount = (vertexCount <= 24);  // Expanded from 12 to catch more overlays
+      const bool noDepthTest = !drawCallState.zEnable;
+      const bool noDepthWrite = !drawCallState.zWriteEnable;
+      const bool isNullMaterial = (matHash == 0);  // Null/invalid materials are often post-processing
+
+      // Fullscreen quad detection: exactly 4 or 6 vertices with no depth write
+      // This catches vignettes and other screen overlays rendered through the 3D pipeline
+      const bool isFullscreenQuad = (vertexCount == 4 || vertexCount == 6) && noDepthWrite;
+
+      // Screen-space overlay detection: identity world transform + no depth write
+      // Objects with identity world transform and no depth write are almost always screen overlays
+      // (vignettes, post-processing effects, HUD elements) - even with many vertices
+      const bool isScreenOverlay = hasIdentityWorldTransform && noDepthWrite;
+
+      // Skip if this looks like a screen-space effect:
+      // Method 1: Identity projection = definitely screen-space (no camera transform)
+      // Method 2: Identity world transform = not positioned in world = screen-space overlay
+      // Method 3: No depth testing = almost certainly screen-space (catches zEnable=0 effects)
+      // Method 4: Fullscreen quad (4/6 verts) with no depth write = screen overlay
+      // Method 5: No depth write = likely screen-space overlay or effect
+      // Method 6: Null material hash = invalid/post-processing material
+      // Method 7: Low vertex count = likely screen overlay (quads, simple geometry)
+      if (hasIdentityProjection ||
+          hasIdentityWorldTransform ||  // ANY identity world = screen-space
+          noDepthTest ||  // ANY draw without depth test is screen-space
+          noDepthWrite ||  // ANY draw without depth write is likely screen-space
+          isFullscreenQuad ||
+          isNullMaterial ||  // Null materials are likely post-processing
+          isLowVertexCount) {  // Low vertex count likely screen overlay
+        static uint32_t s_screenSpaceSkipCount = 0;
+        if (++s_screenSpaceSkipCount <= 20) {
+          Logger::info(str::format("[SHADER-CAPTURE] Skipping screen-space effect: vertexCount=",
+            vertexCount, " zEnable=", drawCallState.zEnable, " zWrite=", drawCallState.zWriteEnable,
+            " identityProj=", hasIdentityProjection, " identityWorld=", hasIdentityWorldTransform,
+            " isFullscreenQuad=", isFullscreenQuad, " isNullMat=", isNullMaterial, " isLowVerts=", isLowVertexCount,
+            " matHash=0x", std::hex, matHash, std::dec));
+        }
+        return false;  // Skip screen-space effects
+      }
+    }
+
     // SIMPLIFIED: If shader capture is enabled, capture ALL materials (bypass hash whitelist)
     if (enableShaderOutputCapture()) {
       // PERF: Only log first 20 unique materials to avoid per-draw overhead
       static std::unordered_set<XXH64_hash_t> loggedMaterials;
-      if (loggedMaterials.size() < 20 && loggedMaterials.insert(matHash).second) {
-        Logger::info(str::format("[SHADER-CAPTURE] Allowing material hash 0x", std::hex, matHash, std::dec, " (capture enabled, accepting all)"));
+      if (loggedMaterials.size() < 30 && loggedMaterials.insert(matHash).second) {
+        const auto& transforms = drawCallState.getTransformData();
+        const uint32_t vertexCount = drawCallState.getGeometryData().vertexCount;
+        Logger::info(str::format("[SHADER-CAPTURE] Allowing material hash 0x", std::hex, matHash, std::dec,
+          " vertexCount=", vertexCount,
+          " zEnable=", drawCallState.zEnable,
+          " zWrite=", drawCallState.zWriteEnable,
+          " usesVS=", drawCallState.usesVertexShader,
+          " usesPS=", drawCallState.usesPixelShader,
+          " identityProj=", isIdentityExact(transforms.viewToProjection),
+          " identityWorld=", isIdentityExact(transforms.objectToWorld)));
       }
       return true;
     }
@@ -2197,7 +2286,19 @@ namespace dxvk {
                               hasRenderTargetReplacement ? "YES" : "NO", ") - proceeding with capture"));
     }
 
-    // Check if we already captured this material
+    // CRITICAL FIX: RT replacements are view-dependent (motion blur, etc.) - NEVER use cache for them
+    // They must re-capture every frame to match current camera position
+    if (hasRenderTargetReplacement) {
+      auto tEnd = std::chrono::high_resolution_clock::now();
+      double totalTime = std::chrono::duration<double, std::micro>(tEnd - tStart).count();
+      totalTimeUs += totalTime;
+      if (shouldLog) {
+        Logger::info(str::format("[PERF-shouldCapture] RT REPLACEMENT - SKIP CACHE (view-dependent): ", totalTime, " μs"));
+      }
+      return true;  // Always re-capture RT replacements
+    }
+
+    // Check if we already captured this material (non-RT-replacement only)
     auto tCacheLookup1Start = std::chrono::high_resolution_clock::now();
     auto it = m_capturedOutputs.find(cacheKey);
     auto tCacheLookup1End = std::chrono::high_resolution_clock::now();
@@ -2512,8 +2613,23 @@ namespace dxvk {
         return false; // Invalid key, skip
       }
 
-      // Check if already captured
+      // CRITICAL FIX: RT replacements are view-dependent (motion blur, etc.) - NEVER use cache for them
+      // They must re-capture every frame to match current camera position
+      const bool isRTReplacementDraw = (drawCallState.renderTargetReplacementSlot >= 0);
+
+      // Check if already captured (non-RT-replacement only - RT replacements skip cache entirely)
       auto it = m_capturedOutputs.find(cacheKey);
+      bool skipCacheDueToRTReplacement = false;
+
+      if (isRTReplacementDraw) {
+        static uint32_t rtReplCacheSkipCount = 0;
+        if (++rtReplCacheSkipCount <= 100) {
+          Logger::info(str::format("[GPU-RT-REPLACEMENT] #", rtReplCacheSkipCount,
+                                  " SKIP CACHE (view-dependent) cacheKey=0x", std::hex, cacheKey, std::dec,
+                                  " - will queue fresh capture"));
+        }
+        skipCacheDueToRTReplacement = true;  // Force cache miss for RT replacements
+      }
 
       static uint32_t cacheLookupCount = 0;
       if (++cacheLookupCount <= 100) {
@@ -2525,7 +2641,8 @@ namespace dxvk {
                                 " valid=", valid ? "YES" : "NO"));
       }
 
-      if (it != m_capturedOutputs.end() && it->second.capturedTexture.isValid()) {
+      // Skip cache lookup entirely for RT replacements (view-dependent, must re-capture every frame)
+      if (!skipCacheDueToRTReplacement && it != m_capturedOutputs.end() && it->second.capturedTexture.isValid()) {
         // CRITICAL FIX: Check if previous capture failed (hash == 0)
         // If so, skip cache and fall through to queue new capture
         XXH64_hash_t cachedHash = (it->second.capturedTexture.image != nullptr) ? it->second.capturedTexture.image->getHash() : 0;
@@ -2593,12 +2710,8 @@ namespace dxvk {
         Logger::info(str::format("[GPU-CACHE-MISS] cacheKey=0x", std::hex, cacheKey, std::dec, " - need to queue capture"));
       }
 
-      // CRITICAL FIX: Skip fullscreen triangle/quad draws (post-processing passes)
-      // These are not game geometry - they're screen-space effects that read from other textures.
-      // Fullscreen passes typically have:
-      // - 3 vertices (single triangle covering screen with overscan UVs)
-      // - 4 or 6 vertices (quad as triangle strip or two triangles)
-      // - 6 indices with 4 vertices (indexed quad)
+      // Skip fullscreen triangle/quad draws ONLY if they're NOT RT replacement draws
+      // RT replacements need capturing even though they use fullscreen triangles
       const uint32_t vertCount = drawCallState.getGeometryData().vertexCount;
       const uint32_t idxCount = drawCallState.getGeometryData().indexCount;
       const bool isFullscreenTriangle = (vertCount == 3 && idxCount == 0);
@@ -2609,11 +2722,14 @@ namespace dxvk {
       if (++vertCountLogCount <= 50) {
         Logger::info(str::format("[VERT-COUNT-DEBUG] vertCount=", vertCount, " idxCount=", idxCount,
           " isFullscreenTri=", isFullscreenTriangle, " isFullscreenQuad=", isFullscreenQuad,
+          " isRTRepl=", isRTReplacementDraw,
           " cacheKey=0x", std::hex, cacheKey, std::dec));
       }
 
-      if (isFullscreenTriangle || isFullscreenQuad) {
-        return false;  // Skip post-processing passes
+      // Skip fullscreen draws ONLY if NOT an RT replacement draw
+      // RT replacement draws ARE fullscreen triangles - that's how the game renders procedural textures
+      if ((isFullscreenTriangle || isFullscreenQuad) && !isRTReplacementDraw) {
+        return false;
       }
 
       // Queue new capture request - COPY ALL DATA (no pointers!)
@@ -2635,9 +2751,22 @@ namespace dxvk {
       request.vertexCount = geometryData.vertexCount;
       request.indexOffset = 0;
       request.indexCount = geometryData.indexCount;
-      request.resolution = calculateCaptureResolution(drawCallState);
+      // For RT replacement (view-dependent) draws, use original viewport resolution
+      // These shaders have view-dependent calculations that expect screen-space coordinates
+      if (isRTReplacementDraw) {
+        const uint32_t vpW = static_cast<uint32_t>(drawCallState.originalViewport.width);
+        const uint32_t vpH = static_cast<uint32_t>(drawCallState.originalViewport.height);
+        request.resolution = { vpW, vpH };
+        static uint32_t rtRepResLog = 0;
+        if (++rtRepResLog <= 10) {
+          Logger::info(str::format("[RT-REP-RESOLUTION] Using original viewport: ", vpW, "x", vpH));
+        }
+      } else {
+        request.resolution = calculateCaptureResolution(drawCallState);
+      }
       request.flags = (geometryData.indexCount > 0) ? 0x1 : 0x0;
       request.isDynamic = isDynamicMaterial(matHash);
+      request.isRTReplacement = isRTReplacementDraw;  // View-dependent, never cache
 
       // COPY GEOMETRY BUFFERS (Rc-counted, cheap to copy)
       request.vertexBuffer = geometryData.positionBuffer;
@@ -4368,16 +4497,31 @@ namespace dxvk {
     };
 
     // Bind vertex shader constants copied at Stage 2
-    // Cast Vector4 vector to uint8_t vector for the buffer creation
-    const std::vector<uint8_t> vsConstBytes(
-      reinterpret_cast<const uint8_t*>(drawCallState.vertexShaderConstantData.data()),
-      reinterpret_cast<const uint8_t*>(drawCallState.vertexShaderConstantData.data() + drawCallState.vertexShaderConstantData.size()));
-
     // NOTE: We no longer reject captures when VS constants c[0]-c[3] are zero.
     // Many D3D9 games use PRE-TRANSFORMED vertices (D3DFVF_XYZRHW) where vertices
     // are already in screen space and don't need a transformation matrix.
     // The executeGpuCaptureBatched() function handles this by building a proper
     // screen-to-clip orthographic projection matrix.
+
+    // FOOLPROOF APPROACH: Do NOT modify ANY shader constants including c[81]!
+    // The game's shader expects all constants exactly as they were set.
+    // Any modification causes oval distortion.
+    // We capture at original RT size with original viewport, so constants should stay unchanged.
+    std::vector<Vector4> modifiedVSConstants = drawCallState.vertexShaderConstantData;
+
+    // Log c[81] for debugging (but don't modify it!)
+    if (modifiedVSConstants.size() > 81) {
+      const Vector4& c81 = modifiedVSConstants[81];
+      static uint32_t c81LogCount = 0;
+      if (++c81LogCount <= 5) {
+        Logger::info(str::format("[VS-CONST-CPU] c[81] = (", c81.x, ", ", c81.y, ", ", c81.z, ", ", c81.w, ") - NOT MODIFIED"));
+      }
+    }
+
+    // Cast modified Vector4 vector to uint8_t vector for the buffer creation
+    const std::vector<uint8_t> vsConstBytes(
+      reinterpret_cast<const uint8_t*>(modifiedVSConstants.data()),
+      reinterpret_cast<const uint8_t*>(modifiedVSConstants.data() + modifiedVSConstants.size()));
 
     DxvkBufferSlice vsConstantSlice = createConstantBufferSlice(
       vsConstBytes,
@@ -4674,7 +4818,7 @@ namespace dxvk {
     return false;
   }
 
-  void ShaderOutputCapturer::onFrameBegin(Rc<RtxContext> ctx) {
+  void ShaderOutputCapturer::onFrameBegin(Rc<RtxContext> ctx, bool isCameraValid) {
     static uint32_t frameBeginCallCount = 0;
     ++frameBeginCallCount;
 
@@ -4682,6 +4826,7 @@ namespace dxvk {
     Logger::info(str::format("[FRAMEBEGIN-ENTRY] ========== onFrameBegin #", frameBeginCallCount,
                             " pendingRequests=", m_pendingCaptureRequests.size(),
                             " enableShaderOutputCapture=", enableShaderOutputCapture() ? "TRUE" : "FALSE",
+                            " isCameraValid=", isCameraValid ? "TRUE" : "FALSE",
                             " =========="));
 
     // GPU-DRIVEN CAPTURE SYSTEM: Lazy initialization on first frame
@@ -4712,10 +4857,13 @@ namespace dxvk {
       Logger::info(str::format("[FRAME-DELAY] Requests queued in frame ", s_requestsQueuedFrame, ", will execute in frame ", s_requestsQueuedFrame + 2));
     }
 
-    // Only execute if requests have been pending for at least 2 frames (GPU has caught up)
+    // Only execute if requests have been pending for at least N frames (GPU has caught up)
     const uint32_t frameDelay = 2;
     bool canExecute = s_hasQueuedRequests && (m_currentFrame >= s_requestsQueuedFrame + frameDelay);
 
+    // NOTE: Camera validity check removed - this game has identity camera for all D3D9 transforms
+    // The captures are for post-process effects (RT replacements) which don't need camera anyway
+    // The oval distortion issue needs to be solved differently (not by waiting for valid camera)
     if (enableShaderOutputCapture() && !m_pendingCaptureRequests.empty() && canExecute) {
       Logger::info(str::format("[ShaderCapture-GPU-EXEC] ========== EXECUTING ", m_pendingCaptureRequests.size(),
                               " queued captures (queued in frame ", s_requestsQueuedFrame, ", now frame ", m_currentFrame, ") =========="));

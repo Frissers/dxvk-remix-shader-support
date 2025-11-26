@@ -294,7 +294,47 @@ namespace dxvk {
 
     // Upload
     auto& data = *reinterpret_cast<D3D9RtxVertexCaptureData*>(constants.mapPtr);
-    data.invProj = inverse(m_activeDrawCallState.transformData.viewToProjection);
+
+    // ASPECT RATIO FIX FOR SHADER CAPTURE:
+    // When shader reexecution is enabled, we need to inverse-transform clip-space positions
+    // back to object space. If the game's projection has wrong aspect ratio, the captured
+    // geometry will be distorted.
+    //
+    // The fix: If the projection's aspect ratio is NOT a common widescreen ratio (16:9, 16:10, 21:9, 4:3),
+    // correct it to 16:9 since that's the most common modern display ratio.
+    Matrix4 correctedProj = m_activeDrawCallState.transformData.viewToProjection;
+    {
+      float projScaleX = std::abs(correctedProj[0][0]);
+      float projScaleY = std::abs(correctedProj[1][1]);
+      float projAspect = (projScaleX > 0.001f) ? projScaleY / projScaleX : 1.0f;
+
+      // Common aspect ratios to NOT correct (these are likely intentional):
+      // 16:9 = 1.777, 16:10 = 1.6, 21:9 = 2.333, 4:3 = 1.333
+      bool isCommonAspect =
+        (projAspect > 1.72f && projAspect < 1.83f) ||   // 16:9 range
+        (projAspect > 1.55f && projAspect < 1.65f) ||   // 16:10 range
+        (projAspect > 2.28f && projAspect < 2.40f) ||   // 21:9 range
+        (projAspect > 1.28f && projAspect < 1.38f);     // 4:3 range
+
+      // Only correct if NOT a common aspect (meaning the game has a weird internal aspect)
+      // AND only if projAspect is close to 1:1 (which often indicates a bug)
+      if (projScaleX > 0.001f && projScaleY > 0.001f && !isCommonAspect) {
+        // Correct to 16:9
+        float targetAspect = 16.0f / 9.0f;
+        float correctedScaleX = projScaleY / targetAspect;
+        float sign = (correctedProj[0][0] >= 0) ? 1.0f : -1.0f;
+        correctedProj[0][0] = sign * correctedScaleX;
+
+        static uint32_t s_captureAspectFixLogCount = 0;
+        if (s_captureAspectFixLogCount++ < 20) {
+          Logger::info(str::format("[CAPTURE-ASPECT-FIX] Corrected non-standard projection:",
+            " origScaleX=", projScaleX, " scaleY=", projScaleY,
+            " projAspect=", projAspect, " correctedScaleX=", correctedScaleX));
+        }
+      }
+    }
+
+    data.invProj = inverse(correctedProj);
     data.viewToWorld = inverseAffine(m_activeDrawCallState.transformData.worldToView);
     data.worldToObject = inverseAffine(m_activeDrawCallState.transformData.objectToWorld);
     data.normalTransform = m_activeDrawCallState.transformData.objectToWorld;
@@ -869,8 +909,9 @@ namespace dxvk {
 
           Matrix4 finalWorld = worldMatrix;
 
-          // RE-ENABLED: RTX Remix's projection already handles aspect ratio
-          // So we need to remove the aspect ratio from world matrix to avoid double-application
+          // DISABLED: Testing if world aspect fix causes the oval
+          // The game might need this aspect scaling for geometry positioning
+          #if 0
           if (isScaleOnly && noTranslation && isAspectRatioScale) {
             finalWorld = Matrix4(
               1.0f, 0.0f, 0.0f, 0.0f,
@@ -884,6 +925,7 @@ namespace dxvk {
               Logger::info(str::format("[WORLD-ASPECT-FIX] Removed aspect scale: X=", scaleX, " Y=", scaleY, " ratio=", xyRatio));
             }
           }
+          #endif
 
           transformData.objectToWorld = finalWorld;
 
@@ -1827,7 +1869,12 @@ namespace dxvk {
                 const bool isRT = isCategorizedRenderTarget(tex);
                 const XXH64_hash_t texHash = tex->GetImage()->getHash();
 
-                if (!isRT && !isDepthStencil && !isTinyTexture) {
+                // CRITICAL: Skip screen-sized textures - they're likely render targets even if not categorized
+                const uint32_t vpW = static_cast<uint32_t>(m_activeDrawCallState.originalViewport.width);
+                const uint32_t vpH = static_cast<uint32_t>(m_activeDrawCallState.originalViewport.height);
+                const bool isScreenSized = (desc->Width == vpW && desc->Height == vpH);
+
+                if (!isRT && !isDepthStencil && !isTinyTexture && !isScreenSized) {
                   // Only override if decompiler didn't provide an answer
                   if (recommendedAlbedoSampler < 0) {
                     recommendedAlbedoSampler = slot;

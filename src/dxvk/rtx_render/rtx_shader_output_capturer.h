@@ -87,7 +87,8 @@ namespace dxvk {
     bool hasReplacementTexture(XXH64_hash_t originalTextureHash) const;
 
     // Called at start of frame
-    void onFrameBegin(Rc<RtxContext> ctx);
+    // isCameraValid: only execute captures when camera is valid to avoid capturing with garbage matrices
+    void onFrameBegin(Rc<RtxContext> ctx, bool isCameraValid);
 
     // Called at end of frame
     void onFrameEnd();
@@ -185,18 +186,16 @@ namespace dxvk {
                                   " originalRTHash=0x", std::hex, drawCallState.originalRenderTargetHash, std::dec));
         }
         if (replacementTexture.isValid()) {
-          // CRITICAL FIX: Cache key should only depend on WHAT is rendered (replacement texture + material hash),
-          // NOT on WHERE it's rendered (originalRT). Same replacement texture + same material = same shader output!
-          // This enables proper deduplication: 556 draws with same material share ONE cached texture.
+          // CRITICAL FIX: Use full geometry hash to differentiate draws with same replacement texture
           XXH64_hash_t replacementHash = replacementTexture.getImageHash();
-          XXH64_hash_t materialHash = drawCallState.getMaterialData().getHash();
+          XXH64_hash_t geomHash = drawCallState.getGeometryData().getHashForRule<rules::FullGeometryHash>();
 
-          // Combine replacement texture with material hash for uniqueness
-          XXH64_hash_t combinedHash = XXH64(&materialHash, sizeof(XXH64_hash_t), replacementHash);
+          // Combine replacement texture with geometry hash for uniqueness
+          XXH64_hash_t combinedHash = XXH64(&geomHash, sizeof(geomHash), replacementHash);
 
           if (shouldLog) {
             Logger::info(str::format("[getCacheKey] RT REPLACEMENT: replacement=0x", std::hex, replacementHash,
-                                    " material=0x", materialHash,
+                                    " geomHash=0x", geomHash,
                                     " = combined=0x", combinedHash, std::dec));
           }
           return {combinedHash, true};
@@ -207,30 +206,27 @@ namespace dxvk {
         return {0, false}; // Invalid RT replacement
       }
       // Check for render target feedback case: no replacement found but slot 0 was a render target
-      // For RT feedback, the originalRT hash IS the relevant identifier (which RT is being read)
+      // For RT feedback, use full geometry hash to differentiate draws
       if (drawCallState.originalRenderTargetHash != 0) {
-        XXH64_hash_t materialHash = drawCallState.getMaterialData().getHash();
-        // Combine originalRT with material to differentiate different materials using same RT
-        XXH64_hash_t combinedHash = XXH64(&materialHash, sizeof(XXH64_hash_t), drawCallState.originalRenderTargetHash);
+        XXH64_hash_t geomHash = drawCallState.getGeometryData().getHashForRule<rules::FullGeometryHash>();
+        // Combine originalRT with geometry hash to differentiate draws
+        XXH64_hash_t combinedHash = XXH64(&geomHash, sizeof(geomHash), drawCallState.originalRenderTargetHash);
 
         if (shouldLog) {
           Logger::info(str::format("[getCacheKey] RT FEEDBACK: originalRT=0x", std::hex, drawCallState.originalRenderTargetHash,
-                                  " material=0x", materialHash,
+                                  " geomHash=0x", geomHash,
                                   " = combined=0x", combinedHash, std::dec));
         }
         return {combinedHash, true};
       }
-      // For regular materials, combine geometry + material to prevent collisions
-      // CRITICAL FIX: Materials with hash=0 were colliding! Use vertex/index count as unique seed
-      // This ensures same geometry + different materials get different cache keys
+      // For regular materials, combine geometry hash + material hash
       XXH64_hash_t matHash = drawCallState.getMaterialData().getHash();
-      const auto& geom = drawCallState.getGeometryData();
-      uint64_t geomSeed = (uint64_t(geom.vertexCount) << 32) | uint64_t(geom.indexCount);
-      // Combine: hash material with geometry seed (vertexCount+indexCount never both zero)
-      XXH64_hash_t combinedHash = (geomSeed != 0) ? XXH64(&matHash, sizeof(XXH64_hash_t), geomSeed) : (matHash + 1);
+      XXH64_hash_t geomHash = drawCallState.getGeometryData().getHashForRule<rules::FullGeometryHash>();
+      // Combine: geometry hash with material hash for uniqueness
+      XXH64_hash_t combinedHash = XXH64(&matHash, sizeof(XXH64_hash_t), geomHash);
       if (shouldLog) {
         Logger::info(str::format("[getCacheKey] REGULAR MATERIAL: matHash=0x", std::hex, matHash,
-                                " geomSeed=0x", geomSeed,
+                                " geomHash=0x", geomHash,
                                 " combined=0x", combinedHash, std::dec));
       }
       return {combinedHash, true};
@@ -283,6 +279,7 @@ namespace dxvk {
       VkExtent2D resolution;          // Capture resolution
       uint32_t flags;                 // Capture flags (indexed, dynamic, etc.)
       bool isDynamic = false;         // Is this a dynamic material?
+      bool isRTReplacement = false;   // Is this an RT replacement (view-dependent, never cache)?
 
       // GEOMETRY DATA (Rc-counted, safe to copy)
       DxvkBufferSlice vertexBuffer;   // Position buffer

@@ -386,12 +386,8 @@ namespace dxvk {
     getResourceManager().onFrameBegin(this, getCommonObjects()->getTextureManager(), getSceneManager(), downscaledExtent,
                                       upscaledExtent, m_resetHistory, mainCamera.isCameraCut());
 
-    // CHRONO: Time shader capture onFrameBegin (includes buildGpuCaptureList + executeMultiIndirectCaptures)
-    auto tShaderCaptureStart = std::chrono::high_resolution_clock::now();
-    getCommonObjects()->metaShaderOutputCapturer().onFrameBegin(this);
-    auto tShaderCaptureDone = std::chrono::high_resolution_clock::now();
-    auto shaderCaptureOnFrameBeginTime = std::chrono::duration<double, std::micro>(tShaderCaptureDone - tShaderCaptureStart).count();
-    Logger::info(str::format("[CHRONO] ShaderCapture::onFrameBegin: ", std::fixed, std::setprecision(2), shaderCaptureOnFrameBeginTime, " μs (", shaderCaptureOnFrameBeginTime / 1000.0, " ms)"));
+    // NOTE: ShaderOutputCapturer::onFrameBegin is now called unconditionally earlier in injectRTX
+    // (before the getSurfaceBuffer check) to ensure captures execute even without RT geometry
 
     // Force history reset on integrate indirect mode change to discard incompatible history 
     if (RtxOptions::integrateIndirectMode() != m_prevIntegrateIndirectMode) {
@@ -487,10 +483,16 @@ namespace dxvk {
 
     if (!m_rayTracingSupported) {
       ONCE(Logger::info(str::format("[RTX-Compatibility-Info] Raytracing doesn't appear to be supported on this HW.")));
+      Logger::info("[INJECT-RTX-SKIP] m_rayTracingSupported=FALSE - shader capture NOT reachable from this path");
       return;
     }
 
     if (m_frameLastInjected == m_device->getCurrentFrameId()) {
+      // NOTE: This means injectRTX was already called this frame - shader capture already executed
+      static uint32_t s_alreadyInjectedCount = 0;
+      if (++s_alreadyInjectedCount <= 5) {
+        Logger::info(str::format("[INJECT-RTX-SKIP] Frame already injected (frameId=", m_device->getCurrentFrameId(), ") - shader capture already ran this frame"));
+      }
       return;
     }
 
@@ -539,6 +541,17 @@ namespace dxvk {
 #endif
 
     const float gpuIdleTimeMilliseconds = getGpuIdleTimeSinceLastCall();
+
+    // CRITICAL: Execute shader output captures - pass camera validity to prevent captures with garbage matrices
+    // Captures are queued during D3D9 draw phase and need to execute regardless of RT state,
+    // BUT only when camera is valid to avoid oval distortion from wrong view matrices
+    {
+      auto tShaderCaptureStart = std::chrono::high_resolution_clock::now();
+      getCommonObjects()->metaShaderOutputCapturer().onFrameBegin(this, isCameraValid);
+      auto tShaderCaptureDone = std::chrono::high_resolution_clock::now();
+      auto shaderCaptureTime = std::chrono::duration<double, std::micro>(tShaderCaptureDone - tShaderCaptureStart).count();
+      Logger::info(str::format("[CHRONO] ShaderCapture::onFrameBegin (camera=", isCameraValid ? "VALID" : "INVALID", "): ", std::fixed, std::setprecision(2), shaderCaptureTime, " μs"));
+    }
 
     // Note: Only engage ray tracing when it is enabled, the camera is valid and when no shaders are currently being compiled asynchronously (as
     // trying to render before shaders are done compiling will cause Remix to block).
@@ -606,6 +619,9 @@ namespace dxvk {
       auto tScenePrepDone = std::chrono::high_resolution_clock::now();
       auto scenePrepTime = std::chrono::duration<double, std::micro>(tScenePrepDone - tScenePrepStart).count();
       Logger::info(str::format("[CHRONO] SceneManager::prepareSceneData: ", std::fixed, std::setprecision(2), scenePrepTime, " μs (", scenePrepTime / 1000.0, " ms)"));
+
+      // NOTE: ShaderOutputCapturer::onFrameBegin is now called unconditionally earlier in injectRTX
+      // (before the raytracing checks) to ensure captures execute even without valid camera/RT
 
       // If we really don't have any RT to do, just bail early (could be UI/menus rendering)
       if (getSceneManager().getSurfaceBuffer() != nullptr) {

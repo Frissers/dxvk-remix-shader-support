@@ -21,6 +21,8 @@
 */
 #include <mutex>
 #include <vector>
+#include <algorithm>
+#include <iomanip>
 
 #include "rtx_asset_replacer.h"
 #include "rtx_scene_manager.h"
@@ -352,6 +354,69 @@ namespace dxvk {
           ++iter;
         }
       }
+    }
+
+    // Log visible meshes if enabled
+    if (RtxOptions::logVisibleMeshes()) {
+      const Vector3 cameraPos = getCamera().getPosition(false);
+
+      // Collect visible meshes with distance info
+      struct MeshInfo {
+        const RtInstance* instance;
+        float distance;
+        Vector3 dimensions;
+        XXH64_hash_t hash;
+      };
+      std::vector<MeshInfo> visibleMeshes;
+
+      for (const RtInstance* instance : m_instanceManager.getInstanceTable()) {
+        if (instance->isInsideFrustum()) {
+          const auto& geometryData = instance->getBlas()->input.getGeometryData();
+          const auto& boundingBox = geometryData.boundingBox;
+          const Matrix4& transform = instance->getTransform();
+
+          // Get world-space center of bounding box
+          const Vector3 localCenter = boundingBox.getCentroid();
+          const Vector3 worldCenter = (transform * Vector4(localCenter, 1.0f)).xyz();
+
+          // Calculate distance to camera
+          const float distance = length(worldCenter - cameraPos);
+
+          // Calculate world-space dimensions (approximate - assumes no rotation scaling issues)
+          const Vector3 localSize = boundingBox.maxPos - boundingBox.minPos;
+          const Vector3 scale(length(Vector3(transform[0][0], transform[1][0], transform[2][0])),
+                              length(Vector3(transform[0][1], transform[1][1], transform[2][1])),
+                              length(Vector3(transform[0][2], transform[1][2], transform[2][2])));
+          const Vector3 worldSize = localSize * scale;
+
+          const XXH64_hash_t hash = instance->getBlas()->input.getHash(RtxOptions::geometryAssetHashRule());
+          visibleMeshes.push_back({instance, distance, worldSize, hash});
+        }
+      }
+
+      // Sort by distance (closest first)
+      std::sort(visibleMeshes.begin(), visibleMeshes.end(),
+        [](const MeshInfo& a, const MeshInfo& b) { return a.distance < b.distance; });
+
+      // Filter out meshes with no size, flat meshes, or zero distance (UI/skybox elements)
+      uint32_t filteredCount = 0;
+      Logger::info("[VisibleMeshes] === Frame visible meshes (filtered: 3D objects with distance > 0) ===");
+      for (const auto& mesh : visibleMeshes) {
+        // Skip flat meshes (require ALL dimensions > 0) and zero distance (at camera origin)
+        const bool is3D = mesh.dimensions.x > 0.1f && mesh.dimensions.y > 0.1f && mesh.dimensions.z > 0.1f;
+        const bool hasDistance = mesh.distance > 0.1f;
+        if (!is3D || !hasDistance) {
+          continue;
+        }
+        filteredCount++;
+        const auto& geometryData = mesh.instance->getBlas()->input.getGeometryData();
+        Logger::info(str::format("[VisibleMeshes] Dist: ", std::fixed, std::setprecision(1), mesh.distance,
+          " Hash: 0x", std::hex, mesh.hash, std::dec,
+          " Size(WxHxD): ", mesh.dimensions.x, "x", mesh.dimensions.y, "x", mesh.dimensions.z,
+          " Verts: ", geometryData.vertexCount,
+          " ID: ", mesh.instance->getId()));
+      }
+      Logger::info(str::format("[VisibleMeshes] Showing ", filteredCount, " of ", visibleMeshes.size(), " total meshes"));
     }
 
     // Perform GC on the other managers

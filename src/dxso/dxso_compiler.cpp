@@ -3799,16 +3799,22 @@ void DxsoCompiler::emitControlFlowGenericLoop(
     // clip space (gl_Position)
     const uint32_t clipPos = m_module.opLoad(vec4TypeId, m_vs.oPos.id);
 
-    // clip -> view (homogeneous), then early perspective divide
+    // clip -> view (homogeneous), then perspective divide to undo projection
     const uint32_t viewH = m_module.opVectorTimesMatrix(vec4TypeId, clipPos, invProj);
     const uint32_t wComp = m_module.opCompositeExtract(floatType, viewH, 1, &lit3);
     const uint32_t invW = m_module.opFDiv(floatType, oneF, wComp);
 
     const uint32_t view3 = m_module.opVectorShuffle(vec3TypeId, viewH, viewH, 3, lit012);
 
-    const uint32_t vx = m_module.opCompositeExtract(floatType, view3, 1, &lit0);
-    const uint32_t vy = m_module.opCompositeExtract(floatType, view3, 1, &lit1);
-    const uint32_t vz = m_module.opCompositeExtract(floatType, view3, 1, &lit2);
+    const uint32_t vxRaw = m_module.opCompositeExtract(floatType, view3, 1, &lit0);
+    const uint32_t vyRaw = m_module.opCompositeExtract(floatType, view3, 1, &lit1);
+    const uint32_t vzRaw = m_module.opCompositeExtract(floatType, view3, 1, &lit2);
+
+    // Apply inverse perspective divide to properly reconstruct view-space positions
+    const uint32_t vx = m_module.opFMul(floatType, vxRaw, invW);
+    const uint32_t vy = m_module.opFMul(floatType, vyRaw, invW);
+    const uint32_t vz = m_module.opFMul(floatType, vzRaw, invW);
+
     uint32_t view4Comps[4] = { vx, vy, vz, oneF };
     const uint32_t view4 = m_module.opCompositeConstruct(vec4TypeId, 4, view4Comps);
 
