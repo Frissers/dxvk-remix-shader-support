@@ -342,8 +342,6 @@ dxvk_src = files([
   'rtx_render/rtx_shader_output_capturer.cpp',
   'rtx_render/rtx_shader_output_capturer.h',
 
-  'rtx_render/rtx_hlsl_decompiler_bridge.cpp',
-  'rtx_render/rtx_hlsl_decompiler_bridge.h',
 
   'rtx_render/rtx_shader_compatibility_manager.cpp',
   'rtx_render/rtx_shader_compatibility_manager.h',

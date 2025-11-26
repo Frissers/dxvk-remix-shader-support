@@ -388,7 +388,7 @@ namespace dxvk {
 
     // CHRONO: Time shader capture onFrameBegin (includes buildGpuCaptureList + executeMultiIndirectCaptures)
     auto tShaderCaptureStart = std::chrono::high_resolution_clock::now();
-    getCommonObjects()->metaShaderOutputCapturer().onFrameBegin(this);
+    getCommonObjects()->metaShaderOutputCapturer().onFrameBegin(this, true);
     auto tShaderCaptureDone = std::chrono::high_resolution_clock::now();
     auto shaderCaptureOnFrameBeginTime = std::chrono::duration<double, std::micro>(tShaderCaptureDone - tShaderCaptureStart).count();
     Logger::info(str::format("[CHRONO] ShaderCapture::onFrameBegin: ", std::fixed, std::setprecision(2), shaderCaptureOnFrameBeginTime, " μs (", shaderCaptureOnFrameBeginTime / 1000.0, " ms)"));
