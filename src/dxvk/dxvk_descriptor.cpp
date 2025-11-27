@@ -23,6 +23,7 @@
 #include "dxvk_device.h"
 #include "dxvk_image.h"
 #include "dxvk_buffer.h"
+#include "../util/log/log.h"
 
 namespace dxvk {
 
@@ -112,6 +113,9 @@ namespace dxvk {
 
     if (m_vkd->vkCreateDescriptorPool(m_vkd->device(), &info, nullptr, &m_pool) != VK_SUCCESS)
       throw DxvkError("DxvkDescriptorPool: Failed to create descriptor pool");
+
+    Logger::info(str::format("[DescPool] Created MAIN pool 0x", std::hex, (uint64_t)m_pool, std::dec,
+      " with UNIFORM_BUFFER=", maxSets * 4));
   }
 
   // NV-DXVK start: Adding global bindless resources
@@ -121,6 +125,17 @@ namespace dxvk {
 
     if (m_vkd->vkCreateDescriptorPool(m_vkd->device(), &info, nullptr, &m_pool) != VK_SUCCESS)
       throw DxvkError("DxvkDescriptorPool: Failed to create descriptor pool");
+
+    // Log what types this custom pool has
+    bool hasUniformBuffer = false;
+    for (uint32_t i = 0; i < info.poolSizeCount; i++) {
+      if (info.pPoolSizes[i].type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER) {
+        hasUniformBuffer = true;
+        break;
+      }
+    }
+    Logger::info(str::format("[DescPool] Created CUSTOM pool 0x", std::hex, (uint64_t)m_pool, std::dec,
+      " poolSizeCount=", info.poolSizeCount, " hasUniformBuffer=", hasUniformBuffer ? "YES" : "NO"));
   }
   // NV-DXVK end
 

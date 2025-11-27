@@ -516,10 +516,11 @@ namespace dxvk {
       if (group.renderTarget.isValid()) {
         VkImageLayout currentLayout = group.renderTarget.image->info().layout;
         Logger::info(str::format("[RT-BATCH-DEBUG] RT 0x", std::hex, group.renderTarget.image->getHash(), std::dec,
-                                " current layout=", currentLayout, " (GENERAL=", VK_IMAGE_LAYOUT_GENERAL, ")"));
+                                " current layout=", currentLayout, " (COLOR_ATTACHMENT_OPTIMAL=", VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, ")"));
 
-        if (currentLayout != VK_IMAGE_LAYOUT_GENERAL) {
-          rtLayoutTransitions.emplace_back(group.renderTarget.image, VK_IMAGE_LAYOUT_GENERAL);
+        // Use COLOR_ATTACHMENT_OPTIMAL to match D3D9 shader pipeline render pass expectations
+        if (currentLayout != VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL) {
+          rtLayoutTransitions.emplace_back(group.renderTarget.image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
           needsTransition++;
         } else {
           alreadyCorrectLayout++;
@@ -630,6 +631,33 @@ namespace dxvk {
       // Binding texture after bindRenderTargets() forces transitions inside render pass = individual barriers!
       auto tBindingStart = std::chrono::high_resolution_clock::now();
 
+      // CRITICAL FIX: Pre-bind dummy depth textures to ALL PS sampler slots (1014-1029) as safe defaults.
+      // DXSO shaders have shadow sampler variants (s0_2d_shadow, etc.) that share the same binding
+      // as regular samplers. Vulkan validates ALL descriptors even if spec constants disable them.
+      // By pre-binding depth textures, we ensure shadow sampler variants have valid descriptors.
+      // The actual texture binding loops below will overwrite these with real textures where appropriate.
+      if (firstRequest.pixelShader != nullptr) {
+        createDummyResources(ctx->getDevice());
+        if (m_dummyDepthImage != nullptr && !m_dummyDepthLayoutInitialized) {
+          ctx->changeImageLayout(m_dummyDepthImage, VK_IMAGE_LAYOUT_GENERAL);
+          m_dummyDepthLayoutInitialized = true;
+        }
+        if (m_dummyDepthTexture != nullptr && m_dummyShadowSampler != nullptr) {
+          constexpr uint32_t PS_SAMPLER_BASE_BINDING = 1014;
+          constexpr uint32_t PS_SAMPLER_COUNT = 16;
+          for (uint32_t i = 0; i < PS_SAMPLER_COUNT; i++) {
+            uint32_t binding = PS_SAMPLER_BASE_BINDING + i;
+            ctx->bindResourceView(binding, m_dummyDepthTexture, nullptr);
+            ctx->bindResourceSampler(binding, m_dummyShadowSampler);
+          }
+          static bool loggedPreBind = false;
+          if (!loggedPreBind) {
+            Logger::info("[SHADOW-FIX] Pre-bound dummy depth textures to ALL PS sampler slots 1014-1029");
+            loggedPreBind = true;
+          }
+        }
+      }
+
       // CRITICAL FIX: Bind ALL textures from the request to their correct sampler slots
       // The PS expects textures at specific slots (s0, s1, s2, etc.)
       // Only binding one texture causes the shader to sample black for other slots!
@@ -717,9 +745,37 @@ namespace dxvk {
               }
             } else {
               // Use the captured slot directly - it's the binding number the shader expects
+              // NOTE: Don't transition layout here - let DXVK handle it automatically
+              // Explicit transitions were causing issues with RTX rendering expecting different layouts
               ctx->bindResourceView(tex.slot, tex.texture.getImageView(), nullptr);
               if (tex.sampler != nullptr) {
-                ctx->bindResourceSampler(tex.slot, tex.sampler);
+                // CRITICAL FIX: Check if sampler has depth comparison but texture is NOT a depth format
+                // This causes Vulkan validation errors - shadow samplers require depth-capable formats
+                bool useShadowSampler = false;
+                if (tex.sampler->info().compareToDepth) {
+                  VkFormat texFormat = tex.texture.getImageView()->image()->info().format;
+                  // Check if format is a depth format
+                  bool isDepthFormat = (texFormat >= VK_FORMAT_D16_UNORM && texFormat <= VK_FORMAT_D32_SFLOAT_S8_UINT);
+                  if (!isDepthFormat) {
+                    // Shadow sampler with non-depth texture - use regular sampler instead
+                    createDummyResources(ctx->getDevice());
+                    if (m_dummySampler != nullptr) {
+                      ctx->bindResourceSampler(tex.slot, m_dummySampler);
+                    }
+                    static uint32_t shadowFixLog = 0;
+                    if (++shadowFixLog <= 10) {
+                      Logger::info(str::format("[SAMPLER-FIX] Slot ", tex.slot, " (s", d3d9Stage,
+                        "): replaced shadow sampler with regular sampler (texture format=", texFormat, ")"));
+                    }
+                  } else {
+                    useShadowSampler = true;
+                  }
+                } else {
+                  useShadowSampler = false;
+                }
+                if (!tex.sampler->info().compareToDepth || useShadowSampler) {
+                  ctx->bindResourceSampler(tex.slot, tex.sampler);
+                }
               }
               static uint32_t texBindLog = 0;
               if (++texBindLog <= 50) {
@@ -750,30 +806,36 @@ namespace dxvk {
       Logger::info(str::format("[BARRIER-DEBUG] ===== BINDING RT 0x", std::hex, group.renderTarget.image->getHash(), std::dec,
                               " currentLayout=", group.renderTarget.image->info().layout, " ====="));
 
+      // CRITICAL: End any existing render pass before binding our render targets.
+      // RTX rendering may have left a render pass active with 3 subpass dependencies.
+      // We need a fresh render pass with our minimal dependency configuration.
+      ctx->endCurrentRenderPass();
+
       // Bind texture array as render target (layered rendering)
       DxvkRenderTargets captureRt;
       captureRt.color[0].view = group.renderTarget.view;
-      captureRt.color[0].layout = VK_IMAGE_LAYOUT_GENERAL;
+      // Use COLOR_ATTACHMENT_OPTIMAL to match D3D9 shader pipeline render pass expectations
+      // GENERAL layout caused render pass incompatibility (READ+WRITE vs WRITE-only access masks)
+      captureRt.color[0].layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
 
-      Logger::info(str::format("[BARRIER-DEBUG] Calling bindRenderTargets with GENERAL layout..."));
+      Logger::info(str::format("[BARRIER-DEBUG] Calling bindRenderTargets with COLOR_ATTACHMENT_OPTIMAL layout..."));
       ctx->bindRenderTargets(captureRt);
       // CRITICAL: Clear render pass barriers to ensure renderpass has 1 dependency
       // This matches the default renderpass used when compiling pipelines.
       // Without this, we get "dependencyCount is incompatible" errors (3 != 1)
       ctx->clearRenderPassBarriers();
-      Logger::info(str::format("[BARRIER-DEBUG] After bindRenderTargets, layout=", group.renderTarget.image->info().layout));
 
-      VkClearValue clearValue = {};
-      // DEBUG: Clear to magenta instead of black to see if shader renders anything
-      clearValue.color.float32[0] = 1.0f;  // R
-      clearValue.color.float32[1] = 0.0f;  // G
-      clearValue.color.float32[2] = 1.0f;  // B
-      clearValue.color.float32[3] = 1.0f;  // A
-      Logger::info(str::format("[BARRIER-DEBUG] Calling clearRenderTarget with MAGENTA..."));
-      ctx->clearRenderTarget(group.renderTarget.view, VK_IMAGE_ASPECT_COLOR_BIT, clearValue);
-      // Clear barriers again after clear in case it modified them
-      ctx->clearRenderPassBarriers();
-      Logger::info(str::format("[BARRIER-DEBUG] After clearRenderTarget, layout=", group.renderTarget.image->info().layout));
+      // CRITICAL: Set LOAD_OP_CLEAR instead of LOAD_OP_LOAD to avoid READ access requirement.
+      // D3D9 pipelines were compiled with render passes that only have WRITE access.
+      // Using LOAD_OP_LOAD adds READ_BIT which causes "dstAccessMask is incompatible" errors.
+      VkClearColorValue clearColor = {};
+      clearColor.float32[0] = 1.0f;  // R (magenta for debugging)
+      clearColor.float32[1] = 0.0f;  // G
+      clearColor.float32[2] = 1.0f;  // B
+      clearColor.float32[3] = 1.0f;  // A
+      ctx->setColorAttachmentLoadOp(0, VK_ATTACHMENT_LOAD_OP_CLEAR, clearColor);
+
+      Logger::info(str::format("[BARRIER-DEBUG] After setColorAttachmentLoadOp(CLEAR), layout=", group.renderTarget.image->info().layout));
 
       // Bind shaders - BOTH ORIGINAL game shaders
       // Using both original VS + PS avoids renderpass incompatibility issues
@@ -1074,7 +1136,23 @@ namespace dxvk {
               if (texView != nullptr) {
                 ctx->bindResourceView(binding, Rc<DxvkImageView>(texView), nullptr);
                 if (capturedTex->sampler != nullptr) {
-                  ctx->bindResourceSampler(binding, capturedTex->sampler);
+                  // CRITICAL FIX: Check if sampler has depth comparison but texture is NOT a depth format
+                  bool bindOriginalSampler = true;
+                  if (capturedTex->sampler->info().compareToDepth) {
+                    VkFormat texFormat = texView->image()->info().format;
+                    bool isDepthFormat = (texFormat >= VK_FORMAT_D16_UNORM && texFormat <= VK_FORMAT_D32_SFLOAT_S8_UINT);
+                    if (!isDepthFormat) {
+                      // Shadow sampler with non-depth texture - use regular sampler
+                      createDummyResources(ctx->getDevice());
+                      if (m_dummySampler != nullptr) {
+                        ctx->bindResourceSampler(binding, m_dummySampler);
+                        bindOriginalSampler = false;
+                      }
+                    }
+                  }
+                  if (bindOriginalSampler) {
+                    ctx->bindResourceSampler(binding, capturedTex->sampler);
+                  }
                 }
                 anyTextureBound = true;
 
@@ -1138,35 +1216,9 @@ namespace dxvk {
         Logger::warn("[SHADER-TEXTURE] NO pixel shader! Cannot bind textures correctly.");
       }
 
-      // CRITICAL FIX: Bind dummy depth textures to shadow sampler slots.
-      // DXSO shaders have shadow sampler variants (s0_2d_shadow, s3_2d_shadow, etc.) that are
-      // NOT reported by getResourceSlots(). The Vulkan driver assigns them separate descriptor
-      // bindings (typically 5, 6, 7, etc. based on the order they appear in SPIRV).
-      // These slots get stale color textures which cause Vulkan validation errors.
-      //
-      // Since the exact binding scheme is complex and depends on SPIRV ordering, we use a
-      // brute-force approach: bind dummy depth textures to ALL potential shadow sampler slots.
-      // The binding numbers appear to be in the range 0-15 for shadow samplers.
-      if (firstRequest.pixelShader != nullptr) {
-        createDummyResources(ctx->getDevice());
-        if (m_dummyDepthImage != nullptr && !m_dummyDepthLayoutInitialized) {
-          ctx->changeImageLayout(m_dummyDepthImage, VK_IMAGE_LAYOUT_GENERAL);
-          m_dummyDepthLayoutInitialized = true;
-        }
-        if (m_dummyDepthTexture != nullptr && m_dummyShadowSampler != nullptr) {
-          // Bind dummy depth textures to all potential shadow sampler bindings (0-15)
-          // This ensures any shadow sampler variant has a valid depth texture bound
-          for (uint32_t shadowBinding = 0; shadowBinding < 16; shadowBinding++) {
-            ctx->bindResourceView(shadowBinding, m_dummyDepthTexture, nullptr);
-            ctx->bindResourceSampler(shadowBinding, m_dummyShadowSampler);
-          }
-          static bool loggedShadow = false;
-          if (!loggedShadow) {
-            Logger::info("[SHADOW-FIX] Bound dummy depth textures to shadow sampler slots 0-15");
-            loggedShadow = true;
-          }
-        }
-      }
+      // NOTE: Dummy depth textures were pre-bound at the start of texture binding (before first loop).
+      // This ensures shadow sampler variants have valid depth descriptors, while real textures
+      // overwrite the defaults for slots that need color textures.
 
       auto tBindingEnd = std::chrono::high_resolution_clock::now();
       totalBindingTime += std::chrono::duration<double, std::micro>(tBindingEnd - tBindingStart).count();
@@ -1289,6 +1341,21 @@ namespace dxvk {
         const uint32_t drawCount = static_cast<uint32_t>(indirectIndexedDraws.size());
         const bool hasMultiDrawIndirect = ctx->getDevice()->features().core.features.multiDrawIndirect;
 
+        // DEBUG: Log all draw parameters before GPU execution
+        static uint32_t preIdxDrawLogCount = 0;
+        if (++preIdxDrawLogCount <= 50) {
+          Logger::warn(str::format("[PRE-DRAW-IDX-INDIRECT #", preIdxDrawLogCount, "] drawCount=", drawCount,
+            " hasMultiDraw=", hasMultiDrawIndirect,
+            " groupSize=", groupSize,
+            " resolution=", group.resolution.width, "x", group.resolution.height,
+            " rtValid=", group.renderTarget.isValid(),
+            " firstReq.vertCount=", firstRequest.vertexCount,
+            " firstReq.idxCount=", firstRequest.indexCount,
+            " hasVS=", firstRequest.vertexShader != nullptr,
+            " hasPS=", firstRequest.pixelShader != nullptr,
+            " numTextures=", firstRequest.textures.size()));
+        }
+
         if (hasMultiDrawIndirect || drawCount <= 1) {
           ctx->drawIndexedIndirect(0, drawCount, sizeof(VkDrawIndexedIndirectCommand));
         } else {
@@ -1364,8 +1431,25 @@ namespace dxvk {
         const uint32_t drawCount = static_cast<uint32_t>(indirectDraws.size());
         const bool hasMultiDrawIndirect = ctx->getDevice()->features().core.features.multiDrawIndirect;
 
+        // DEBUG: Log all draw parameters before GPU execution
+        static uint32_t preDrawLogCount = 0;
+        if (++preDrawLogCount <= 50) {
+          Logger::warn(str::format("[PRE-DRAW-INDIRECT #", preDrawLogCount, "] drawCount=", drawCount,
+            " hasMultiDraw=", hasMultiDrawIndirect,
+            " groupSize=", groupSize,
+            " resolution=", group.resolution.width, "x", group.resolution.height,
+            " rtValid=", group.renderTarget.isValid(),
+            " firstReq.vertCount=", firstRequest.vertexCount,
+            " firstReq.idxCount=", firstRequest.indexCount,
+            " hasVS=", firstRequest.vertexShader != nullptr,
+            " hasPS=", firstRequest.pixelShader != nullptr,
+            " numTextures=", firstRequest.textures.size()));
+        }
+
         if (hasMultiDrawIndirect || drawCount <= 1) {
+          Logger::warn(str::format("[DRAW-EXEC] About to call drawIndirect count=", drawCount));
           ctx->drawIndirect(0, drawCount, sizeof(VkDrawIndirectCommand));
+          Logger::warn("[DRAW-EXEC] drawIndirect returned OK");
         } else {
           // Fallback: loop through draws one by one
           for (uint32_t i = 0; i < drawCount; i++) {
@@ -1618,11 +1702,12 @@ namespace dxvk {
       // Reset input layout to empty
       ctx->setInputLayout(0, nullptr, 0, nullptr);
 
-      // CRITICAL: Flush command list to ensure all our capture commands complete
-      // before RTX rendering begins. This creates a clean boundary.
-      ctx->flushCommandList();
+      // NOTE: Removed flushCommandList() call - it was causing semaphore synchronization issues
+      // with the presenter. The RTX context should handle its own barriers/sync as needed.
+      // The state unbinding above is sufficient to prevent state leaking between captures and RTX.
+      // If RTX rendering needs the capture results, it will naturally wait due to resource dependencies.
 
-      Logger::info("[STATE-CLEANUP] Reset all GPU state after capture and flushed command list");
+      Logger::info("[STATE-CLEANUP] Reset all GPU state after capture (no flush to avoid presenter sync issues)");
     }
 
     // ASYNC FRAME SPREADING: Remove only processed requests, keep the rest queued
@@ -2090,16 +2175,12 @@ namespace dxvk {
     // Stage 2 version - no cache checking, just basic feature/hash checking
     // This is called early in D3D9Rtx before GPU context is available
 
+    // CHRONO: Count calls to understand load
     static uint32_t s_callCount = 0;
+    static uint32_t s_acceptCount = 0;
     s_callCount++;
-    if (s_callCount <= 10) {
-      Logger::info(str::format("[STATIC-CHECK #", s_callCount, "] shouldCaptureStatic() CALLED - enableShaderOutputCapture=", enableShaderOutputCapture()));
-    }
 
     if (!enableShaderOutputCapture()) {
-      if (s_callCount <= 10) {
-        Logger::info(str::format("[STATIC-CHECK #", s_callCount, "] RETURNING FALSE - feature disabled"));
-      }
       return false;
     }
 
@@ -2129,69 +2210,76 @@ namespace dxvk {
 
     XXH64_hash_t matHash = drawCallState.getMaterialData().getHash();
 
-    // Check if capturing all draws (except UI/pixel shaders)
-    if (captureAllDraws()) {
-      // Skip UI draws - pixel shaders without vertex shaders are typically UI
-      if (drawCallState.usesPixelShader && !drawCallState.usesVertexShader) {
-        return false; // UI draw, skip
-      }
-      return true; // Capture all non-UI draws
+    // CRITICAL PERF FIX: Apply screen-space filtering BEFORE captureAllDraws check!
+    // Without this, captureAllDraws=true causes ALL draws to trigger expensive buffer captures,
+    // freezing the game. This filtering must happen regardless of captureAllDraws setting.
+
+    // Skip UI draws - pixel shaders without vertex shaders are typically UI
+    if (drawCallState.usesPixelShader && !drawCallState.usesVertexShader) {
+      return false; // UI draw, skip
     }
 
     // CRITICAL FIX: Skip fullscreen quad / screen-space effects (vignettes, post-processing)
     // These effects are rendered with screen-space UVs, but when captured and applied to
     // 3D geometry with object-space UVs, they cause "sliding texture" artifacts when the
-    // camera moves. Detection criteria:
-    // 1. Identity viewToProjection matrix = no proper camera/projection (screen-space rendering)
-    // 2. Identity objectToWorld matrix = no world transform (direct screen rendering)
-    // 3. Very few vertices with no depth test = fullscreen quad overlay
-    // 4. Exactly 4 vertices with no depth write = fullscreen quad overlay (vignette pattern)
-    // 5. Material hash 0x0 = null/invalid material (often post-processing)
-    // 6. Low vertex count (<=24) = likely screen quad or simple overlay
+    // camera moves.
+    //
+    // PERF FIX: This filtering must be applied BEFORE captureAllDraws() returns true,
+    // otherwise thousands of unwanted draws trigger expensive buffer captures!
     {
       const auto& transforms = drawCallState.getTransformData();
       const bool hasIdentityProjection = isIdentityExact(transforms.viewToProjection);
-      const bool hasIdentityWorldTransform = isIdentityExact(transforms.objectToWorld);
       const uint32_t vertexCount = drawCallState.getGeometryData().vertexCount;
-      const bool isLowVertexCount = (vertexCount <= 24);  // Expanded from 12 to catch more overlays
       const bool noDepthTest = !drawCallState.zEnable;
-      const bool noDepthWrite = !drawCallState.zWriteEnable;
       const bool isNullMaterial = (matHash == 0);  // Null/invalid materials are often post-processing
 
-      // Fullscreen quad detection: exactly 4 or 6 vertices with no depth write
-      // This catches vignettes and other screen overlays rendered through the 3D pipeline
-      const bool isFullscreenQuad = (vertexCount == 4 || vertexCount == 6) && noDepthWrite;
+      // Fullscreen quad detection: exactly 4 or 6 vertices without depth test
+      // This catches screen quads (post-processing passes, screen clears)
+      const bool isFullscreenQuad = (vertexCount == 4 || vertexCount == 6) && noDepthTest;
 
-      // Screen-space overlay detection: identity world transform + no depth write
-      // Objects with identity world transform and no depth write are almost always screen overlays
-      // (vignettes, post-processing effects, HUD elements) - even with many vertices
-      const bool isScreenOverlay = hasIdentityWorldTransform && noDepthWrite;
+      // LESS AGGRESSIVE FILTERING for captureAllDraws mode:
+      // Only skip draws that are DEFINITELY screen-space effects:
+      // 1. Identity projection = no camera transform = screen-space
+      // 2. No depth test AND low vertex count = UI/overlay
+      // 3. Null material = invalid/uninitialized
+      // 4. Fullscreen quad without depth test
+      //
+      // We DON'T skip based on:
+      // - noDepthWrite alone (many 3D effects disable depth write)
+      // - identity world transform alone (instanced objects may use identity)
+      // - low vertex count alone (small objects are valid)
+      const bool isScreenSpace = hasIdentityProjection ||  // No projection = screen-space
+                                  isFullscreenQuad ||      // 4/6 verts + no depth = screen quad
+                                  isNullMaterial ||        // Null material = invalid
+                                  (noDepthTest && vertexCount <= 12);  // UI overlays
 
-      // Skip if this looks like a screen-space effect:
-      // Method 1: Identity projection = definitely screen-space (no camera transform)
-      // Method 2: Identity world transform = not positioned in world = screen-space overlay
-      // Method 3: No depth testing = almost certainly screen-space (catches zEnable=0 effects)
-      // Method 4: Fullscreen quad (4/6 verts) with no depth write = screen overlay
-      // Method 5: No depth write = likely screen-space overlay or effect
-      // Method 6: Null material hash = invalid/post-processing material
-      // Method 7: Low vertex count = likely screen overlay (quads, simple geometry)
-      if (hasIdentityProjection ||
-          hasIdentityWorldTransform ||  // ANY identity world = screen-space
-          noDepthTest ||  // ANY draw without depth test is screen-space
-          noDepthWrite ||  // ANY draw without depth write is likely screen-space
-          isFullscreenQuad ||
-          isNullMaterial ||  // Null materials are likely post-processing
-          isLowVertexCount) {  // Low vertex count likely screen overlay
+      if (isScreenSpace) {
         static uint32_t s_screenSpaceSkipCount = 0;
-        if (++s_screenSpaceSkipCount <= 20) {
-          Logger::info(str::format("[SHADER-CAPTURE] Skipping screen-space effect: vertexCount=",
-            vertexCount, " zEnable=", drawCallState.zEnable, " zWrite=", drawCallState.zWriteEnable,
-            " identityProj=", hasIdentityProjection, " identityWorld=", hasIdentityWorldTransform,
-            " isFullscreenQuad=", isFullscreenQuad, " isNullMat=", isNullMaterial, " isLowVerts=", isLowVertexCount,
+        // Always log rejections for draws with 100+ verts to debug why real geometry is rejected
+        const bool logThis = (++s_screenSpaceSkipCount <= 20) || (vertexCount >= 100 && vertexCount <= 1000);
+        if (logThis) {
+          Logger::info(str::format("[SCREEN-SPACE-SKIP] verts=", vertexCount,
+            " REASON: identityProj=", hasIdentityProjection,
+            " fullscreenQuad=", isFullscreenQuad,
+            " nullMat=", isNullMaterial,
+            " noDepthTest=", noDepthTest,
+            " (noDepth+lowVert)=", (noDepthTest && vertexCount <= 12),
+            " zEnable=", drawCallState.zEnable,
             " matHash=0x", std::hex, matHash, std::dec));
         }
         return false;  // Skip screen-space effects
       }
+    }
+
+    // PERF: After filtering, if captureAllDraws is enabled, capture this draw
+    if (captureAllDraws()) {
+      s_acceptCount++;
+      // Log acceptance rate every 500 calls
+      if (s_callCount % 500 == 0) {
+        Logger::info(str::format("[STATIC-RATE] calls=", s_callCount, " accepted=", s_acceptCount,
+          " rate=", std::fixed, std::setprecision(1), (100.0 * s_acceptCount / s_callCount), "%"));
+      }
+      return true;
     }
 
     // SIMPLIFIED: If shader capture is enabled, capture ALL materials (bypass hash whitelist)
@@ -2286,19 +2374,12 @@ namespace dxvk {
                               hasRenderTargetReplacement ? "YES" : "NO", ") - proceeding with capture"));
     }
 
-    // CRITICAL FIX: RT replacements are view-dependent (motion blur, etc.) - NEVER use cache for them
-    // They must re-capture every frame to match current camera position
-    if (hasRenderTargetReplacement) {
-      auto tEnd = std::chrono::high_resolution_clock::now();
-      double totalTime = std::chrono::duration<double, std::micro>(tEnd - tStart).count();
-      totalTimeUs += totalTime;
-      if (shouldLog) {
-        Logger::info(str::format("[PERF-shouldCapture] RT REPLACEMENT - SKIP CACHE (view-dependent): ", totalTime, " μs"));
-      }
-      return true;  // Always re-capture RT replacements
-    }
+    // REMOVED: Cache bypass for RT replacements was causing 3000+ recaptures per frame
+    // RT replacements in Lego Batman are NOT view-dependent - they're just using a different
+    // sampler slot for the albedo texture. The cache key includes geometry+texture hash,
+    // so caching works correctly.
 
-    // Check if we already captured this material (non-RT-replacement only)
+    // Check if we already captured this material (includes RT replacements now)
     auto tCacheLookup1Start = std::chrono::high_resolution_clock::now();
     auto it = m_capturedOutputs.find(cacheKey);
     auto tCacheLookup1End = std::chrono::high_resolution_clock::now();
@@ -2613,36 +2694,25 @@ namespace dxvk {
         return false; // Invalid key, skip
       }
 
-      // CRITICAL FIX: RT replacements are view-dependent (motion blur, etc.) - NEVER use cache for them
-      // They must re-capture every frame to match current camera position
+      // REMOVED: RT replacement cache bypass was causing 3000+ recaptures per frame
+      // RT replacements now use the cache like regular materials
       const bool isRTReplacementDraw = (drawCallState.renderTargetReplacementSlot >= 0);
 
-      // Check if already captured (non-RT-replacement only - RT replacements skip cache entirely)
+      // Check if already captured
       auto it = m_capturedOutputs.find(cacheKey);
-      bool skipCacheDueToRTReplacement = false;
-
-      if (isRTReplacementDraw) {
-        static uint32_t rtReplCacheSkipCount = 0;
-        if (++rtReplCacheSkipCount <= 100) {
-          Logger::info(str::format("[GPU-RT-REPLACEMENT] #", rtReplCacheSkipCount,
-                                  " SKIP CACHE (view-dependent) cacheKey=0x", std::hex, cacheKey, std::dec,
-                                  " - will queue fresh capture"));
-        }
-        skipCacheDueToRTReplacement = true;  // Force cache miss for RT replacements
-      }
 
       static uint32_t cacheLookupCount = 0;
       if (++cacheLookupCount <= 100) {
         bool found = (it != m_capturedOutputs.end());
         bool valid = found && it->second.capturedTexture.isValid();
-        Logger::warn(str::format("[CACHE-LOOKUP] #", cacheLookupCount,
+        Logger::info(str::format("[CACHE-LOOKUP] #", cacheLookupCount,
                                 " cacheKey=0x", std::hex, cacheKey, std::dec,
                                 " found=", found ? "YES" : "NO",
                                 " valid=", valid ? "YES" : "NO"));
       }
 
-      // Skip cache lookup entirely for RT replacements (view-dependent, must re-capture every frame)
-      if (!skipCacheDueToRTReplacement && it != m_capturedOutputs.end() && it->second.capturedTexture.isValid()) {
+      // Check cache for all materials (including RT replacements now)
+      if (it != m_capturedOutputs.end() && it->second.capturedTexture.isValid()) {
         // CRITICAL FIX: Check if previous capture failed (hash == 0)
         // If so, skip cache and fall through to queue new capture
         XXH64_hash_t cachedHash = (it->second.capturedTexture.image != nullptr) ? it->second.capturedTexture.image->getHash() : 0;
@@ -2871,10 +2941,22 @@ namespace dxvk {
 
       // COPY SHADERS (Rc-counted, cheap to copy)
       // Extract vertex shader
+      static uint32_t shaderExtractLogCount = 0;
+      ++shaderExtractLogCount;
+      if (shaderExtractLogCount <= 50) {
+        Logger::info(str::format("[SHADER-EXTRACT] #", shaderExtractLogCount,
+                                " usesVS=", drawCallState.usesVertexShader,
+                                " vsPtr=", (drawCallState.vertexShader != nullptr ? "non-null" : "NULL"),
+                                " usesPS=", drawCallState.usesPixelShader,
+                                " psPtr=", (drawCallState.pixelShader != nullptr ? "non-null" : "NULL")));
+      }
       if (drawCallState.usesVertexShader && drawCallState.vertexShader != nullptr) {
         const D3D9CommonShader* commonShader = drawCallState.vertexShader->GetCommonShader();
         if (commonShader != nullptr) {
           request.vertexShader = commonShader->GetShader(D3D9ShaderPermutations::None);
+          if (shaderExtractLogCount <= 50) {
+            Logger::info(str::format("[SHADER-EXTRACT] VS extracted: ", (request.vertexShader != nullptr ? "SUCCESS" : "NULL")));
+          }
         }
       }
       // Extract pixel shader
@@ -2882,6 +2964,9 @@ namespace dxvk {
         const D3D9CommonShader* commonShader = drawCallState.pixelShader->GetCommonShader();
         if (commonShader != nullptr) {
           request.pixelShader = commonShader->GetShader(D3D9ShaderPermutations::None);
+          if (shaderExtractLogCount <= 50) {
+            Logger::info(str::format("[SHADER-EXTRACT] PS extracted: ", (request.pixelShader != nullptr ? "SUCCESS" : "NULL")));
+          }
           // Compute D3D9 bytecode hash for decompiler lookup (same hash format used by decompiler)
           const auto& bytecode = commonShader->GetBytecode();
           if (!bytecode.empty()) {
@@ -3305,42 +3390,36 @@ namespace dxvk {
       }
     }
 
-    // BARRIER OPTIMIZATION: Transition to GENERAL layout once, then never transition again
-    // GENERAL supports both COLOR_ATTACHMENT and SHADER_READ without transitions (820 barrier reduction!)
-    ctx->changeImageLayout(renderTarget.image, VK_IMAGE_LAYOUT_GENERAL);
+    // Transition to COLOR_ATTACHMENT_OPTIMAL to match D3D9 shader pipeline render pass expectations
+    // (GENERAL layout caused render pass incompatibility - READ+WRITE vs WRITE-only access masks)
+    ctx->changeImageLayout(renderTarget.image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
 
     Logger::info(str::format("[ShaderCapture-Layout] Transitioned render target 0x", std::hex,
                             renderTarget.image->getHash(), std::dec,
-                            " to GENERAL layout (supports both render and read without transitions)"));
+                            " to COLOR_ATTACHMENT_OPTIMAL layout"));
+
+    // CRITICAL: End any existing render pass before binding our render targets.
+    // RTX rendering may have left a render pass active with 3 subpass dependencies.
+    // We need a fresh render pass with our minimal dependency configuration.
+    ctx->endCurrentRenderPass();
 
     // Bind offscreen render target
     DxvkRenderTargets captureRt;
     captureRt.color[0].view = renderTarget.view;
-    captureRt.color[0].layout = VK_IMAGE_LAYOUT_GENERAL;
+    // Use COLOR_ATTACHMENT_OPTIMAL to match D3D9 shader pipeline render pass expectations
+    captureRt.color[0].layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
     ctx->bindRenderTargets(captureRt);
+    ctx->clearRenderPassBarriers();
 
-    // Clear the render target to MAGENTA for debugging
-    // If output stays magenta = no pixels written
-    // If output is black = pixels written as black (shader issue)
-    // If output is colored = SUCCESS!
-    VkClearValue clearValue;
-    clearValue.color.float32[0] = 1.0f;
-    clearValue.color.float32[1] = 0.0f;
-    clearValue.color.float32[2] = 1.0f;
-    clearValue.color.float32[3] = 1.0f;
-
-    VkClearAttachment clearAttachment;
-    clearAttachment.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    clearAttachment.colorAttachment = 0;
-    clearAttachment.clearValue = clearValue;
-
-    VkClearRect clearRect;
-    clearRect.rect.offset = { 0, 0 };
-    clearRect.rect.extent = resolution;
-    clearRect.baseArrayLayer = 0;
-    clearRect.layerCount = 1;
-
-    ctx->clearRenderTarget(renderTarget.view, VK_IMAGE_ASPECT_COLOR_BIT, clearValue);
+    // CRITICAL: Set LOAD_OP_CLEAR instead of LOAD_OP_LOAD to avoid READ access requirement.
+    // D3D9 pipelines were compiled with render passes that only have WRITE access.
+    // Using LOAD_OP_LOAD adds READ_BIT which causes "dstAccessMask is incompatible" errors.
+    VkClearColorValue clearColor = {};
+    clearColor.float32[0] = 1.0f;  // R (magenta for debugging)
+    clearColor.float32[1] = 0.0f;  // G
+    clearColor.float32[2] = 1.0f;  // B
+    clearColor.float32[3] = 1.0f;  // A
+    ctx->setColorAttachmentLoadOp(0, VK_ATTACHMENT_LOAD_OP_CLEAR, clearColor);
 
     // Use game's EXACT viewport/scissor state for shader re-execution
     // This is CRITICAL: the game's projection matrix was designed for this viewport size
@@ -3360,10 +3439,10 @@ namespace dxvk {
     Logger::info(str::format("[VIEWPORT-DEBUG] renderTarget resolution: ", resolution.width, "x", resolution.height));
     Logger::info(str::format("[RT-FORMAT-DEBUG] Render target format: ", rtFormat,
                             " (has alpha: ", (rtFormat == VK_FORMAT_B8G8R8A8_UNORM || rtFormat == VK_FORMAT_R8G8B8A8_UNORM) ? "YES" : "NO", ")"));
-    Logger::info(str::format("[RT-FORMAT-DEBUG] Clear color: R=", clearValue.color.float32[0],
-                            " G=", clearValue.color.float32[1],
-                            " B=", clearValue.color.float32[2],
-                            " A=", clearValue.color.float32[3]));
+    Logger::info(str::format("[RT-FORMAT-DEBUG] Clear color: R=", clearColor.float32[0],
+                            " G=", clearColor.float32[1],
+                            " B=", clearColor.float32[2],
+                            " A=", clearColor.float32[3]));
 
     ctx->setViewports(1, &drawCallState.originalViewport, &drawCallState.originalScissor);
 
@@ -3589,7 +3668,6 @@ namespace dxvk {
       // Bind it to slot 0 so the shader can read from it
       const uint32_t slot0 = 1014; // PS sampler 0
 
-      // TextureRef already has an image view, use it directly
       ctx->bindResourceView(slot0, previousRTContent.getImageView(), nullptr);
 
       const Rc<DxvkSampler>& sampler = material.getSampler();
@@ -3800,13 +3878,13 @@ namespace dxvk {
               format = VK_FORMAT_B8G8R8A8_UNORM;
               break;
             case D3DDECLTYPE_UBYTE4:
-              format = VK_FORMAT_R8G8B8A8_UINT;
+              format = VK_FORMAT_R8G8B8A8_USCALED;  // USCALED auto-converts to float for shader compatibility
               break;
             case D3DDECLTYPE_SHORT2:
-              format = VK_FORMAT_R16G16_SINT;
+              format = VK_FORMAT_R16G16_SSCALED;  // SSCALED auto-converts to float for shader compatibility
               break;
             case D3DDECLTYPE_SHORT4:
-              format = VK_FORMAT_R16G16B16A16_SINT;
+              format = VK_FORMAT_R16G16B16A16_SSCALED;  // SSCALED auto-converts to float for shader compatibility
               break;
             case D3DDECLTYPE_UBYTE4N:
               format = VK_FORMAT_R8G8B8A8_UNORM;
@@ -5061,6 +5139,28 @@ namespace dxvk {
     // The LRU eviction above handles cleanup safely by checking age
     // m_renderTargetCache.clear();
 
+    // Periodic cleanup of texture array cache (VRAM FIX)
+    // With layer bucketing (4, 16, 64, 128, 256, 512), we have max 6 arrays per resolution
+    // Clear every 300 frames (~5 seconds) to free unused buckets
+    if (m_currentFrame % 300 == 0 && !m_renderTargetArrayCache.empty()) {
+      size_t oldSize = m_renderTargetArrayCache.size();
+      size_t freedVram = 0;
+
+      // Calculate approximate VRAM being freed
+      for (const auto& [key, resource] : m_renderTargetArrayCache) {
+        if (resource.image != nullptr) {
+          uint32_t width = (key >> 48) & 0xFFFF;
+          uint32_t height = (key >> 32) & 0xFFFF;
+          uint32_t layers = key & 0xFFFFFFFF;
+          freedVram += width * height * 4 * layers;  // RGBA8 = 4 bytes
+        }
+      }
+
+      m_renderTargetArrayCache.clear();
+      Logger::info(str::format("[RT-ARRAY-CACHE-EVICT] Cleared ", oldSize, " texture arrays, freed ~",
+                               freedVram / (1024 * 1024), " MB VRAM (frame ", m_currentFrame, ")"));
+    }
+
     // Periodic cleanup of texture array pools (unchanged)
     if (m_currentFrame % 60 == 0) {
       // Clear texture array pools - will be rebuilt as needed
@@ -5197,6 +5297,25 @@ namespace dxvk {
       VkFormat format,
       uint32_t layerCount) {
 
+    // VRAM FIX: Round layer counts to power-of-2 buckets to reduce unique allocations
+    // Without this, each unique batch size (3, 17, 72, 156...) creates a NEW texture array
+    // that's cached forever, causing VRAM to spike to 10-30GB+
+    // With bucketing: max 6 arrays per resolution instead of 60+
+    uint32_t originalLayerCount = layerCount;
+    if (layerCount <= 4) {
+      layerCount = 4;
+    } else if (layerCount <= 16) {
+      layerCount = 16;
+    } else if (layerCount <= 64) {
+      layerCount = 64;
+    } else if (layerCount <= 128) {
+      layerCount = 128;
+    } else if (layerCount <= 256) {
+      layerCount = 256;
+    } else {
+      layerCount = 512;  // Max bucket
+    }
+
     // OPTIMIZATION 1: Cache texture arrays by (resolution, layerCount)
     // Key format: width (16 bits) | height (16 bits) | layerCount (32 bits)
     uint64_t cacheKey = (uint64_t(resolution.width) << 48) |
@@ -5214,19 +5333,20 @@ namespace dxvk {
     if (it != m_renderTargetArrayCache.end() && it->second.isValid()) {
       s_cacheHits++;
       float hitRate = 100.0f * s_cacheHits / s_totalCacheChecks;
-      Logger::info(str::format("[CACHE-HIT] RT ", resolution.width, "x", resolution.height,
-                               " layers=", layerCount, " (hit rate: ", hitRate, "% - ",
-                               s_cacheHits, "/", s_totalCacheChecks, ")"));
+      if (s_cacheHits <= 20 || s_cacheHits % 100 == 0) {
+        Logger::info(str::format("[RT-ARRAY-CACHE-HIT] ", resolution.width, "x", resolution.height,
+                                 " requested=", originalLayerCount, " bucket=", layerCount,
+                                 " (hit rate: ", hitRate, "%)"));
+      }
       return it->second;
     }
 
     // Cache miss - create new texture array
     s_cacheMisses++;
     float missRate = 100.0f * s_cacheMisses / s_totalCacheChecks;
-    Logger::info(str::format("[CACHE-MISS] RT ", resolution.width, "x", resolution.height,
-                             " layers=", layerCount, " NOT in cache (miss rate: ", missRate,
-                             "% - ", s_cacheMisses, "/", s_totalCacheChecks,
-                             ") cache size=", m_renderTargetArrayCache.size()));
+    Logger::info(str::format("[RT-ARRAY-CACHE-MISS] ", resolution.width, "x", resolution.height,
+                             " requested=", originalLayerCount, " bucket=", layerCount,
+                             " (cache size=", m_renderTargetArrayCache.size(), ")"));
 
     VkExtent3D extent = { resolution.width, resolution.height, 1 };
 
@@ -5247,14 +5367,14 @@ namespace dxvk {
       // Use cacheKey as hash - same as getRenderTarget() does
       resource.image->setHash(cacheKey);
 
-      VkImageLayout initialLayout = resource.image->info().layout;
-      Logger::info(str::format("[CACHE-MISS] Created NEW RT 0x", std::hex, resource.image->getHash(), std::dec,
-                               " ", resolution.width, "x", resolution.height,
-                               " layers=", layerCount, " initialLayout=", initialLayout));
+      size_t vramBytes = resolution.width * resolution.height * 4 * layerCount;
+      Logger::info(str::format("[RT-ARRAY-CREATED] ", resolution.width, "x", resolution.height,
+                               " bucket=", layerCount, " layers (~", vramBytes / (1024 * 1024), " MB)",
+                               " cache size=", m_renderTargetArrayCache.size() + 1));
       // Add to cache
       m_renderTargetArrayCache[cacheKey] = resource;
     } else {
-      Logger::err(str::format("[CACHE-MISS] FAILED to create RT ", resolution.width, "x", resolution.height));
+      Logger::err(str::format("[RT-ARRAY-FAILED] ", resolution.width, "x", resolution.height, " bucket=", layerCount));
     }
 
     return resource;

@@ -162,6 +162,17 @@ namespace dxvk {
       m_state.om.renderTargets,
       m_state.om.renderPassOps);
 
+    // NV-DXVK start: Fix layout tracking desync for depth attachments
+    // When render passes suspend (spillRenderPass with suspend=true), the depth image
+    // is left in storeLayout but transitionRenderTargetLayouts() isn't called, leaving
+    // tracking out of sync. Set loadLayout from tracked layout so the render pass knows
+    // where to transition FROM. The tracking update happens in applyRenderTargetStoreLayouts().
+    if (targets.depth.view != nullptr) {
+      VkImageLayout currentLayout = targets.depth.view->image()->info().layout;
+      m_state.om.renderPassOps.depthOps.loadLayout = currentLayout;
+    }
+    // NV-DXVK end
+
     if (!m_state.om.framebufferInfo.hasTargets(targets)) {
       // Create a new framebuffer object next
       // time we start rendering something
@@ -846,6 +857,38 @@ namespace dxvk {
     m_state.om.renderPassOps.barrier.srcAccess = 0;
     m_state.om.renderPassOps.barrier.dstStages = 0;
     m_state.om.renderPassOps.barrier.dstAccess = 0;
+  }
+
+
+  void DxvkContext::setColorAttachmentLoadOp(uint32_t index, VkAttachmentLoadOp loadOp, VkClearColorValue clearValue) {
+    // Set the load op directly to avoid READ access requirement that comes with LOAD_OP_LOAD.
+    // This is needed for shader capture where we need the render pass to match the
+    // pipeline's expected render pass (which typically uses CLEAR or DONT_CARE).
+    if (index < MaxNumRenderTargets) {
+      m_state.om.renderPassOps.colorOps[index].loadOp = loadOp;
+      if (loadOp != VK_ATTACHMENT_LOAD_OP_LOAD) {
+        // When not loading, we can use UNDEFINED layout for potential performance gain
+        m_state.om.renderPassOps.colorOps[index].loadLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+      }
+      // Store clear value in case it's a CLEAR operation
+      if (loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR) {
+        int attachmentIndex = m_state.om.framebufferInfo.getColorAttachmentIndex(index);
+        if (attachmentIndex >= 0) {
+          m_state.om.clearValues[attachmentIndex].color = clearValue;
+        }
+      }
+    }
+  }
+
+
+  void DxvkContext::endCurrentRenderPass() {
+    // Public wrapper for spillRenderPass to allow external code to
+    // force end of current render pass before setting up a new one.
+    // This is needed for shader capture where we need to ensure our
+    // render pass configuration is used, not an inherited one.
+    // Use suspend=false to properly transition render target layouts,
+    // otherwise textures may be left in wrong layout causing validation errors.
+    this->spillRenderPass(false);
   }
 
 
@@ -5156,10 +5199,21 @@ namespace dxvk {
 
   void DxvkContext::applyRenderTargetStoreLayouts() {
     ScopedCpuProfileZone();
-    for (uint32_t i = 0; i < MaxNumRenderTargets; i++)
+    for (uint32_t i = 0; i < MaxNumRenderTargets; i++) {
       m_rtLayouts.color[i] = m_state.om.renderPassOps.colorOps[i].storeLayout;
+      // NOTE: Don't update color image tracking here - color targets go through
+      // transitionRenderTargetLayouts() which handles both transition and tracking
+    }
 
     m_rtLayouts.depth = m_state.om.renderPassOps.depthOps.storeLayout;
+
+    // NV-DXVK: Update depth image tracking to storeLayout
+    // Depth targets need this because spillRenderPass(suspend=true) doesn't call
+    // transitionRenderTargetLayouts(), leaving depth tracking out of sync
+    const DxvkAttachment& depth = m_state.om.framebufferInfo.getDepthTarget();
+    if (depth.view != nullptr) {
+      depth.view->image()->setLayout(m_rtLayouts.depth);
+    }
   }
 
 

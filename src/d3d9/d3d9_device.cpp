@@ -38,6 +38,7 @@
 
 #include "../dxvk/dxvk_adapter.h"
 #include "../dxvk/dxvk_instance.h"
+#include "../dxso/dxso_util.h"  // For shadowSamplerBindingOffset
 
 #include "../util/util_bit.h"
 #include "../util/util_math.h"
@@ -2642,11 +2643,32 @@ namespace dxvk {
 
     if ((drawPrepare & PrepareDrawFlag::ApplyDrawState) ||
         (drawPrepare & PrepareDrawFlag::OriginalDrawCall)) {
+      // FREEZE DEBUG: Time each operation to find bottleneck
+      static uint32_t s_freezeDbgCount = 0;
+      static double s_totalTimeMs = 0.0;
+      auto tDrawCapStart = std::chrono::high_resolution_clock::now();
+
+      // Set vertex count early
+      const uint32_t earlyVertCount = GetVertexCount(PrimitiveType, PrimitiveCount);
+      m_rtx.setEarlyVertexCount(earlyVertCount);
+
+      // Check if capture needed
+      const bool shaderCaptureEnabled = ShaderOutputCapturer::enableShaderOutputCapture();
+      const bool shouldAttemptCapture = shaderCaptureEnabled && m_rtx.shouldCaptureBuffers(m_state);
+
+      auto tDrawCapEnd = std::chrono::high_resolution_clock::now();
+      double elapsedMs = std::chrono::duration<double, std::milli>(tDrawCapEnd - tDrawCapStart).count();
+      s_totalTimeMs += elapsedMs;
+      s_freezeDbgCount++;
+
+      // Log EVERY call to catch freeze point
+      Logger::info(str::format("[FREEZE-DBG #", s_freezeDbgCount, "] check took ",
+        std::fixed, std::setprecision(3), elapsedMs, "ms avg=", s_totalTimeMs/s_freezeDbgCount,
+        "ms verts=", earlyVertCount, " capture=", shouldAttemptCapture));
+
       // Apply render target texture replacements BEFORE PrepareDraw binds textures
-      // PERF FIX: Only do this if shader capture is enabled AND material needs capture
-      // Skip this entirely for cached materials to avoid overhead on every draw call
       bool didReplaceTextures = false;
-      if (ShaderOutputCapturer::enableShaderOutputCapture() && m_rtx.shouldCaptureBuffers(m_state)) {
+      if (shouldAttemptCapture) {
         didReplaceTextures = m_rtx.applyRenderTargetTextureReplacements();
       }
 
@@ -2654,14 +2676,14 @@ namespace dxvk {
 
       // OPTIMIZATION: Only capture buffers if we'll actually use them
       // captureOriginalD3D9Buffers() locks/copies ALL vertex/index buffers + 4KB of shader constants
-      // This was running for EVERY draw call, causing 50-100ms GPU stalls!
-      // Now we check if capture is enabled AND if this draw call qualifies BEFORE expensive copies
-      const bool shouldAttemptCapture = ShaderOutputCapturer::enableShaderOutputCapture() &&
-                                       m_rtx.shouldCaptureBuffers(m_state);
       if (shouldAttemptCapture) {
         // OPTION A: Capture original D3D9 buffers for shader re-execution
         // This must be called AFTER PrepareDraw() while D3D9 state is still available
         m_rtx.captureOriginalD3D9Buffers(m_state);
+      } else if (ShaderOutputCapturer::enableShaderOutputCapture()) {
+        // CRITICAL FIX: Even when skipping full buffer capture (cached materials),
+        // we MUST still copy shader pointers for re-execution! Shader pointers are cheap to copy.
+        m_rtx.captureShaderPointersOnly(m_state);
       }
 
       // Prepare framebuffer capture texture ONLY for rasterized draws (OriginalDrawCall).
@@ -2835,11 +2857,32 @@ namespace dxvk {
 
     if ((drawPrepare & PrepareDrawFlag::ApplyDrawState) ||
         (drawPrepare & PrepareDrawFlag::OriginalDrawCall)) {
+      // FREEZE DEBUG: Time each operation to find bottleneck
+      static uint32_t s_freezeDbgCount = 0;
+      static double s_totalTimeMs = 0.0;
+      auto tDrawCapStart = std::chrono::high_resolution_clock::now();
+
+      // Set vertex count early
+      const uint32_t earlyVertCount = GetVertexCount(PrimitiveType, PrimitiveCount);
+      m_rtx.setEarlyVertexCount(earlyVertCount);
+
+      // Check if capture needed
+      const bool shaderCaptureEnabled = ShaderOutputCapturer::enableShaderOutputCapture();
+      const bool shouldAttemptCapture = shaderCaptureEnabled && m_rtx.shouldCaptureBuffers(m_state);
+
+      auto tDrawCapEnd = std::chrono::high_resolution_clock::now();
+      double elapsedMs = std::chrono::duration<double, std::milli>(tDrawCapEnd - tDrawCapStart).count();
+      s_totalTimeMs += elapsedMs;
+      s_freezeDbgCount++;
+
+      // Log EVERY call to catch freeze point
+      Logger::info(str::format("[FREEZE-DBG #", s_freezeDbgCount, "] check took ",
+        std::fixed, std::setprecision(3), elapsedMs, "ms avg=", s_totalTimeMs/s_freezeDbgCount,
+        "ms verts=", earlyVertCount, " capture=", shouldAttemptCapture));
+
       // Apply render target texture replacements BEFORE PrepareDraw binds textures
-      // PERF FIX: Only do this if shader capture is enabled AND material needs capture
-      // Skip this entirely for cached materials to avoid overhead on every draw call
       bool didReplaceTextures = false;
-      if (ShaderOutputCapturer::enableShaderOutputCapture() && m_rtx.shouldCaptureBuffers(m_state)) {
+      if (shouldAttemptCapture) {
         didReplaceTextures = m_rtx.applyRenderTargetTextureReplacements();
       }
 
@@ -2847,14 +2890,14 @@ namespace dxvk {
 
       // OPTIMIZATION: Only capture buffers if we'll actually use them
       // captureOriginalD3D9Buffers() locks/copies ALL vertex/index buffers + 4KB of shader constants
-      // This was running for EVERY draw call, causing 50-100ms GPU stalls!
-      // Now we check if capture is enabled AND if this draw call qualifies BEFORE expensive copies
-      const bool shouldAttemptCapture = ShaderOutputCapturer::enableShaderOutputCapture() &&
-                                       m_rtx.shouldCaptureBuffers(m_state);
       if (shouldAttemptCapture) {
         // OPTION A: Capture original D3D9 buffers for shader re-execution
         // This must be called AFTER PrepareDraw() while D3D9 state is still available
         m_rtx.captureOriginalD3D9Buffers(m_state);
+      } else if (ShaderOutputCapturer::enableShaderOutputCapture()) {
+        // CRITICAL FIX: Even when skipping full buffer capture (cached materials),
+        // we MUST still copy shader pointers for re-execution! Shader pointers are cheap to copy.
+        m_rtx.captureShaderPointersOnly(m_state);
       }
 
       // Prepare framebuffer capture texture ONLY for rasterized draws (OriginalDrawCall).
@@ -2966,6 +3009,10 @@ namespace dxvk {
         // OPTION A: Capture original D3D9 buffers for shader re-execution
         // This must be called AFTER PrepareDraw() while D3D9 state is still available
         m_rtx.captureOriginalD3D9Buffers(m_state);
+      } else if (ShaderOutputCapturer::enableShaderOutputCapture()) {
+        // CRITICAL FIX: Even when skipping full buffer capture (cached materials),
+        // we MUST still copy shader pointers for re-execution! Shader pointers are cheap to copy.
+        m_rtx.captureShaderPointersOnly(m_state);
       }
 
       // Prepare framebuffer capture texture ONLY for rasterized draws (OriginalDrawCall).
@@ -3085,6 +3132,10 @@ namespace dxvk {
         // OPTION A: Capture original D3D9 buffers for shader re-execution
         // This must be called AFTER PrepareDraw() while D3D9 state is still available
         m_rtx.captureOriginalD3D9Buffers(m_state);
+      } else if (ShaderOutputCapturer::enableShaderOutputCapture()) {
+        // CRITICAL FIX: Even when skipping full buffer capture (cached materials),
+        // we MUST still copy shader pointers for re-execution! Shader pointers are cheap to copy.
+        m_rtx.captureShaderPointersOnly(m_state);
       }
 
       // Prepare framebuffer capture texture ONLY for rasterized draws (OriginalDrawCall).
@@ -6863,29 +6914,56 @@ namespace dxvk {
       samplerInfo.first, DxsoBindingType::Image,
       samplerInfo.second);
 
+    // NV-DXVK: Shadow samplers use separate binding slot
+    const uint32_t shadowSlot = slot + shadowSamplerBindingOffset;
+    const bool isDepthSampler = key.Depth;
+
+    // Create a shadow sampler key for depth textures
+    D3D9SamplerKey shadowKey = key;
+    shadowKey.Depth = TRUE;  // Shadow sampler always needs depth comparison
+
     EmitCs([this,
       cSlot = slot,
+      cShadowSlot = shadowSlot,
       cKey  = key,
+      cShadowKey = shadowKey,
+      cIsDepth = isDepthSampler,
       cSamplerNum = Sampler
     ] (DxvkContext* ctx) {
+      // Bind color sampler to color slot
       auto pair = m_samplers.find(cKey);
       if (pair != m_samplers.end()) {
         ctx->bindResourceSampler(cSlot, pair->second);
-        return;
+      } else {
+        DxvkSamplerCreateInfo info = DecodeSamplerKey(cKey);
+        try {
+          auto sampler = m_dxvkDevice->createSampler(info);
+          m_samplers.insert(std::make_pair(cKey, sampler));
+          ctx->bindResourceSampler(cSlot, std::move(sampler));
+          m_samplerCount++;
+        }
+        catch (const DxvkError& e) {
+          Logger::err(e.message());
+        }
       }
 
-      DxvkSamplerCreateInfo info = DecodeSamplerKey(cKey);
-
-      try {
-        auto sampler = m_dxvkDevice->createSampler(info);
-
-        m_samplers.insert(std::make_pair(cKey, sampler));
-        ctx->bindResourceSampler(cSlot, std::move(sampler));
-
-        m_samplerCount++;
-      }
-      catch (const DxvkError& e) {
-        Logger::err(e.message());
+      // NV-DXVK: Also bind shadow sampler to shadow slot when using depth textures
+      if (cIsDepth) {
+        auto shadowPair = m_samplers.find(cShadowKey);
+        if (shadowPair != m_samplers.end()) {
+          ctx->bindResourceSampler(cShadowSlot, shadowPair->second);
+        } else {
+          DxvkSamplerCreateInfo shadowInfo = DecodeSamplerKey(cShadowKey);
+          try {
+            auto shadowSampler = m_dxvkDevice->createSampler(shadowInfo);
+            m_samplers.insert(std::make_pair(cShadowKey, shadowSampler));
+            ctx->bindResourceSampler(cShadowSlot, std::move(shadowSampler));
+            m_samplerCount++;
+          }
+          catch (const DxvkError& e) {
+            Logger::err(e.message());
+          }
+        }
       }
     });
   }
@@ -6903,11 +6981,22 @@ namespace dxvk {
     D3D9CommonTexture* commonTex =
       GetCommonTexture(m_state.textures[StateSampler]);
 
+    // NV-DXVK: For depth textures, also bind to the shadow sampler slot
+    // Shadow samplers use a separate binding (slot + shadowSamplerBindingOffset)
+    const bool isDepthTexture = commonTex->IsShadow();
+    const uint32_t shadowSlot = slot + shadowSamplerBindingOffset;
+
     EmitCs([
       cSlot = slot,
-      cImageView = commonTex->GetSampleView(srgb)
+      cShadowSlot = shadowSlot,
+      cImageView = commonTex->GetSampleView(srgb),
+      cIsDepth = isDepthTexture
     ](DxvkContext* ctx) {
       ctx->bindResourceView(cSlot, cImageView, nullptr);
+      // Bind depth textures to shadow slot as well for shadow sampling
+      if (cIsDepth) {
+        ctx->bindResourceView(cShadowSlot, cImageView, nullptr);
+      }
     });
   }
 

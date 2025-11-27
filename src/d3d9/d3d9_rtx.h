@@ -314,6 +314,17 @@ namespace dxvk {
     // Quick check if we should capture buffers (avoids expensive copies if capture won't be used)
     bool shouldCaptureBuffers(const Direct3DState9& state) const;
 
+    // Lightweight shader-only capture: copies just the shader pointers (no buffer data)
+    // Used when full capture is skipped (cached materials) but we still need shaders for re-execution
+    void captureShaderPointersOnly(const Direct3DState9& state);
+
+    // Set vertex count early (before geometry data is populated) for shouldCaptureBuffers() filtering
+    // This is needed because shouldCaptureStatic() checks vertex count to skip fullscreen triangles,
+    // but the geometry data isn't populated until later in the draw call flow.
+    void setEarlyVertexCount(uint32_t vertexCount) {
+      m_activeDrawCallState.geometryData.vertexCount = vertexCount;
+    }
+
   private:
     // Storage for original texture pointers during render target replacement
     IDirect3DBaseTexture9* m_replacedTextures[16] = {};

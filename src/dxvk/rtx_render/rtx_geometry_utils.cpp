@@ -661,11 +661,18 @@ namespace dxvk {
     ScopedCpuProfileZone();
     // Handle index buffer replacement - since the BVH builder does not support legacy primitive topology
     if (input.isTopologyRaytraceReady()) {
-      ctx->copyBuffer(output.indexCacheBuffer, 0, input.indexBuffer.buffer(), input.indexBuffer.offset() + input.indexBuffer.offsetFromSlice(), input.indexCount * input.indexBuffer.stride());
-    } else {
-      return RtxGeometryUtils::generateTriangleList(ctx, input, output.indexCacheBuffer);
+      const size_t indexCopySize = input.indexCount * input.indexBuffer.stride();
+      const size_t srcOffset = input.indexBuffer.offset() + input.indexBuffer.offsetFromSlice();
+      const size_t availableSize = input.indexBuffer.buffer()->info().size;
+
+      // Check if buffer is large enough for direct copy
+      if (srcOffset + indexCopySize <= availableSize) {
+        ctx->copyBuffer(output.indexCacheBuffer, 0, input.indexBuffer.buffer(), srcOffset, indexCopySize);
+        return true;
+      }
+      // Fall through to generateTriangleList if buffer too small
     }
-    return true;
+    return RtxGeometryUtils::generateTriangleList(ctx, input, output.indexCacheBuffer);
   }
 
   bool RtxGeometryUtils::generateTriangleList(const Rc<DxvkContext>& ctx, const RasterGeometry& input, Rc<DxvkBuffer> output) {
@@ -790,8 +797,13 @@ namespace dxvk {
 
   void RtxGeometryUtils::cacheVertexDataOnGPU(const Rc<DxvkContext>& ctx, const RasterGeometry& input, RaytraceGeometry& output) {
     ScopedCpuProfileZone();
-    if (input.isVertexDataInterleaved() && input.areFormatsGpuFriendly()) {
-      const size_t vertexBufferSize = input.vertexCount * input.positionBuffer.stride();
+
+    // Check if we can use direct interleaved copy optimization
+    const size_t vertexBufferSize = input.vertexCount * input.positionBuffer.stride();
+    const size_t availableSize = input.positionBuffer.length();
+    const bool bufferLargeEnough = vertexBufferSize <= availableSize;
+
+    if (input.isVertexDataInterleaved() && input.areFormatsGpuFriendly() && bufferLargeEnough) {
       ctx->copyBuffer(output.historyBuffer[0], 0, input.positionBuffer.buffer(), input.positionBuffer.offset(), vertexBufferSize);
 
       processGeometryBuffers(input, output);

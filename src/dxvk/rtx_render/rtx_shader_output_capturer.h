@@ -186,19 +186,15 @@ namespace dxvk {
                                   " originalRTHash=0x", std::hex, drawCallState.originalRenderTargetHash, std::dec));
         }
         if (replacementTexture.isValid()) {
-          // CRITICAL FIX: Use full geometry hash to differentiate draws with same replacement texture
+          // CRITICAL FIX: Use ONLY the replacement texture hash as cache key
+          // FullGeometryHash includes per-frame buffer addresses that change, breaking cache lookup
+          // For RT replacements, each texture IS unique to a specific procedural material
           XXH64_hash_t replacementHash = replacementTexture.getImageHash();
-          XXH64_hash_t geomHash = drawCallState.getGeometryData().getHashForRule<rules::FullGeometryHash>();
-
-          // Combine replacement texture with geometry hash for uniqueness
-          XXH64_hash_t combinedHash = XXH64(&geomHash, sizeof(geomHash), replacementHash);
 
           if (shouldLog) {
-            Logger::info(str::format("[getCacheKey] RT REPLACEMENT: replacement=0x", std::hex, replacementHash,
-                                    " geomHash=0x", geomHash,
-                                    " = combined=0x", combinedHash, std::dec));
+            Logger::info(str::format("[getCacheKey] RT REPLACEMENT: using texture hash only=0x", std::hex, replacementHash, std::dec));
           }
-          return {combinedHash, true};
+          return {replacementHash, true};
         }
         if (shouldLog) {
           Logger::warn(str::format("[getCacheKey] INVALID RT REPLACEMENT! Returning isValid=FALSE"));
@@ -219,17 +215,16 @@ namespace dxvk {
         }
         return {combinedHash, true};
       }
-      // For regular materials, combine geometry hash + material hash
+      // For regular materials, use ONLY material hash as cache key
+      // CRITICAL FIX: FullGeometryHash includes per-frame buffer addresses that change,
+      // causing cache misses every frame. For static materials, material hash alone is stable
+      // and sufficient for caching - same material = same shader output.
       XXH64_hash_t matHash = drawCallState.getMaterialData().getHash();
-      XXH64_hash_t geomHash = drawCallState.getGeometryData().getHashForRule<rules::FullGeometryHash>();
-      // Combine: geometry hash with material hash for uniqueness
-      XXH64_hash_t combinedHash = XXH64(&matHash, sizeof(XXH64_hash_t), geomHash);
       if (shouldLog) {
         Logger::info(str::format("[getCacheKey] REGULAR MATERIAL: matHash=0x", std::hex, matHash,
-                                " geomHash=0x", geomHash,
-                                " combined=0x", combinedHash, std::dec));
+                                " (using matHash only for stable caching)", std::dec));
       }
-      return {combinedHash, true};
+      return {matHash, true};
     }
 
     struct CapturedShaderOutput {

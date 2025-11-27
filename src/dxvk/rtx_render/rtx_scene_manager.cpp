@@ -524,7 +524,11 @@ namespace dxvk {
     // Assume we won't need this, and update the value if required
     output.previousPositionBuffer = RaytraceBuffer();
 
-    const size_t vertexStride = (input.isVertexDataInterleaved() && input.areFormatsGpuFriendly()) ? input.positionBuffer.stride() : RtxGeometryUtils::computeOptimalVertexStride(input);
+    // Check if buffer is large enough for direct interleaved copy
+    const size_t interleavedSize = input.vertexCount * input.positionBuffer.stride();
+    const bool bufferLargeEnough = interleavedSize <= input.positionBuffer.length();
+    const bool canUseDirectCopy = input.isVertexDataInterleaved() && input.areFormatsGpuFriendly() && bufferLargeEnough;
+    const size_t vertexStride = canUseDirectCopy ? input.positionBuffer.stride() : RtxGeometryUtils::computeOptimalVertexStride(input);
 
     switch (result) {
       case ObjectCacheState::KBuildBVH: {

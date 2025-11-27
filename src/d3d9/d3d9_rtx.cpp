@@ -326,7 +326,20 @@ namespace dxvk {
 
       ScopedCpuProfileZoneN("Process Vertices");
       const int32_t vertexOffset = ctx.offset + ctx.stride * vertexIndexOffset;
-      const uint32_t numVertexBytes = ctx.stride * geoData.vertexCount;
+
+      // Calculate actual available bytes and determine effective stride
+      uint32_t effectiveStride = ctx.stride;
+      const VkDeviceSize availableBytes = (ctx.mappedSlice.length > vertexOffset)
+        ? (ctx.mappedSlice.length - vertexOffset) : 0;
+
+      if (geoData.vertexCount > 0 && availableBytes < ctx.stride * geoData.vertexCount) {
+        // Buffer too small for declared stride - calculate actual stride from available space
+        effectiveStride = static_cast<uint32_t>(availableBytes / geoData.vertexCount);
+        // Align to 4 bytes and ensure minimum size for position (12 bytes)
+        effectiveStride = std::max((effectiveStride / 4) * 4, 12u);
+      }
+
+      const uint32_t numVertexBytes = effectiveStride * geoData.vertexCount;
 
       // Validating index data here, vertexCount and vertexIndexOffset accounts for the min/max indices
       if (RtxOptions::validateCPUIndexData()) {
@@ -412,7 +425,7 @@ namespace dxvk {
           }
         }
 
-        *targetBuffer = RasterBuffer(streamCopies[element.Stream], element.Offset, ctx.stride, DecodeDecltype(D3DDECLTYPE(element.Type)));
+        *targetBuffer = RasterBuffer(streamCopies[element.Stream], element.Offset, effectiveStride, DecodeDecltype(D3DDECLTYPE(element.Type)));
         assert(targetBuffer->offset() % 4 == 0);
       }
     }
@@ -1189,8 +1202,24 @@ namespace dxvk {
     bool triggerRtxInjection = drawType.triggerRtxInjection;
     const bool forceCaptureAll = ShaderOutputCapturer::captureAllDraws();
     if (status == RtxGeometryStatus::Rasterized && forceCaptureAll) {
-      status = RtxGeometryStatus::RayTraced;
-      m_activeDrawCallState.forceShaderCapture = true;
+      // CRITICAL PERF FIX: Filter out fullscreen triangles BEFORE forcing shader capture!
+      // Without this filter, captureAllDraws=true captures post-processing passes,
+      // causing massive overhead and freezing the game during loading.
+      // Fullscreen triangles (1-2 triangles) are screen-space effects, not 3D geometry.
+      uint32_t vertCount = 0;
+      switch (drawContext.PrimitiveType) {
+        case D3DPT_TRIANGLELIST:  vertCount = drawContext.PrimitiveCount * 3; break;
+        case D3DPT_TRIANGLESTRIP: vertCount = drawContext.PrimitiveCount + 2; break;
+        case D3DPT_TRIANGLEFAN:   vertCount = drawContext.PrimitiveCount + 2; break;
+        default: vertCount = drawContext.PrimitiveCount; break;
+      }
+
+      // Skip fullscreen triangles (1-2 triangles = 3-6 verts) - these are post-processing
+      const bool isFullscreenTriangle = (vertCount <= 6);
+      if (!isFullscreenTriangle) {
+        status = RtxGeometryStatus::RayTraced;
+        m_activeDrawCallState.forceShaderCapture = true;
+      }
     }
 
     // When raytracing is enabled we want to completely remove the ignored drawcalls from further processing as early as possible
@@ -2187,11 +2216,13 @@ namespace dxvk {
   }
 
   void D3D9Rtx::captureOriginalD3D9Buffers(const Direct3DState9& state) {
-    // DEBUG: Log timing to compare with SetVertexShaderConstantF calls
+    // CHRONO: Detailed timing to find performance bottleneck
+    auto tStart = std::chrono::high_resolution_clock::now();
     static uint32_t captureTimingLogCount = 0;
-    if (++captureTimingLogCount <= 10) {
-      Logger::info(str::format("[CAPTURE-TIMING] #", captureTimingLogCount, " captureOriginalD3D9Buffers CALLED - starting capture"));
-    }
+    static double totalCaptureTimeMs = 0.0;
+    static uint32_t totalCaptureCalls = 0;
+    captureTimingLogCount++;
+    totalCaptureCalls++;
 
     // Clear previous captures
     m_activeDrawCallState.capturedVertexStreams.clear();
@@ -2443,6 +2474,8 @@ namespace dxvk {
       return;
     }
 
+    auto tVBStart = std::chrono::high_resolution_clock::now();
+
     // Get the vertex elements from the declaration
     const auto& elements = state.vertexDecl->GetElements();
     if (elements.empty()) {
@@ -2577,43 +2610,51 @@ namespace dxvk {
       }
     }
 
-    // DEBUG: Log capture result BEFORE validation
-    static uint32_t captureResultLog = 0;
+    // CHRONO: End timing and log
+    auto tEnd = std::chrono::high_resolution_clock::now();
+    auto tVBEnd = tEnd;
+    double vbTimeMs = std::chrono::duration<double, std::milli>(tVBEnd - tVBStart).count();
+    double totalTimeMs = std::chrono::duration<double, std::milli>(tEnd - tStart).count();
+    totalCaptureTimeMs += totalTimeMs;
+
     const uint32_t finalVertCount = m_activeDrawCallState.geometryData.vertexCount;
     const size_t streamCount = m_activeDrawCallState.capturedVertexStreams.size();
-    if (finalVertCount > 6 && captureResultLog++ < 50) {
-      Logger::info(str::format("[CAPTURE-RESULT] verts=", finalVertCount, " capturedStreams=", streamCount,
-        " BEFORE shouldCaptureStatic check"));
+
+    // Log every 100 calls or if time is significant
+    if (captureTimingLogCount <= 50 || (captureTimingLogCount % 100 == 0) || totalTimeMs > 1.0) {
+      Logger::info(str::format("[CAPTURE-CHRONO #", captureTimingLogCount, "] verts=", finalVertCount,
+        " streams=", streamCount, " VBtime=", std::fixed, std::setprecision(3), vbTimeMs, "ms",
+        " totalTime=", totalTimeMs, "ms avgTime=", (totalCaptureTimeMs / totalCaptureCalls), "ms",
+        " totalCalls=", totalCaptureCalls));
     }
 
-    // CRITICAL FIX: Validate VS constants AFTER vertex buffer capture completes
-    // If matrices are invalid (all zeros), clear ALL captured data to mark it as invalid
-    // But DON'T return early - we've already done the capture work
-    if (!ShaderOutputCapturer::shouldCaptureStatic(m_activeDrawCallState)) {
-      if (finalVertCount > 6 && captureResultLog < 100) {
-        Logger::warn(str::format("[CAPTURE-CLEARED] verts=", finalVertCount, " streamCount=", streamCount,
-          " - shouldCaptureStatic returned FALSE, clearing captured data!"));
-      }
-      m_activeDrawCallState.vertexShaderConstantData.clear();
-      m_activeDrawCallState.capturedVertexStreams.clear();
-      m_activeDrawCallState.capturedVertexElements.clear();
-      m_activeDrawCallState.originalIndexData.clear();
-    } else {
-      if (finalVertCount > 6 && captureResultLog < 100) {
-        Logger::info(str::format("[CAPTURE-KEPT] verts=", finalVertCount, " streamCount=", streamCount,
-          " - shouldCaptureStatic returned TRUE, keeping captured data"));
-      }
-    }
+    // NOTE: Removed duplicate shouldCaptureStatic() call - it was already checked in shouldCaptureBuffers()
+    // This was causing DOUBLE evaluation and potential data clearing after expensive capture!
+  }
+
+  void D3D9Rtx::captureShaderPointersOnly(const Direct3DState9& state) {
+    // CRITICAL FIX: Even when skipping full buffer capture (cached materials),
+    // we MUST still copy shader pointers for re-execution!
+    // This is a lightweight operation - just copies 3 raw pointers.
+    m_activeDrawCallState.vertexShader = state.vertexShader.ptr();
+    m_activeDrawCallState.pixelShader = state.pixelShader.ptr();
+    m_activeDrawCallState.vertexDecl = state.vertexDecl.ptr();
   }
 
   bool D3D9Rtx::shouldCaptureBuffers(const Direct3DState9& state) const {
     // OPTIMIZATION: Quick check before expensive buffer copies
     // Only copy buffers if this draw call will actually be captured for shader re-execution
 
-    // DEBUG: Log all calls with geometry info
+    // DEBUG: Log calls with high vertex count (actual geometry) or every 100th call
     static uint32_t shouldCaptureLog = 0;
     const uint32_t vertCount = m_activeDrawCallState.geometryData.vertexCount;
-    const bool logThis = (vertCount > 6 && shouldCaptureLog++ < 50);
+    shouldCaptureLog++;
+    // Log if: first 30, high vertex count (>100), or every 500th call
+    const bool logThis = (shouldCaptureLog <= 30) || (vertCount > 100) || (shouldCaptureLog % 500 == 0);
+
+    if (logThis) {
+      Logger::info(str::format("[SHOULD-CAPTURE #", shouldCaptureLog, "] ENTER vertCount=", vertCount));
+    }
 
     // Requirement 1: Must have both vertex and pixel shaders
     if (state.vertexShader == nullptr || state.pixelShader == nullptr) {

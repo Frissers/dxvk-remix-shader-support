@@ -4,6 +4,7 @@
 
 // Vertex inputs - only position and texcoord (no color - format mismatch issues)
 // The C++ code binds: position at binding 0, texcoord at binding 1
+// Position is vec3 - game vertex data is object space, we transform to clip space
 layout(location = 0) in vec3 i_position;
 layout(location = 1) in vec2 i_texcoord;
 // NOTE: Removed i_color0 at location 2 - D3D9 games use R8G8B8A8_UINT which doesn't
@@ -32,6 +33,7 @@ layout(push_constant) uniform PushConstants {
 // - Outputs to ALL locations so original game PS can read what it needs
 void main() {
   // Transform vertex to clip space using our projection
+  // i_position is object space vec3, W=1.0 for position transformation
   gl_Position = constants.u_projection * vec4(i_position, 1.0);
 
   // Route instance index to layer for texture array rendering (batching)

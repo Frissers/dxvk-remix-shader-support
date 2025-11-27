@@ -678,6 +678,9 @@ namespace dxvk {
 
     m_device->vkd()->vkCreateDescriptorPool(m_device->handle(), &pool_info, nullptr, &m_imguiPool);
 
+    Logger::info(str::format("[DescPool] Created IMGUI pool 0x", std::hex, (uint64_t)m_imguiPool, std::dec,
+      " poolSizeCount=", pool_info.poolSizeCount, " (has UNIFORM_BUFFER=1000)"));
+
     // Initialize the core structures of ImGui and ImPlot
     m_context = ImGui::CreateContext();
     m_plotContext = ImPlot::CreateContext();

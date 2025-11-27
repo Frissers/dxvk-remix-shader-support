@@ -986,26 +986,30 @@ namespace dxvk {
     const bool implicit = m_programInfo.majorVersion() < 2 || m_moduleInfo.options.forceSamplerTypeSpecConstants;
 
     if (!implicit) {
-      DxsoSamplerType samplerType = 
+      DxsoSamplerType samplerType =
         SamplerTypeFromTextureType(type);
 
       DclSampler(idx, binding, samplerType, false, implicit);
 
       if (samplerType != SamplerTypeTexture3D) {
         // We could also be depth compared!
-        DclSampler(idx, binding, samplerType, true, implicit);
+        // NV-DXVK: Use separate binding for shadow samplers to avoid Vulkan validation errors
+        // when color textures are bound but shader declares both sampler2D and sampler2DShadow
+        const uint32_t shadowBinding = binding + shadowSamplerBindingOffset;
+        DclSampler(idx, shadowBinding, samplerType, true, implicit);
       }
     }
     else {
       // Could be any of these!
       // We will check with the spec constant at sample time.
+      const uint32_t shadowBinding = binding + shadowSamplerBindingOffset;
       for (uint32_t i = 0; i < SamplerTypeCount; i++) {
         auto samplerType = static_cast<DxsoSamplerType>(i);
 
         DclSampler(idx, binding, samplerType, false, implicit);
 
         if (samplerType != SamplerTypeTexture3D)
-          DclSampler(idx, binding, samplerType, true, implicit);
+          DclSampler(idx, shadowBinding, samplerType, true, implicit);
       }
     }
 
@@ -1023,6 +1027,17 @@ namespace dxvk {
     resource.view   = implicit ? VK_IMAGE_VIEW_TYPE_MAX_ENUM : viewType;
     resource.access = VK_ACCESS_SHADER_READ_BIT;
     m_resourceSlots.push_back(resource);
+
+    // NV-DXVK: Also register the shadow sampler binding (separate from color sampler)
+    // This ensures DXVK creates descriptor set layout entries for both bindings
+    // Use PARTIALLY_BOUND flag so the descriptor doesn't need to be bound when not accessed
+    DxvkResourceSlot shadowResource;
+    shadowResource.slot   = binding + shadowSamplerBindingOffset;
+    shadowResource.type   = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    shadowResource.view   = implicit ? VK_IMAGE_VIEW_TYPE_MAX_ENUM : viewType;
+    shadowResource.access = VK_ACCESS_SHADER_READ_BIT;
+    shadowResource.flags  = VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT;
+    m_resourceSlots.push_back(shadowResource);
   }
 
 

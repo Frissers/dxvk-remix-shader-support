@@ -1068,6 +1068,19 @@ namespace dxvk {
         if (shouldCapture) {
           TextureRef capturedTexture;
 
+          // DEBUG: Log details before capture attempt
+          static uint32_t s_captureAttempt = 0;
+          s_captureAttempt++;
+          const auto& geoData = drawCallState.geometryData;
+          const auto& matData = drawCallState.getMaterialData();
+          Logger::info(str::format("[SHADER-REEXEC-PRE #", s_captureAttempt, "] verts=", geoData.vertexCount,
+            " indexed=", geoData.indexCount > 0 ? 1 : 0,
+            " texHash=0x", std::hex, matData.getColorTexture().getImageHash(), std::dec,
+            " hasVS=", drawCallState.vertexShader != nullptr ? 1 : 0,
+            " hasPS=", drawCallState.pixelShader != nullptr ? 1 : 0,
+            " numCapturedTex=", drawCallState.capturedD3D9Textures.size(),
+            " forceCapture=", drawCallState.forceShaderCapture ? 1 : 0));
+
           // Re-execute the shaders with captured D3D9 state
           auto tCaptureCallStart = std::chrono::high_resolution_clock::now();
           const bool captured = shaderCapturer.captureDrawCall(
@@ -1087,8 +1100,15 @@ namespace dxvk {
             // This will be looked up later when the material is processed
             XXH64_hash_t originalTextureHash = drawCallState.getMaterialData().getColorTexture().getImageHash();
             shaderCapturer.registerTextureReplacement(originalTextureHash, capturedTexture);
+          } else if (captured) {
+            // GPU batching mode: capture queued, texture will be ready next frame
+            // This is NOT a failure - just deferred execution
+            static uint32_t s_queuedLogCount = 0;
+            if (++s_queuedLogCount <= 20) {
+              Logger::info(str::format("[SHADER-REEXEC-QUEUED #", s_captureAttempt, "] Capture queued for next frame (took ", std::fixed, std::setprecision(2), captureCallTime, " μs)"));
+            }
           } else {
-            Logger::warn(str::format("[SHADER-REEXEC] Failed to capture shader output (took ", std::fixed, std::setprecision(2), captureCallTime, " μs)"));
+            Logger::warn(str::format("[SHADER-REEXEC-FAIL #", s_captureAttempt, "] Failed (took ", std::fixed, std::setprecision(2), captureCallTime, " μs)"));
           }
         }
       }

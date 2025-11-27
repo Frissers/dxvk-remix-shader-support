@@ -370,6 +370,26 @@ namespace dxvk {
     void clearRenderPassBarriers();
 
     /**
+     * \brief Sets the load op for a color attachment
+     *
+     * Sets the load operation for a color attachment before the render pass starts.
+     * Use CLEAR or DONT_CARE to avoid READ access requirements.
+     * \param [in] index Color attachment index (0-7)
+     * \param [in] loadOp The load operation
+     * \param [in] clearValue Clear value if loadOp is CLEAR (optional)
+     */
+    void setColorAttachmentLoadOp(uint32_t index, VkAttachmentLoadOp loadOp, VkClearColorValue clearValue = {});
+
+    /**
+     * \brief Ends the current render pass
+     *
+     * Forces the current render pass to end so that a new render pass
+     * can be started with different configuration. Use this before
+     * bindRenderTargets() when you need to ensure a clean render pass state.
+     */
+    void endCurrentRenderPass();
+
+    /**
      * \brief Clears an image view
      *
      * Can be used to clear sub-regions of storage images
