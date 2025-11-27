@@ -152,6 +152,7 @@ uint32_t getFirstBillboardIndex() const { return m_firstBillboard; }
   bool isViewModelVirtual() const;
 
   bool isUnlinkedForGC() const { return m_isUnlinkedForGC; }
+  bool isInsideFrustum() const { return m_isInsideFrustum; }
 
   PrimInstanceOwner& getPrimInstanceOwner() { return m_primInstanceOwner; }
   

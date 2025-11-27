@@ -295,49 +295,6 @@ namespace dxvk {
     // Upload
     auto& data = *reinterpret_cast<D3D9RtxVertexCaptureData*>(constants.mapPtr);
 
-    /* COMMENTED OUT - new aspect ratio fix not in Bored commit
-    // ASPECT RATIO FIX FOR SHADER CAPTURE:
-    // When shader reexecution is enabled, we need to inverse-transform clip-space positions
-    // back to object space. If the game's projection has wrong aspect ratio, the captured
-    // geometry will be distorted.
-    //
-    // The fix: If the projection's aspect ratio is NOT a common widescreen ratio (16:9, 16:10, 21:9, 4:3),
-    // correct it to 16:9 since that's the most common modern display ratio.
-    Matrix4 correctedProj = m_activeDrawCallState.transformData.viewToProjection;
-    {
-      float projScaleX = std::abs(correctedProj[0][0]);
-      float projScaleY = std::abs(correctedProj[1][1]);
-      float projAspect = (projScaleX > 0.001f) ? projScaleY / projScaleX : 1.0f;
-
-      // Common aspect ratios to NOT correct (these are likely intentional):
-      // 16:9 = 1.777, 16:10 = 1.6, 21:9 = 2.333, 4:3 = 1.333
-      bool isCommonAspect =
-        (projAspect > 1.72f && projAspect < 1.83f) ||   // 16:9 range
-        (projAspect > 1.55f && projAspect < 1.65f) ||   // 16:10 range
-        (projAspect > 2.28f && projAspect < 2.40f) ||   // 21:9 range
-        (projAspect > 1.28f && projAspect < 1.38f);     // 4:3 range
-
-      // Only correct if NOT a common aspect (meaning the game has a weird internal aspect)
-      // AND only if projAspect is close to 1:1 (which often indicates a bug)
-      if (projScaleX > 0.001f && projScaleY > 0.001f && !isCommonAspect) {
-        // Correct to 16:9
-        float targetAspect = 16.0f / 9.0f;
-        float correctedScaleX = projScaleY / targetAspect;
-        float sign = (correctedProj[0][0] >= 0) ? 1.0f : -1.0f;
-        correctedProj[0][0] = sign * correctedScaleX;
-
-        static uint32_t s_captureAspectFixLogCount = 0;
-        if (s_captureAspectFixLogCount++ < 20) {
-          Logger::info(str::format("[CAPTURE-ASPECT-FIX] Corrected non-standard projection:",
-            " origScaleX=", projScaleX, " scaleY=", projScaleY,
-            " projAspect=", projAspect, " correctedScaleX=", correctedScaleX));
-        }
-      }
-    }
-
-    data.invProj = inverse(correctedProj);
-    */
-    // OLD CODE from Bored commit:
     data.invProj = inverse(m_activeDrawCallState.transformData.viewToProjection);
     data.viewToWorld = inverseAffine(m_activeDrawCallState.transformData.worldToView);
     data.worldToObject = inverseAffine(m_activeDrawCallState.transformData.objectToWorld);
@@ -471,8 +428,10 @@ namespace dxvk {
     transformData.worldToView = d3d9State().transforms[GetTransformIndex(D3DTS_VIEW)];
     transformData.viewToProjection = d3d9State().transforms[GetTransformIndex(D3DTS_PROJECTION)];
 
-    /* COMMENTED OUT - matrix extraction not in Bored commit
     // NV-DXVK start: Extract camera matrices from vertex shader constants when using programmable VS
+    // DISABLED: This entire block was causing oval distortion during camera movement
+    // The Bored commit did not have this - just used fixed-function transforms above
+#if 0
     // This is needed for games that use vertex shaders for transforms instead of fixed-function
     //
     // ONE CLEAR PATH: Shader analysis tells us registers, cache from SetVertexShaderConstantF gives us values
@@ -756,19 +715,10 @@ namespace dxvk {
               // proj = inverse(view) * viewProj
               // For Z-translation: proj[i] = viewProj[i] for i<3, proj[3] = viewProj[3] - tz*viewProj[2]
 
-              // Get actual screen aspect ratio and correct scaleX to match
-              // The game's projection may be built for a different internal aspect ratio
-              float screenAspect = (m_activePresentParams && m_activePresentParams->BackBufferHeight > 0)
-                ? (float)m_activePresentParams->BackBufferWidth / (float)m_activePresentParams->BackBufferHeight
-                : 16.0f / 9.0f;
-
-              // Correct scaleX based on actual screen aspect ratio
-              // Keep scaleY (vertical FOV), recalculate scaleX = scaleY / screenAspect
-              float scaleY = std::abs(viewProjMatrix[1][1]);
-              float correctedScaleX = scaleY / screenAspect;
-
+              // DISABLED: Aspect ratio correction was causing oval distortion
+              // Use the original projection values from the game
               extractedProj = Matrix4(
-                correctedScaleX, viewProjMatrix[0][1], viewProjMatrix[0][2], viewProjMatrix[0][3],
+                viewProjMatrix[0][0], viewProjMatrix[0][1], viewProjMatrix[0][2], viewProjMatrix[0][3],
                 viewProjMatrix[1][0], viewProjMatrix[1][1], viewProjMatrix[1][2], viewProjMatrix[1][3],
                 viewProjMatrix[2][0], viewProjMatrix[2][1], viewProjMatrix[2][2], viewProjMatrix[2][3],
                 viewProjMatrix[3][0] - tz*viewProjMatrix[2][0],
@@ -782,7 +732,7 @@ namespace dxvk {
 
               if (logThisFrame) {
                 Logger::info(str::format("[PROJ-EXTRACTED] Extracted from Z-translation view (tz=", tz, ") - RELIABLE",
-                  "\n  screenAspect=", screenAspect, " origScaleX=", viewProjMatrix[0][0], " correctedScaleX=", correctedScaleX,
+                  "\n  scaleX=", viewProjMatrix[0][0], " scaleY=", viewProjMatrix[1][1],
                   "\n  proj row0=", extractedProj[0],
                   "\n  proj row1=", extractedProj[1],
                   "\n  proj row2=", extractedProj[2],
@@ -966,18 +916,16 @@ namespace dxvk {
     }
 
     // NV-DXVK end
-    */
+#endif  // Disabled matrix extraction block
 
     transformData.objectToView = transformData.worldToView * transformData.objectToWorld;
 
-    /* ALSO COMMENTED OUT - logging references extractedFromShader
     // NV-DXVK start: UNLIMITED per-frame logging
     static uint32_t s_lastLoggedFrame = UINT32_MAX;
     uint32_t currentFrame = m_parent->GetDXVKDevice()->getCurrentFrameId();
     if (currentFrame != s_lastLoggedFrame) {
       s_lastLoggedFrame = currentFrame;
       Logger::info(str::format("[FRAME-MATRICES] Frame=", currentFrame,
-        " extracted=", extractedFromShader,
         "\n  VIEW row0=[", transformData.worldToView[0][0], ",", transformData.worldToView[0][1], ",", transformData.worldToView[0][2], ",", transformData.worldToView[0][3], "]",
         "\n  VIEW row3=[", transformData.worldToView[3][0], ",", transformData.worldToView[3][1], ",", transformData.worldToView[3][2], ",", transformData.worldToView[3][3], "]",
         "\n  PROJ row0=[", transformData.viewToProjection[0][0], ",", transformData.viewToProjection[0][1], ",", transformData.viewToProjection[0][2], ",", transformData.viewToProjection[0][3], "]",
@@ -985,7 +933,6 @@ namespace dxvk {
         "\n  WORLD row0=[", transformData.objectToWorld[0][0], ",", transformData.objectToWorld[0][1], ",", transformData.objectToWorld[0][2], ",", transformData.objectToWorld[0][3], "]"));
     }
     // NV-DXVK end
-    */
 
     // Some games pass invalid matrices which D3D9 apparently doesnt care about.
     // since we'll be doing inversions and other matrix operations, we need to 

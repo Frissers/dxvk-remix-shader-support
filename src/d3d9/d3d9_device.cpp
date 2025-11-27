@@ -60,6 +60,23 @@
 #endif
 
 namespace dxvk {
+  // Extern declarations for matrix caching by register (defined in d3d9_rtx.cpp)
+  extern std::array<Matrix4, 256> g_cachedMatricesByRegister;
+  extern std::array<bool, 256> g_hasMatrixAtRegister;
+
+  // Extern declarations for transform caching (D3DTS_VIEW, D3DTS_PROJECTION) - defined in d3d9_rtx.cpp
+  extern Matrix4 g_cachedViewTransform;
+  extern Matrix4 g_cachedProjectionTransform;
+  extern bool g_hasViewTransform;
+  extern bool g_hasProjectionTransform;
+
+  // Track the view matrix register identified by shader analysis - defined in d3d9_rtx.cpp
+  extern int g_shaderAnalyzedViewReg;
+
+  // Camera position from shader constant c8 (vs_worldCamPos) - defined in d3d9_rtx.cpp
+  extern Vector4 g_cachedCameraPosition;
+  extern bool g_hasCachedCameraPosition;
+
   static const bool s_explicitFlush = (env::getEnvVar("DXVK_EXPLICIT_FLUSH") == "1");
 
   D3D9DeviceEx::D3D9DeviceEx(
@@ -1779,6 +1796,15 @@ namespace dxvk {
     if (unlikely(ShouldRecord()))
       return m_recorder->SetViewport(pViewport);
 
+    // Debug: Log viewport dimensions
+    static uint32_t s_viewportLogCount = 0;
+    if (pViewport && s_viewportLogCount++ < 50) {
+      float aspect = (pViewport->Height > 0) ? (float)pViewport->Width / (float)pViewport->Height : 0.0f;
+      Logger::info(str::format("[VIEWPORT] X=", pViewport->X, " Y=", pViewport->Y,
+        " W=", pViewport->Width, " H=", pViewport->Height,
+        " aspect=", aspect, " MinZ=", pViewport->MinZ, " MaxZ=", pViewport->MaxZ));
+    }
+
     if (m_state.viewport == *pViewport)
       return D3D_OK;
 
@@ -2734,6 +2760,75 @@ namespace dxvk {
     if (unlikely(!PrimitiveCount))
       return S_OK;
 
+    // Cache VS constants during draw calls for camera extraction in processRenderState
+    // Use shader analysis to get the correct register dynamically - no hardcoding!
+    if (m_state.vertexShader != nullptr && NumVertices > 50) {
+      const auto& bytecode = m_state.vertexShader->GetCommonShader()->GetBytecode();
+      if (!bytecode.empty()) {
+        uint64_t vsHash = XXH64(bytecode.data(), bytecode.size(), 0);
+        auto* compatManager = m_rtx.getShaderCompatibilityManager();
+        if (compatManager) {
+          const auto* shaderInfo = compatManager->getShaderInfo(vsHash);
+          if (shaderInfo && shaderInfo->analyzed && shaderInfo->analysisResult.success) {
+            const auto& matrixInfo = shaderInfo->analysisResult.matrixInfo;
+            int viewReg = matrixInfo.viewMatrixRegister;
+            int worldReg = matrixInfo.worldMatrixRegister;
+
+            const auto& vsConsts = m_state.vsConsts.fConsts;
+
+            // Cache view matrix at detected register if valid
+            if (viewReg >= 0 && viewReg < 252) {
+              // Check if matrix has non-zero values
+              bool hasNonZero = (vsConsts[viewReg].x != 0 || vsConsts[viewReg].y != 0 ||
+                                 vsConsts[viewReg].z != 0 || vsConsts[viewReg].w != 0);
+              if (hasNonZero) {
+                // Check translation row (viewReg+3) for real camera position
+                int transRow = viewReg + 3;
+                float transMag = std::sqrt(vsConsts[transRow].x*vsConsts[transRow].x +
+                                           vsConsts[transRow].y*vsConsts[transRow].y +
+                                           vsConsts[transRow].z*vsConsts[transRow].z);
+                // Only cache if translation magnitude >= 5 (real camera, not identity-like)
+                if (transMag >= 5.0f) {
+                  g_cachedMatricesByRegister[viewReg] = Matrix4(
+                    vsConsts[viewReg].x, vsConsts[viewReg].y, vsConsts[viewReg].z, vsConsts[viewReg].w,
+                    vsConsts[viewReg+1].x, vsConsts[viewReg+1].y, vsConsts[viewReg+1].z, vsConsts[viewReg+1].w,
+                    vsConsts[viewReg+2].x, vsConsts[viewReg+2].y, vsConsts[viewReg+2].z, vsConsts[viewReg+2].w,
+                    vsConsts[viewReg+3].x, vsConsts[viewReg+3].y, vsConsts[viewReg+3].z, vsConsts[viewReg+3].w
+                  );
+                  g_hasMatrixAtRegister[viewReg] = true;
+
+                  // Record this as the shader-analyzed view register for processRenderState to use
+                  g_shaderAnalyzedViewReg = viewReg;
+
+                  // Debug logging
+                  static uint32_t s_drawConstLogCount = 0;
+                  if (s_drawConstLogCount < 5) {
+                    s_drawConstLogCount++;
+                    Logger::info(str::format("[DRAW-CONST-CACHE] Caching view matrix at reg c", viewReg, " transMag=", transMag));
+                  }
+                }
+              }
+            }
+
+            // Cache world matrix at detected register if valid
+            if (worldReg >= 0 && worldReg < 252) {
+              bool hasNonZero = (vsConsts[worldReg].x != 0 || vsConsts[worldReg].y != 0 ||
+                                 vsConsts[worldReg].z != 0 || vsConsts[worldReg].w != 0);
+              if (hasNonZero) {
+                g_cachedMatricesByRegister[worldReg] = Matrix4(
+                  vsConsts[worldReg].x, vsConsts[worldReg].y, vsConsts[worldReg].z, vsConsts[worldReg].w,
+                  vsConsts[worldReg+1].x, vsConsts[worldReg+1].y, vsConsts[worldReg+1].z, vsConsts[worldReg+1].w,
+                  vsConsts[worldReg+2].x, vsConsts[worldReg+2].y, vsConsts[worldReg+2].z, vsConsts[worldReg+2].w,
+                  vsConsts[worldReg+3].x, vsConsts[worldReg+3].y, vsConsts[worldReg+3].z, vsConsts[worldReg+3].w
+                );
+                g_hasMatrixAtRegister[worldReg] = true;
+              }
+            }
+          }
+        }
+      }
+    }
+
     // NV-DXVK start: geometry processing
     const D3D9Rtx::DrawContext drawContext = { PrimitiveType, BaseVertexIndex, MinVertexIndex, NumVertices, StartIndex, PrimitiveCount, TRUE };
     const PrepareDrawFlags drawPrepare = m_rtx.PrepareDrawGeometryForRT(true, drawContext);
@@ -3379,18 +3474,101 @@ namespace dxvk {
     ScopedCpuProfileZone();
     D3D9DeviceLock lock = LockDevice();
 
-    // DEBUG: Log when game sets VS constants c[0]-c[3] (transformation matrices)
-    static uint32_t setVSConstLogCount = 0;
-    if (setVSConstLogCount < 10 && StartRegister <= 3 && (StartRegister + Vector4fCount) > 0 && pConstantData != nullptr) {
-      setVSConstLogCount++;
-      Logger::info(str::format("[SET-VS-CONST] #", setVSConstLogCount, " Game calling SetVertexShaderConstantF:"));
-      Logger::info(str::format("[SET-VS-CONST]   StartRegister=", StartRegister, " Vector4fCount=", Vector4fCount));
+    // Debug: Log ALL SetVertexShaderConstantF calls for key registers (c0-c7, c48-c55)
+    if (pConstantData != nullptr) {
+      bool isKeyRegRange = (StartRegister <= 7) || (StartRegister >= 48 && StartRegister <= 55);
+      static uint32_t s_keyRegSetLogCount = 0;
+      if (isKeyRegRange && s_keyRegSetLogCount++ < 100) {
+        Logger::info(str::format("[SETVSCONST-KEYREG] c", StartRegister, " count=", Vector4fCount,
+          " data=[", pConstantData[0], ",", pConstantData[1], ",", pConstantData[2], ",", pConstantData[3], "]"));
+      }
+    }
 
-      // Log the actual constant values being set
-      for (uint32_t i = 0; i < Vector4fCount && (StartRegister + i) < 4; i++) {
-        const float* vec = &pConstantData[i * 4];
-        Logger::info(str::format("[SET-VS-CONST]   c[", StartRegister + i, "] = (",
-                                vec[0], ", ", vec[1], ", ", vec[2], ", ", vec[3], ")"));
+    // Cache camera position from c8 (vs_worldCamPos) if this call covers it
+    // c8 is at offset 8 from start, so if StartRegister <= 8 and StartRegister + count > 8
+    if (pConstantData != nullptr && StartRegister <= 8 && StartRegister + Vector4fCount > 8) {
+      uint32_t c8Offset = 8 - StartRegister;
+      const float* c8Data = &pConstantData[c8Offset * 4];
+      g_cachedCameraPosition = Vector4(c8Data[0], c8Data[1], c8Data[2], c8Data[3]);
+      g_hasCachedCameraPosition = true;
+
+      static uint32_t s_camPosLogCount = 0;
+      if (s_camPosLogCount++ < 20) {
+        Logger::info(str::format("[CAMPOS-CACHE] c8 = (", c8Data[0], ", ", c8Data[1], ", ", c8Data[2], ", ", c8Data[3], ")"));
+      }
+    }
+
+    // Cache matrices at any register when game sets 4+ consecutive vectors (potential 4x4 matrix)
+    // This allows us to retrieve view/proj matrices based on shader analysis later
+    if (pConstantData != nullptr && Vector4fCount >= 4) {
+      // Debug: Log ALL SetVertexShaderConstantF calls with 4+ vectors
+      static uint32_t s_setConstLogCount = 0;
+      if (s_setConstLogCount++ < 50) {
+        Logger::info(str::format("[SETVSCONST] StartReg=c", StartRegister, " count=", Vector4fCount,
+          " first4=[", pConstantData[0], ",", pConstantData[1], ",", pConstantData[2], ",", pConstantData[3], "]"));
+      }
+
+      // Cache matrices at each 4-register boundary covered by this write
+      for (uint32_t reg = StartRegister; reg + 4 <= StartRegister + Vector4fCount && reg < 252; reg++) {
+        // Only cache at the start of 4-register groups that are fully covered
+        const float* matrixData = &pConstantData[(reg - StartRegister) * 4];
+
+        // Check if this looks like a valid matrix (not all zeros, not identity)
+        bool hasNonZero = false;
+        bool isIdentity = true;
+        for (int i = 0; i < 16; i++) {
+          if (matrixData[i] != 0.0f) hasNonZero = true;
+          float expected = (i % 5 == 0) ? 1.0f : 0.0f;
+          if (matrixData[i] != expected) isIdentity = false;
+        }
+
+        // Log interesting registers (c0, c4, c48) regardless of filtering
+        if ((reg == 0 || reg == 4 || reg == 48) && hasNonZero) {
+          float transMag = std::sqrt(matrixData[12]*matrixData[12] +
+                                     matrixData[13]*matrixData[13] +
+                                     matrixData[14]*matrixData[14]);
+          static uint32_t s_keyRegLogCount = 0;
+          if (s_keyRegLogCount++ < 30) {
+            Logger::info(str::format("[SETVSCONST-KEY] c", reg, " transMag=", transMag, " isIdentity=", isIdentity,
+              "\n  row0=[", matrixData[0], ",", matrixData[1], ",", matrixData[2], ",", matrixData[3], "]",
+              "\n  row1=[", matrixData[4], ",", matrixData[5], ",", matrixData[6], ",", matrixData[7], "]",
+              "\n  row2=[", matrixData[8], ",", matrixData[9], ",", matrixData[10], ",", matrixData[11], "]",
+              "\n  row3=[", matrixData[12], ",", matrixData[13], ",", matrixData[14], ",", matrixData[15], "]"));
+          }
+        }
+
+        if (hasNonZero && !isIdentity) {
+          // Check translation magnitude - row 3 (indices 12,13,14) should have meaningful translation
+          // This filters out post-processing shaders with near-zero translation
+          float transMag = std::sqrt(matrixData[12]*matrixData[12] +
+                                     matrixData[13]*matrixData[13] +
+                                     matrixData[14]*matrixData[14]);
+
+          // For key registers (c0, c4, c48), always cache regardless of translation
+          // Other registers still require translation >= 5 units
+          bool isKeyRegister = (reg == 0 || reg == 4 || reg == 48);
+          if (transMag >= 5.0f || isKeyRegister) {
+            g_cachedMatricesByRegister[reg] = Matrix4(
+              matrixData[0], matrixData[1], matrixData[2], matrixData[3],
+              matrixData[4], matrixData[5], matrixData[6], matrixData[7],
+              matrixData[8], matrixData[9], matrixData[10], matrixData[11],
+              matrixData[12], matrixData[13], matrixData[14], matrixData[15]
+            );
+            g_hasMatrixAtRegister[reg] = true;
+
+            // Debug: Log matrices being cached - show ALL rows for c48 and c0
+            static uint32_t s_matrixCacheLogCount = 0;
+            if (s_matrixCacheLogCount++ < 100) {
+              if (reg == 48 || reg == 0 || reg == 4) {
+                Logger::info(str::format("[SETVSCONST-CACHE] c", reg, " FULL MATRIX transMag=", transMag,
+                  "\n  row0=[", matrixData[0], ",", matrixData[1], ",", matrixData[2], ",", matrixData[3], "]",
+                  "\n  row1=[", matrixData[4], ",", matrixData[5], ",", matrixData[6], ",", matrixData[7], "]",
+                  "\n  row2=[", matrixData[8], ",", matrixData[9], ",", matrixData[10], ",", matrixData[11], "]",
+                  "\n  row3=[", matrixData[12], ",", matrixData[13], ",", matrixData[14], ",", matrixData[15], "]"));
+              }
+            }
+          }
+        }
       }
     }
 
@@ -4025,6 +4203,14 @@ namespace dxvk {
     ScopedCpuProfileZone();
     InitReturnPtr(ppSurface);
 
+    // Debug: Log render target creation
+    static uint32_t s_rtLogCount = 0;
+    if (s_rtLogCount++ < 30) {
+      float aspect = (Height > 0) ? (float)Width / (float)Height : 0.0f;
+      Logger::info(str::format("[RENDER-TARGET] Created: ", Width, "x", Height,
+        " aspect=", aspect, " format=", (int)Format));
+    }
+
     if (unlikely(ppSurface == nullptr))
       return D3DERR_INVALIDCALL;
 
@@ -4366,12 +4552,38 @@ namespace dxvk {
     if (unlikely(ShouldRecord()))
       return m_recorder->SetStateTransform(idx, pMatrix);
 
-    m_state.transforms[idx] = ConvertMatrix(pMatrix);
+    Matrix4 matrix = ConvertMatrix(pMatrix);
+    m_state.transforms[idx] = matrix;
+
+    // Debug: Log ALL SetTransform calls to understand what the game uses
+    static uint32_t allTransformLogCount = 0;
+    if (allTransformLogCount++ < 50) {
+      Logger::info(str::format("[SETTRANSFORM] idx=", idx, " (VIEW=", GetTransformIndex(D3DTS_VIEW), " PROJ=", GetTransformIndex(D3DTS_PROJECTION), " WORLD=", GetTransformIndex(D3DTS_WORLD), ")"));
+    }
 
     m_flags.set(D3D9DeviceFlag::DirtyFFVertexData);
 
     if (idx == GetTransformIndex(D3DTS_VIEW) || idx >= GetTransformIndex(D3DTS_WORLD))
       m_flags.set(D3D9DeviceFlag::DirtyFFVertexBlend);
+
+    // NV-DXVK start: Cache D3DTS_VIEW and D3DTS_PROJECTION for camera extraction
+    if (idx == GetTransformIndex(D3DTS_VIEW)) {
+      g_cachedViewTransform = matrix;
+      g_hasViewTransform = true;
+      static uint32_t viewLogCount = 0;
+      if (viewLogCount++ < 10) {
+        Logger::info(str::format("[TRANSFORM-CACHE] D3DTS_VIEW row0=[", matrix[0][0], ",", matrix[0][1], ",", matrix[0][2], ",", matrix[0][3], "]"));
+      }
+    }
+    else if (idx == GetTransformIndex(D3DTS_PROJECTION)) {
+      g_cachedProjectionTransform = matrix;
+      g_hasProjectionTransform = true;
+      static uint32_t projLogCount = 0;
+      if (projLogCount++ < 10) {
+        Logger::info(str::format("[TRANSFORM-CACHE] D3DTS_PROJ row0=[", matrix[0][0], ",", matrix[0][1], ",", matrix[0][2], ",", matrix[0][3], "]"));
+      }
+    }
+    // NV-DXVK end
 
     // NV-DXVK start: signal that a transform has updated
     m_rtx.SetTransformDirty(idx);

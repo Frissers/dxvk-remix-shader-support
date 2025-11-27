@@ -803,13 +803,15 @@ private:
   // Shader output capture: D3D9 texture bindings captured from original draw call
   // These are the ACTUAL textures the game was using, before RT replacement
   struct CapturedD3D9Texture {
-    Rc<DxvkSampler> sampler;  // Sampler state
     TextureRef texture;
+    Rc<DxvkSampler> sampler;  // Sampler state
     uint32_t slot = 0;
   };
   std::vector<CapturedD3D9Texture> capturedD3D9Textures;
 
   // Bitmask of texture slots that require depth textures (shadow samplers)
+  // Captured from D3D9Device::m_depthTextures at draw time
+  // Bit N set = slot N expects depth comparison texture
   uint32_t depthTextureMask = 0;
 
   // Shader output capture: captured framebuffer output

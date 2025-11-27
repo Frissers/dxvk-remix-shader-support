@@ -185,6 +185,14 @@ namespace dxvk {
     }
 
     /**
+     * \brief Returns the resource slot definitions
+     * \returns Vector of resource slots
+     */
+    const std::vector<DxvkResourceSlot>& getResourceSlots() const {
+      return m_slots;
+    }
+
+    /**
      * \brief Creates a shader module
      * 
      * Maps the binding slot numbers 

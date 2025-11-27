@@ -32,6 +32,7 @@ dxvk_shaders = files([
   'shaders/dxvk_fullscreen_layer_vert.vert',
 
   'shaders/rtx/pass/shader_capture/shader_capture_layer_vert.vert',
+  'shaders/rtx/pass/shader_capture/shader_capture_frag.frag',
 
   'shaders/dxvk_pack_d24s8.comp',
   'shaders/dxvk_pack_d32s8.comp',
@@ -342,6 +343,8 @@ dxvk_src = files([
   'rtx_render/rtx_shader_output_capturer.cpp',
   'rtx_render/rtx_shader_output_capturer.h',
 
+  'rtx_render/rtx_hlsl_decompiler_bridge.cpp',
+  'rtx_render/rtx_hlsl_decompiler_bridge.h',
 
   'rtx_render/rtx_shader_compatibility_manager.cpp',
   'rtx_render/rtx_shader_compatibility_manager.h',
