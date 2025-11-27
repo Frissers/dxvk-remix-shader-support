@@ -210,22 +210,36 @@ namespace dxvk {
       return;
     }
 
-    // Create vertex shader from compiled SPIR-V
-    SpirvCodeBuffer spirvCode(shader_capture_layer_vert);
+    // Create shader from embedded SPIR-V binary (included via shader_capture_layer_vert.h)
+    SpirvCodeBuffer spirvCode(sizeof(shader_capture_layer_vert) / sizeof(uint32_t), shader_capture_layer_vert);
 
     DxvkShaderConstData constData;
 
-    // OLD interface slots: simple format from Bored commit
+    // Interface slots for our custom VS:
+    // - inputSlots: bits 0, 1 set for position, texcoord at locations 0, 1
+    //   (no color input - D3D9 uses R8G8B8A8_UINT which doesn't match vec4 float)
+    // - outputSlots: bits 0-7 set for outputs at locations 0-7
+    // - pushConstOffset: 0 (starts at beginning)
+    // - pushConstSize: 64 bytes (mat4 projection)
+    DxvkInterfaceSlots iface;
+    iface.inputSlots = 0x3u;       // Bits 0, 1 = inputs at locations 0, 1 (position, texcoord)
+    iface.outputSlots = 0xFFu;     // Bits 0-7 = outputs at ALL locations 0-7
+    iface.pushConstOffset = 0;
+    iface.pushConstSize = 64;      // mat4 = 16 floats = 64 bytes
+
     m_layerRoutingVertexShader = new DxvkShader(
       VK_SHADER_STAGE_VERTEX_BIT,
-      0,  // No resource slots
+      0,  // No resource slots (we use push constants, not uniform buffers)
       nullptr,
-      { 0u, 1u, 0u, 64u },  // Interface slots: 0 inputSlots, 1 outputSlot (texcoord), 0 reserved, 64 bytes push constants
+      iface,
       spirvCode,
       DxvkShaderOptions(),
       std::move(constData));
 
-    Logger::info("[ShaderCapture-GPU] Layer routing vertex shader initialized");
+    // Note: DxvkShader automatically detects ExportsViewportIndexLayerFromVertexStage
+    // from SPIR-V analysis when gl_Layer is written
+
+    Logger::info("[ShaderCapture-GPU] Layer routing vertex shader initialized (inputs: 0x7, outputs: 0xFF)");
   }
 
   void ShaderOutputCapturer::buildGpuCaptureList(Rc<RtxContext> ctx) {
@@ -612,13 +626,10 @@ namespace dxvk {
         continue;
       }
 
-      /* COMMENTED OUT - testing if early texture binding causes issue
       // CRITICAL: Bind texture BEFORE render targets to allow DXVK to batch layout transitions
       // Binding texture after bindRenderTargets() forces transitions inside render pass = individual barriers!
-      */
       auto tBindingStart = std::chrono::high_resolution_clock::now();
 
-      /* COMMENTED OUT - new texture binding code not in Bored commit
       // CRITICAL FIX: Bind ALL textures from the request to their correct sampler slots
       // The PS expects textures at specific slots (s0, s1, s2, etc.)
       // Only binding one texture causes the shader to sample black for other slots!
@@ -735,7 +746,6 @@ namespace dxvk {
           Logger::info(str::format("[TEX-BIND] Fallback: bound colorTexture to slot 0"));
         }
       }
-      */
 
       Logger::info(str::format("[BARRIER-DEBUG] ===== BINDING RT 0x", std::hex, group.renderTarget.image->getHash(), std::dec,
                               " currentLayout=", group.renderTarget.image->info().layout, " ====="));
@@ -747,29 +757,28 @@ namespace dxvk {
 
       Logger::info(str::format("[BARRIER-DEBUG] Calling bindRenderTargets with GENERAL layout..."));
       ctx->bindRenderTargets(captureRt);
-      /* COMMENTED OUT - testing if clearRenderPassBarriers causes issue
       // CRITICAL: Clear render pass barriers to ensure renderpass has 1 dependency
       // This matches the default renderpass used when compiling pipelines.
       // Without this, we get "dependencyCount is incompatible" errors (3 != 1)
       ctx->clearRenderPassBarriers();
-      */
       Logger::info(str::format("[BARRIER-DEBUG] After bindRenderTargets, layout=", group.renderTarget.image->info().layout));
 
       VkClearValue clearValue = {};
-      // OLD: Clear to black
-      Logger::info(str::format("[BARRIER-DEBUG] Calling clearRenderTarget..."));
+      // DEBUG: Clear to magenta instead of black to see if shader renders anything
+      clearValue.color.float32[0] = 1.0f;  // R
+      clearValue.color.float32[1] = 0.0f;  // G
+      clearValue.color.float32[2] = 1.0f;  // B
+      clearValue.color.float32[3] = 1.0f;  // A
+      Logger::info(str::format("[BARRIER-DEBUG] Calling clearRenderTarget with MAGENTA..."));
       ctx->clearRenderTarget(group.renderTarget.view, VK_IMAGE_ASPECT_COLOR_BIT, clearValue);
-      /* COMMENTED OUT - second clearRenderPassBarriers
       // Clear barriers again after clear in case it modified them
       ctx->clearRenderPassBarriers();
-      */
       Logger::info(str::format("[BARRIER-DEBUG] After clearRenderTarget, layout=", group.renderTarget.image->info().layout));
 
       // Bind shaders - BOTH ORIGINAL game shaders
       // Using both original VS + PS avoids renderpass incompatibility issues
       // (pipelines were created for game's renderpass, custom VS caused mismatch)
 
-      /* COMMENTED OUT - testing if spec constants cause issue
       // CRITICAL: Set spec constants BEFORE binding shaders!
       // SamplerDepthMode=0 disables shadow/depth comparison samplers
       // This is essential because we bind color textures, not depth textures
@@ -777,9 +786,7 @@ namespace dxvk {
       // AlphaCompareOp=7 (VK_COMPARE_OP_ALWAYS) disables alpha test
       ctx->setSpecConstant(VK_PIPELINE_BIND_POINT_GRAPHICS, D3D9SpecConstantId::AlphaCompareOp, 7);
       Logger::info("[SPEC-CONST-BATCH] Set SamplerDepthMode=0 and AlphaCompareOp=7 for batched capture");
-      */
 
-      /* COMMENTED OUT - testing if binding original shaders breaks geometry
       // Bind the ORIGINAL vertex shader from the game
       if (firstRequest.vertexShader != nullptr) {
         ctx->bindShader(VK_SHADER_STAGE_VERTEX_BIT, firstRequest.vertexShader);
@@ -797,9 +804,6 @@ namespace dxvk {
       } else {
         Logger::err("[SHADER-BIND] NO pixel shader in request! Will render incorrectly!");
       }
-      */
-      // Use layer routing shader instead
-      ctx->bindShader(VK_SHADER_STAGE_VERTEX_BIT, m_layerRoutingVertexShader);
 
       // Shader decompilation is now handled by ShaderCompatibilityManager in d3d9_shader.cpp
       // Decompiled shaders are saved to rtx-remix/decompiled_shaders/
@@ -849,7 +853,6 @@ namespace dxvk {
         return DxvkBufferSlice(uploadBuffer, 0, alignedSize);
       };
 
-      /* COMMENTED OUT - not needed when using layer routing shader
       // Bind vertex shader constants - RESTORED since we're using original game VS now
       // The original VS uses uniform buffers, not push constants
       if (!firstRequest.vertexShaderConstantData.empty()) {
@@ -996,9 +999,7 @@ namespace dxvk {
       } else {
         Logger::warn("[SHADER-CONST] NO pixel shader constant data! Shader will read garbage!");
       }
-      */
 
-      /* COMMENTED OUT - testing if texture binding causes issue
       // Bind textures and samplers - CRITICAL for textured shaders
       // ROBUST BINDING: Iterate shader slots to know exactly what the shader expects
       if (firstRequest.pixelShader != nullptr) {
@@ -1166,7 +1167,6 @@ namespace dxvk {
           }
         }
       }
-      */
 
       auto tBindingEnd = std::chrono::high_resolution_clock::now();
       totalBindingTime += std::chrono::duration<double, std::micro>(tBindingEnd - tBindingStart).count();
