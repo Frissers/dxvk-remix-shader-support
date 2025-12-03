@@ -28,6 +28,7 @@ namespace {
   constexpr float kFovToleranceRadians = 0.001f;
 }
 
+
 namespace dxvk {
   // Forward declaration from rtx_camera.cpp
   Matrix4 getMatrixFromEulerAngles(float pitch, float yaw, float roll);
@@ -142,13 +143,45 @@ namespace dxvk {
         Matrix4 fakeWorldToView = inverse(fakeViewToWorld);
         
         // Set the fake camera with correct parameters
-        mainCam.update(frameId, fakeWorldToView, fakeProjection, 
+        mainCam.update(frameId, fakeWorldToView, fakeProjection,
                       fov,
                       aspectRatio,
                       nearPlane,
                       farPlane,
                       false);  // not left-handed
-        
+
+        // DEBUG: Log fake camera position each frame
+        static uint32_t s_fakeCamLogCount = 0;
+        static Vector3 s_prevFreeCamPos = Vector3(0,0,0);
+        static Vector3 s_prevGameCamPos = Vector3(0,0,0);
+
+        Vector3 freeCamPos = mainCam.getPosition(true);  // free camera position
+        Vector3 gameCamPos = mainCam.getPosition(false); // game camera position
+        Vector3 freeCamDir = mainCam.getDirection(true);  // free camera direction
+        Vector3 gameCamDir = mainCam.getDirection(false); // game camera direction
+
+        static Vector3 s_prevFreeCamDir = Vector3(0,0,0);
+        static Vector3 s_prevGameCamDir = Vector3(0,0,0);
+
+        bool freeCamMoved = (freeCamPos.x != s_prevFreeCamPos.x || freeCamPos.y != s_prevFreeCamPos.y || freeCamPos.z != s_prevFreeCamPos.z);
+        bool gameCamMoved = (gameCamPos.x != s_prevGameCamPos.x || gameCamPos.y != s_prevGameCamPos.y || gameCamPos.z != s_prevGameCamPos.z);
+        bool freeCamRotated = (freeCamDir.x != s_prevFreeCamDir.x || freeCamDir.y != s_prevFreeCamDir.y || freeCamDir.z != s_prevFreeCamDir.z);
+        bool gameCamRotated = (gameCamDir.x != s_prevGameCamDir.x || gameCamDir.y != s_prevGameCamDir.y || gameCamDir.z != s_prevGameCamDir.z);
+
+        if (s_fakeCamLogCount < 30 || (s_fakeCamLogCount % 60 == 0) || freeCamMoved || gameCamMoved || freeCamRotated || gameCamRotated) {
+          Logger::info(str::format("[FAKE-CAM-POS] Frame=", frameId,
+                                   " freePos=(", freeCamPos.x, ",", freeCamPos.y, ",", freeCamPos.z, ")",
+                                   " freeDir=(", freeCamDir.x, ",", freeCamDir.y, ",", freeCamDir.z, ")",
+                                   " freeMoved=", freeCamMoved ? "Y" : "N",
+                                   " freeRot=", freeCamRotated ? "Y" : "N",
+                                   " gameRot=", gameCamRotated ? "Y" : "N"));
+        }
+        s_prevFreeCamPos = freeCamPos;
+        s_prevGameCamPos = gameCamPos;
+        s_prevFreeCamDir = freeCamDir;
+        s_prevGameCamDir = gameCamDir;
+        s_fakeCamLogCount++;
+
         // Auto-enable free camera with default position and lock it (unless user wants to override)
         if (!RtxOptions::allowFreeCameraOverride()) {
           // Enable free camera
@@ -156,8 +189,8 @@ namespace dxvk {
             RtCamera::enableFreeCameraObject().setDeferred(true);
           }
           
-          // Set free camera position to (0.01, 0.01, 0.01) // This works in most games so far
-          RtCamera::freeCameraPositionObject().setDeferred(Vector3(0.01f, 0.01f, 0.01f));
+          // Camera position is set via setDeferred from rtx_context.cpp when extracted from VS constants
+          // Don't set fallback - let extraction code be the only source of camera position
           
           // Lock the free camera
           if (!RtCamera::lockFreeCamera()) {
@@ -170,6 +203,14 @@ namespace dxvk {
       
       return input.testCategoryFlags(InstanceCategories::Sky) ? CameraType::Sky : CameraType::Unknown;
     }
+
+    // DEBUG: Log that we're taking the non-fake-camera path
+    static uint32_t s_realCamPathLog = 0;
+    if (s_realCamPathLog < 20 || (s_realCamPathLog % 120 == 0)) {
+      Logger::info(str::format("[REAL-CAM-PATH] Frame=", m_device->getCurrentFrameId(),
+                               " viewToProj NOT identity, using real camera path"));
+    }
+    s_realCamPathLog++;
 
     switch (RtxOptions::fusedWorldViewMode()) {
     case FusedWorldViewMode::None:
@@ -263,6 +304,40 @@ namespace dxvk {
         }
       }
     } else {
+      // NV-DXVK start: Debug camera caching - check if worldToView is changing between frames
+      static Matrix4 s_prevWorldToView = Matrix4();
+      static uint32_t s_prevFrameId = UINT32_MAX;
+      static uint32_t s_sameMatrixCount = 0;
+
+      bool matrixChanged = (worldToView[0] != s_prevWorldToView[0] ||
+                            worldToView[1] != s_prevWorldToView[1] ||
+                            worldToView[2] != s_prevWorldToView[2] ||
+                            worldToView[3] != s_prevWorldToView[3]);
+
+      if (!matrixChanged && frameId != s_prevFrameId) {
+        s_sameMatrixCount++;
+      } else if (matrixChanged) {
+        s_sameMatrixCount = 0;
+      }
+
+      // Log every frame for first 20 frames, then every 60 frames
+      static uint32_t s_cacheLogCount = 0;
+      if (s_cacheLogCount < 20 || (s_cacheLogCount % 60 == 0)) {
+        // Extract camera position from worldToView (inverse of view matrix translation)
+        Matrix4 viewToWorld = inverse(worldToView);
+        Vector3 camPos = Vector3(viewToWorld[3][0], viewToWorld[3][1], viewToWorld[3][2]);
+
+        Logger::info(str::format("[CAMERA-CACHE-CHECK] Frame=", frameId,
+                                 " matrixChanged=", matrixChanged ? "YES" : "NO",
+                                 " sameForFrames=", s_sameMatrixCount,
+                                 " camPos=(", camPos.x, ",", camPos.y, ",", camPos.z, ")",
+                                 "\n  worldToView[3]=(", worldToView[3][0], ",", worldToView[3][1], ",", worldToView[3][2], ",", worldToView[3][3], ")"));
+      }
+      s_cacheLogCount++;
+      s_prevWorldToView = worldToView;
+      s_prevFrameId = frameId;
+      // NV-DXVK end
+
       // NV-DXVK start: Debug camera update
       static uint32_t s_cameraUpdateLogCount = 0;
       if (s_cameraUpdateLogCount++ < 10) {

@@ -70,10 +70,16 @@ namespace dxvk {
     , m_parent(d3d9Device)
     , m_enableDrawCallConversion(enableDrawCallConversion)
     , m_pGeometryWorkers(enableDrawCallConversion ? std::make_unique<GeometryProcessor>(numGeometryProcessingThreads(), "geometry-processing") : nullptr)
-    , m_shaderCompatibilityManager(std::make_unique<ShaderCompatibilityManager>()) {
+    , m_shaderCompatibilityManager(std::make_unique<ShaderCompatibilityManager>())
+    , m_geometryIdentityManager(std::make_unique<GeometryIdentityManager>(d3d9Device->GetDXVKDevice().ptr())) {
 
     // Add space for 256 objects skinned with 256 bones each.
     m_stagedBones.resize(256 * 256);
+
+    // Initialize geometry identity manager
+    GeometryIdentityConfig config;
+    config.enableDebugLogging = true;  // Enable logging for debugging
+    m_geometryIdentityManager->initialize(config);
   }
 
   D3D9Rtx::~D3D9Rtx() {
@@ -440,6 +446,36 @@ namespace dxvk {
 
     transformData.worldToView = d3d9State().transforms[GetTransformIndex(D3DTS_VIEW)];
     transformData.viewToProjection = d3d9State().transforms[GetTransformIndex(D3DTS_PROJECTION)];
+
+    // NV-DXVK start: Debug D3D9 transform source - check if game is updating D3DTS_VIEW
+    {
+      static Matrix4 s_prevD3D9View = Matrix4();
+      static uint32_t s_d3d9SameCount = 0;
+      static uint32_t s_d3d9LogCount = 0;
+
+      bool viewChanged = (transformData.worldToView[0] != s_prevD3D9View[0] ||
+                          transformData.worldToView[1] != s_prevD3D9View[1] ||
+                          transformData.worldToView[2] != s_prevD3D9View[2] ||
+                          transformData.worldToView[3] != s_prevD3D9View[3]);
+
+      if (!viewChanged) {
+        s_d3d9SameCount++;
+      } else {
+        s_d3d9SameCount = 0;
+      }
+
+      if (s_d3d9LogCount < 20 || (s_d3d9LogCount % 120 == 0)) {
+        Logger::info(str::format("[D3D9-VIEW-CHECK] viewChanged=", viewChanged ? "YES" : "NO",
+                                 " sameFor=", s_d3d9SameCount,
+                                 " view[3]=(", transformData.worldToView[3][0], ",",
+                                 transformData.worldToView[3][1], ",",
+                                 transformData.worldToView[3][2], ",",
+                                 transformData.worldToView[3][3], ")"));
+      }
+      s_d3d9LogCount++;
+      s_prevD3D9View = transformData.worldToView;
+    }
+    // NV-DXVK end
 
     // NV-DXVK start: Extract camera matrices from vertex shader constants when using programmable VS
     // DISABLED: This entire block was causing oval distortion during camera movement
@@ -1006,6 +1042,11 @@ namespace dxvk {
   }
 
   D3D9Rtx::DrawCallType D3D9Rtx::makeDrawCallType(const DrawContext& drawContext) {
+    // Notify geometry identity manager of frame begin on first draw
+    if (m_drawCallID == 0 && m_geometryIdentityManager) {
+      m_geometryIdentityManager->onFrameBegin(m_frameIndex);
+    }
+
     // Track the drawcall index so we can use it in rtx_context
     m_activeDrawCallState.drawCallID = m_drawCallID++;
     m_activeDrawCallState.isDrawingToRaytracedRenderTarget = false;
@@ -1366,6 +1407,91 @@ namespace dxvk {
       std::memcpy(m_activeDrawCallState.vertexShaderConstantData.data(),
                   state.vsConsts.fConsts,
                   kMaxD3D9VSConsts * sizeof(Vector4));
+
+#if 0 // DISABLED: WVP injection - broke camera validity
+      // CRITICAL FIX: If VS constants c[0]-c[3] are all zeros but fixed-function transforms are set,
+      // inject the WVP matrix into c[0]-c[3]. Many D3D9 games rely on the driver to do this.
+      bool c0to3AllZeros = true;
+      for (int i = 0; i < 4 && c0to3AllZeros; i++) {
+        const auto& c = state.vsConsts.fConsts[i];
+        if (c.x != 0.0f || c.y != 0.0f || c.z != 0.0f || c.w != 0.0f) {
+          c0to3AllZeros = false;
+        }
+      }
+
+      if (c0to3AllZeros) {
+        // Get fixed-function transforms
+        const Matrix4& world = d3d9State().transforms[GetTransformIndex(D3DTS_WORLD)];
+        const Matrix4& view = d3d9State().transforms[GetTransformIndex(D3DTS_VIEW)];
+        const Matrix4& proj = d3d9State().transforms[GetTransformIndex(D3DTS_PROJECTION)];
+
+        // Check if fixed-function transforms are valid (not identity or zero)
+        bool hasValidTransforms = proj[0][0] != 0.0f || proj[1][1] != 0.0f || proj[2][2] != 0.0f;
+
+        if (hasValidTransforms) {
+          // Compute WVP = World * View * Projection (row-major for D3D9)
+          Matrix4 wvp = world * view * proj;
+
+          // Inject WVP matrix into c[0]-c[3] (each row is one constant register)
+          for (int row = 0; row < 4; row++) {
+            m_activeDrawCallState.vertexShaderConstantData[row].x = wvp[row][0];
+            m_activeDrawCallState.vertexShaderConstantData[row].y = wvp[row][1];
+            m_activeDrawCallState.vertexShaderConstantData[row].z = wvp[row][2];
+            m_activeDrawCallState.vertexShaderConstantData[row].w = wvp[row][3];
+          }
+
+          // Also inject view matrix into c[4]-c[7] if shader uses it
+          for (int row = 0; row < 4; row++) {
+            m_activeDrawCallState.vertexShaderConstantData[4 + row].x = view[row][0];
+            m_activeDrawCallState.vertexShaderConstantData[4 + row].y = view[row][1];
+            m_activeDrawCallState.vertexShaderConstantData[4 + row].z = view[row][2];
+            m_activeDrawCallState.vertexShaderConstantData[4 + row].w = view[row][3];
+          }
+
+          // Inject world matrix into c[48]-c[51]
+          for (int row = 0; row < 4; row++) {
+            m_activeDrawCallState.vertexShaderConstantData[48 + row].x = world[row][0];
+            m_activeDrawCallState.vertexShaderConstantData[48 + row].y = world[row][1];
+            m_activeDrawCallState.vertexShaderConstantData[48 + row].z = world[row][2];
+            m_activeDrawCallState.vertexShaderConstantData[48 + row].w = world[row][3];
+          }
+
+          // Inject worldView matrix into c[52]-c[55]
+          Matrix4 worldView = world * view;
+          for (int row = 0; row < 4; row++) {
+            m_activeDrawCallState.vertexShaderConstantData[52 + row].x = worldView[row][0];
+            m_activeDrawCallState.vertexShaderConstantData[52 + row].y = worldView[row][1];
+            m_activeDrawCallState.vertexShaderConstantData[52 + row].z = worldView[row][2];
+            m_activeDrawCallState.vertexShaderConstantData[52 + row].w = worldView[row][3];
+          }
+
+          static uint32_t wvpInjectLog = 0;
+          if (++wvpInjectLog <= 5) {
+            Logger::warn(str::format("[PREPAREDRAW-FIX] Injected matrices from fixed-function transforms:"));
+            Logger::warn(str::format("[PREPAREDRAW-FIX]   c[0] (WVP row0) = (",
+              m_activeDrawCallState.vertexShaderConstantData[0].x, ", ",
+              m_activeDrawCallState.vertexShaderConstantData[0].y, ", ",
+              m_activeDrawCallState.vertexShaderConstantData[0].z, ", ",
+              m_activeDrawCallState.vertexShaderConstantData[0].w, ")"));
+            Logger::warn(str::format("[PREPAREDRAW-FIX]   c[48] (world row0) = (",
+              m_activeDrawCallState.vertexShaderConstantData[48].x, ", ",
+              m_activeDrawCallState.vertexShaderConstantData[48].y, ", ",
+              m_activeDrawCallState.vertexShaderConstantData[48].z, ", ",
+              m_activeDrawCallState.vertexShaderConstantData[48].w, ")"));
+          }
+        } else {
+          // Also inject view and world matrices if they're non-zero
+          bool viewNonZero = view[0][0] != 0.0f || view[1][1] != 0.0f || view[2][2] != 0.0f;
+          bool worldNonZero = world[0][0] != 0.0f || world[1][1] != 0.0f || world[2][2] != 0.0f;
+
+          static uint32_t noTransformLog = 0;
+          if (++noTransformLog <= 5) {
+            Logger::warn(str::format("[PREPAREDRAW-FIX] c[0-3] are zeros but no valid proj transform! view=",
+              viewNonZero ? "YES" : "NO", " world=", worldNonZero ? "YES" : "NO"));
+          }
+        }
+      }
+#endif
     }
     
     if (m_activeDrawCallState.usesPixelShader) {
@@ -2195,9 +2321,15 @@ namespace dxvk {
       static_cast<RtxContext*>(ctx)->endFrame(currentReflexFrameId, targetImage, callInjectRtx); 
     });
 
+    // Notify geometry identity manager of frame end
+    if (m_geometryIdentityManager) {
+      m_geometryIdentityManager->onFrameEnd();
+    }
+
     // Reset for the next frame
     m_rtxInjectTriggered = false;
     m_drawCallID = 0;
+    m_frameIndex++;  // Increment frame counter
     m_seenCameraPositionsPrev = std::move(m_seenCameraPositions);
 
     m_stagedBonesCount = 0;
@@ -2261,48 +2393,65 @@ namespace dxvk {
       // Copy from fConsts array (float constants)
       memcpy(m_activeDrawCallState.vertexShaderConstantData.data(), state.vsConsts.fConsts, vsConstantCount * sizeof(Vector4));
 
-      // CRITICAL FIX: If VS constants c[0]-c[3] are all zeros but fixed-function transforms are set,
-      // inject the WVP matrix into c[0]-c[3]. Many D3D9 games rely on the driver to do this.
-      // Check if c[0]-c[3] are all zeros (transformation matrix would be zero)
-      bool c0to3AllZeros = true;
-      for (int i = 0; i < 4 && c0to3AllZeros; i++) {
-        const auto& c = state.vsConsts.fConsts[i];
-        if (c.x != 0.0f || c.y != 0.0f || c.z != 0.0f || c.w != 0.0f) {
-          c0to3AllZeros = false;
-        }
-      }
+      // CAMERA EXTRACTION: Extract camera from VS constants HERE where they're populated
+      // Game layout: c0-c3=WVP, c4-c7=View matrix, c8=Camera position
+      if (vsConstantCount >= 9) {
+        const auto& c3 = state.vsConsts.fConsts[3];
+        const auto& c8 = state.vsConsts.fConsts[8];
 
-      if (c0to3AllZeros) {
-        // Get fixed-function transforms
-        const Matrix4& world = d3d9State().transforms[GetTransformIndex(D3DTS_WORLD)];
-        const Matrix4& view = d3d9State().transforms[GetTransformIndex(D3DTS_VIEW)];
-        const Matrix4& proj = d3d9State().transforms[GetTransformIndex(D3DTS_PROJECTION)];
+        // Check if c8 looks like camera position (w=1, large world coords)
+        bool c8HasPosition = (c8.w == 1.0f &&
+          (std::abs(c8.x) > 10.0f || std::abs(c8.y) > 10.0f || std::abs(c8.z) > 10.0f));
 
-        // Check if fixed-function transforms are valid (not identity or zero)
-        bool hasValidTransforms = proj[0][0] != 0.0f || proj[1][1] != 0.0f || proj[2][2] != 0.0f;
+        // Check if c3 has translation (WVP with camera)
+        bool c3HasTranslation = (std::abs(c3.x) > 10.0f || std::abs(c3.y) > 10.0f || std::abs(c3.z) > 10.0f);
 
-        if (hasValidTransforms) {
-          // Compute WVP = World * View * Projection (row-major for D3D9)
-          Matrix4 wvp = world * view * proj;
-
-          // Inject WVP matrix into c[0]-c[3] (each row is one constant register)
-          // D3D9 uses row-major matrices, so row 0 goes to c[0], etc.
-          for (int row = 0; row < 4; row++) {
-            m_activeDrawCallState.vertexShaderConstantData[row].x = wvp[row][0];
-            m_activeDrawCallState.vertexShaderConstantData[row].y = wvp[row][1];
-            m_activeDrawCallState.vertexShaderConstantData[row].z = wvp[row][2];
-            m_activeDrawCallState.vertexShaderConstantData[row].w = wvp[row][3];
+        if (c8HasPosition && c3HasTranslation) {
+          // Extract View matrix from c4-c7 (keep row-major so row 3 = translation)
+          Matrix4 extractedView;
+          for (int i = 0; i < 4; i++) {
+            const auto& ci = state.vsConsts.fConsts[4 + i];
+            extractedView[i][0] = ci.x;
+            extractedView[i][1] = ci.y;
+            extractedView[i][2] = ci.z;
+            extractedView[i][3] = ci.w;
           }
 
-          static uint32_t wvpInjectLogCount = 0;
-          if (++wvpInjectLogCount <= 10) {
-            Logger::info(str::format("[VS-CONST-INJECT] #", wvpInjectLogCount,
-              " Injected WVP matrix into c[0]-c[3] (was all zeros)"));
-            Logger::info(str::format("[VS-CONST-INJECT]   c[0] = (",
-              m_activeDrawCallState.vertexShaderConstantData[0].x, ", ",
-              m_activeDrawCallState.vertexShaderConstantData[0].y, ", ",
-              m_activeDrawCallState.vertexShaderConstantData[0].z, ", ",
-              m_activeDrawCallState.vertexShaderConstantData[0].w, ")"));
+          // Inject View matrix into worldToView
+          m_activeDrawCallState.transformData.worldToView = extractedView;
+
+          // Create perspective projection to bypass fake camera path
+          if (m_activeDrawCallState.transformData.viewToProjection[0][0] == 1.0f &&
+              m_activeDrawCallState.transformData.viewToProjection[1][1] == 1.0f &&
+              m_activeDrawCallState.transformData.viewToProjection[2][2] == 1.0f) {
+            // viewToProjection is identity - inject perspective
+            const float fovY = 1.0472f; // ~60 degrees
+            const float aspect = 16.0f / 9.0f;
+            const float nearZ = 0.1f;
+            const float farZ = 10000.0f;
+            const float tanHalfFov = std::tan(fovY / 2.0f);
+
+            Matrix4 proj;
+            proj[0][0] = 1.0f / (aspect * tanHalfFov);
+            proj[0][1] = 0.0f; proj[0][2] = 0.0f; proj[0][3] = 0.0f;
+            proj[1][0] = 0.0f;
+            proj[1][1] = 1.0f / tanHalfFov;
+            proj[1][2] = 0.0f; proj[1][3] = 0.0f;
+            proj[2][0] = 0.0f; proj[2][1] = 0.0f;
+            proj[2][2] = farZ / (nearZ - farZ);
+            proj[2][3] = -1.0f;
+            proj[3][0] = 0.0f; proj[3][1] = 0.0f;
+            proj[3][2] = (nearZ * farZ) / (nearZ - farZ);
+            proj[3][3] = 0.0f;
+
+            m_activeDrawCallState.transformData.viewToProjection = proj;
+          }
+
+          static uint32_t camInjectLog = 0;
+          if (++camInjectLog <= 20) {
+            Logger::info(str::format("[D3D9-CAM-INJECT] Injected View+Proj from VS constants"));
+            Logger::info(str::format("[D3D9-CAM-INJECT]   camPos=(", c8.x, ",", c8.y, ",", c8.z, ")"));
+            Logger::info(str::format("[D3D9-CAM-INJECT]   viewRow3=(", extractedView[3][0], ",", extractedView[3][1], ",", extractedView[3][2], ",", extractedView[3][3], ")"));
           }
         }
       }

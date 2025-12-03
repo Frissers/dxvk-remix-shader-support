@@ -275,6 +275,7 @@ namespace dxvk {
       uint32_t flags;                 // Capture flags (indexed, dynamic, etc.)
       bool isDynamic = false;         // Is this a dynamic material?
       bool isRTReplacement = false;   // Is this an RT replacement (view-dependent, never cache)?
+      bool rtxTransformsAreIdentity = false;  // If true, vertex capture positions are in CLIP SPACE (RTX couldn't invert)
 
       // GEOMETRY DATA (Rc-counted, safe to copy)
       DxvkBufferSlice vertexBuffer;   // Position buffer
@@ -314,6 +315,9 @@ namespace dxvk {
       // VIEWPORT/SCISSOR STATE
       VkViewport viewport;
       VkRect2D scissor;
+
+      // TRANSFORM DATA for passthrough shader (world-space positions need viewProj)
+      Matrix4 viewProj;  // View * Projection matrix for transforming world-space to clip-space
 
       // REPLACEMENT BUFFER SUPPORT (optional)
       DxvkBufferSlice replacementVertexBuffer;
@@ -387,6 +391,12 @@ namespace dxvk {
     Rc<DxvkBuffer> m_persistentIndexedIndirectBuffer;  // For indexed draws
     size_t m_persistentIndirectBufferSize = 0;
     size_t m_persistentIndexedIndirectBufferSize = 0;
+
+    // OPTIMIZED: Ring buffers for constant buffer allocation (instead of createBuffer per draw)
+    // These use DxvkBuffer's built-in slice allocation which recycles memory efficiently
+    Rc<DxvkBuffer> m_vsConstantRingBuffer;  // VS constants ring buffer
+    Rc<DxvkBuffer> m_psConstantRingBuffer;  // PS constants ring buffer
+    static constexpr VkDeviceSize kConstantBufferSliceSize = 4352;  // 256 int + 224 float vec4s = 4352 bytes
 
     // CPU-side request queue (built during frame, uploaded to GPU)
     std::vector<GpuCaptureRequest> m_pendingCaptureRequests;
@@ -484,6 +494,11 @@ namespace dxvk {
     // Vertex shader for gl_Layer output (instanced multi-draw-indirect)
     Rc<DxvkShader> m_layerRoutingVertexShader;
     void initializeLayerRoutingShader(Rc<DxvkDevice> device);
+
+    // Passthrough shaders - no constant buffer binding required, just push constants
+    Rc<DxvkShader> m_passthroughVertexShader;
+    Rc<DxvkShader> m_passthroughFragmentShader;
+    void initializePassthroughShaders(Rc<DxvkDevice> device);
 
     // GPU profiling - timestamp queries to measure actual GPU execution time
     Rc<DxvkGpuQuery> m_gpuTimestampStart;

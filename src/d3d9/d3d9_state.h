@@ -34,7 +34,7 @@ namespace dxvk {
   // NOTE: Padding exists to ensure we get vectorized loads for these attributes
   struct CapturedVertex {
     Vector3 position;
-    uint32_t pad0;
+    float positionW;      // W component of position (needed for clip-space when RTX transforms are identity)
     Vector2 texcoord0;
     Vector2 texcoord1;     // Second UV set for lightmaps/detail
     Vector3 normal0;
@@ -47,6 +47,7 @@ namespace dxvk {
 
   enum class CapturedVertexMembers {
     Position = 0,
+    PositionW,      // W component (needed for clip-space when RTX transforms are identity)
     Texcoord0,
     Texcoord1,      // Second UV set for lightmaps/detail
     Normal0,

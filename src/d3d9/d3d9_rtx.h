@@ -4,6 +4,7 @@
 #include "../dxvk/dxvk_buffer.h"
 #include "../util/util_threadpool.h"
 #include "../dxvk/rtx_render/rtx_shader_compatibility_manager.h"
+#include "../dxvk/rtx_render/rtx_shader_compat_manager.h"
 
 #include <vector>
 #include <optional>
@@ -41,6 +42,11 @@ namespace dxvk {
      * \brief Get the shader compatibility manager (for shader decompilation)
      */
     ShaderCompatibilityManager* getShaderCompatibilityManager() { return m_shaderCompatibilityManager.get(); }
+
+    /**
+     * \brief Get the geometry identity manager (for stable geometry tracking)
+     */
+    GeometryIdentityManager* getGeometryIdentityManager() { return m_geometryIdentityManager.get(); }
 
     RTX_OPTION("rtx", bool, orthographicIsUI, true, "When enabled, draw calls that are orthographic will be considered as UI.");
     RTX_OPTION("rtx", bool, allowCubemaps, false, "When enabled, cubemaps from the game are processed through Remix, but they may not render correctly.");
@@ -187,6 +193,7 @@ namespace dxvk {
     using GeometryProcessor = WorkerThreadPool<kMaxConcurrentDraws>;
     const std::unique_ptr<GeometryProcessor> m_pGeometryWorkers;
     std::unique_ptr<ShaderCompatibilityManager> m_shaderCompatibilityManager;
+    std::unique_ptr<GeometryIdentityManager> m_geometryIdentityManager;
     AtomicQueue<DrawCallState, kMaxConcurrentDraws> m_drawCallStateQueue;
 
     DrawCallState m_activeDrawCallState;
@@ -199,6 +206,7 @@ namespace dxvk {
     D3D9RtxFlags m_flags = 0xFFFFffff;
 
     uint32_t m_drawCallID = 0;
+    uint32_t m_frameIndex = 0;
     // Note: A frame identifier the the main thread holds on to passed down into thread invocations such that
     // Reflex markers have a consistent ID despite executing in parallel (as typical methods of getting a frame ID
     // in DXVK depend on say when the submit thread's present happens which is unpredictable).

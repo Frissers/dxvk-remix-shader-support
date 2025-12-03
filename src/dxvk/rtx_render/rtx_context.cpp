@@ -44,6 +44,7 @@
 #include "rtx_restir_gi_rayquery.h"
 #include "rtx_composite.h"
 #include "rtx_debug_view.h"
+#include "rtx_camera.h"
 
 #include "rtx/pass/common_binding_indices.h"
 #include "rtx/pass/raytrace_args.h"
@@ -994,6 +995,10 @@ namespace dxvk {
 
     // Sync any pending work with geometry processing threads
     if (drawCallState.finalizePendingFutures(lastCamera)) {
+      // NOTE: Camera extraction from VS constants is done in d3d9_rtx.cpp where
+      // the VS constants are actually populated. By this point, the View and
+      // Projection matrices have already been injected into transformData.
+
       drawCallState.cameraType = cameraManager.processCameraData(drawCallState);
 
       if (drawCallState.cameraType == CameraType::Unknown) {

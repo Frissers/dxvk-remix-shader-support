@@ -574,12 +574,13 @@ namespace dxvk {
       const uint32_t vec2Type = m_module.defVectorType(floatType, 2);
       const uint32_t vec3Type = m_module.defVectorType(floatType, 3);
 
-      // struct CapturedVertex { vec3 pos; vec2 tex0; vec2 tex1; vec3 nrm0; uint color0; vec3 tangent0; uint color1; vec3 binormal0; }
-      const uint32_t capMembers[8] = { vec3Type, vec2Type, vec2Type, vec3Type, uintType, vec3Type, uintType, vec3Type };
+      // struct CapturedVertex { vec3 pos; float posW; vec2 tex0; vec2 tex1; vec3 nrm0; uint color0; vec3 tangent0; uint color1; vec3 binormal0; }
+      const uint32_t capMembers[9] = { vec3Type, floatType, vec2Type, vec2Type, vec3Type, uintType, vec3Type, uintType, vec3Type };
       const uint32_t capturedVertexType = m_module.defStructType(std::size(capMembers), capMembers);
 
       // Member offsets (std430)
       m_module.memberDecorateOffset(capturedVertexType, (uint32_t) CapturedVertexMembers::Position, offsetof(CapturedVertex, position));
+      m_module.memberDecorateOffset(capturedVertexType, (uint32_t) CapturedVertexMembers::PositionW, offsetof(CapturedVertex, positionW));
       m_module.memberDecorateOffset(capturedVertexType, (uint32_t) CapturedVertexMembers::Texcoord0, offsetof(CapturedVertex, texcoord0));
       m_module.memberDecorateOffset(capturedVertexType, (uint32_t) CapturedVertexMembers::Texcoord1, offsetof(CapturedVertex, texcoord1));
       m_module.memberDecorateOffset(capturedVertexType, (uint32_t) CapturedVertexMembers::Normal0, offsetof(CapturedVertex, normal0));
@@ -3847,7 +3848,16 @@ void DxsoCompiler::emitControlFlowGenericLoop(
     const uint32_t worldPosId = m_module.opCompositeConstruct(vec4TypeId, 4, outComps);
 
     emitVertexCaptureWrite(vertexIndex, CapturedVertexMembers::Position, obj3, vec3TypeId);
-    
+
+    // Write positionW - extract W from original clip position (needed for perspective when RTX transforms are identity)
+    // When RTX transforms are identity, vertex capture doesn't transform, so positions stay in clip space
+    // The W component is critical for perspective-correct rendering
+    {
+      const uint32_t lit3 = 3;
+      const uint32_t clipW = m_module.opCompositeExtract(floatType, clipPos, 1, &lit3);
+      emitVertexCaptureWrite(vertexIndex, CapturedVertexMembers::PositionW, clipW, floatType);
+    }
+
     // Write texcoord0
     {
       uint32_t tex2 = m_module.constvec2f32(0.0f, 0.0f);

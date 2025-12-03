@@ -51,6 +51,8 @@
 #include <rtx_shaders/shader_capture_prepare.h>
 #include "rtx/pass/shader_capture/shader_capture.h"
 #include <shader_capture_layer_vert.h>
+#include <shader_capture_passthrough_vert.h>
+#include <shader_capture_passthrough_frag.h>
 
 namespace dxvk {
 
@@ -242,6 +244,70 @@ namespace dxvk {
     Logger::info("[ShaderCapture-GPU] Layer routing vertex shader initialized (inputs: 0x7, outputs: 0xFF)");
   }
 
+  void ShaderOutputCapturer::initializePassthroughShaders(Rc<DxvkDevice> device) {
+    // Lazy initialization - only create shaders once
+    if (m_passthroughVertexShader != nullptr) {
+      return;
+    }
+
+    // === PASSTHROUGH VERTEX SHADER ===
+    // Uses DXSO-compatible attribute locations to match game's vertex format
+    // Only needs push constants for projection matrix (64 bytes)
+    {
+      SpirvCodeBuffer spirvCode(sizeof(shader_capture_passthrough_vert) / sizeof(uint32_t), shader_capture_passthrough_vert);
+      DxvkShaderConstData constData;
+
+      // Interface slots for passthrough VS:
+      // Input locations (DXSO-compatible):
+      //   location 0 = POSITION
+      //   location 4 = COLOR0
+      //   location 7 = TEXCOORD0
+      // Output locations: 7 (texcoord) - MUST match DXSO locations for game PS!
+      DxvkInterfaceSlots iface;
+      iface.inputSlots = (1u << 0) | (1u << 4) | (1u << 7);  // POSITION, COLOR0, TEXCOORD0
+      iface.outputSlots = (1u << 7);  // Output at location 7 (TEXCOORD0)
+      iface.pushConstOffset = 0;
+      iface.pushConstSize = 64;  // mat4 = 16 floats = 64 bytes
+
+      m_passthroughVertexShader = new DxvkShader(
+        VK_SHADER_STAGE_VERTEX_BIT,
+        0,  // No resource slots (push constants only)
+        nullptr,
+        iface,
+        spirvCode,
+        DxvkShaderOptions(),
+        std::move(constData));
+    }
+
+    // === PASSTHROUGH FRAGMENT SHADER ===
+    // Simple texture sample, no constants needed
+    {
+      SpirvCodeBuffer spirvCode(sizeof(shader_capture_passthrough_frag) / sizeof(uint32_t), shader_capture_passthrough_frag);
+      DxvkShaderConstData constData;
+
+      // Interface slots for passthrough PS:
+      // Input locations: 0 (texcoord), 1 (color) - from VS
+      // Output: location 0 (color)
+      // Resource: 1 sampler at set 0 binding 0
+      DxvkInterfaceSlots iface;
+      iface.inputSlots = 0x3u;   // Inputs at locations 0, 1
+      iface.outputSlots = 0x1u;  // Output at location 0
+      iface.pushConstOffset = 0;
+      iface.pushConstSize = 0;   // No push constants for PS
+
+      m_passthroughFragmentShader = new DxvkShader(
+        VK_SHADER_STAGE_FRAGMENT_BIT,
+        0,  // Resource slots defined in SPIR-V
+        nullptr,
+        iface,
+        spirvCode,
+        DxvkShaderOptions(),
+        std::move(constData));
+    }
+
+    Logger::info("[ShaderCapture] Passthrough shaders initialized (VS: DXSO locations, PS: simple sampler)");
+  }
+
   void ShaderOutputCapturer::buildGpuCaptureList(Rc<RtxContext> ctx) {
     // Build capture request list from pending requests and upload to GPU
     // Following MegaGeometry pattern: CPU fills request buffer, GPU processes it
@@ -378,6 +444,8 @@ namespace dxvk {
 
     // Initialize layer routing shader if not already done
     initializeLayerRoutingShader(ctx->getDevice());
+    // Initialize passthrough shaders for world-space vertex data
+    initializePassthroughShaders(ctx->getDevice());
 
     auto tFunctionStart = std::chrono::high_resolution_clock::now();
 
@@ -789,6 +857,39 @@ namespace dxvk {
                   " layout=", imgInfo.layout,
                   " isInUse=", isInUse ? "YES" : "NO",
                   " imgPtr=", (void*)srcImg.ptr()));
+
+                // TEXTURE DIAGNOSTIC: Log more details about the texture to debug random colors
+                const char* formatName = "UNKNOWN";
+                switch (imgInfo.format) {
+                  case VK_FORMAT_R8G8B8A8_UNORM: formatName = "R8G8B8A8_UNORM"; break;
+                  case VK_FORMAT_R8G8B8A8_SRGB: formatName = "R8G8B8A8_SRGB"; break;
+                  case VK_FORMAT_B8G8R8A8_UNORM: formatName = "B8G8R8A8_UNORM"; break;
+                  case VK_FORMAT_B8G8R8A8_SRGB: formatName = "B8G8R8A8_SRGB"; break;
+                  case VK_FORMAT_BC1_RGB_UNORM_BLOCK: formatName = "BC1_RGB"; break;
+                  case VK_FORMAT_BC1_RGBA_UNORM_BLOCK: formatName = "BC1_RGBA"; break;
+                  case VK_FORMAT_BC2_UNORM_BLOCK: formatName = "BC2"; break;
+                  case VK_FORMAT_BC3_UNORM_BLOCK: formatName = "BC3"; break;
+                  case VK_FORMAT_BC4_UNORM_BLOCK: formatName = "BC4"; break;
+                  case VK_FORMAT_BC5_UNORM_BLOCK: formatName = "BC5"; break;
+                  case VK_FORMAT_BC7_UNORM_BLOCK: formatName = "BC7"; break;
+                  default: break;
+                }
+                Logger::warn(str::format("[TEX-DIAG] slot=", tex.slot, " formatName=", formatName,
+                  " mipLevels=", imgInfo.mipLevels,
+                  " numLayers=", imgInfo.numLayers,
+                  " usage=0x", std::hex, imgInfo.usage, std::dec,
+                  " tiling=", (imgInfo.tiling == VK_IMAGE_TILING_OPTIMAL ? "OPTIMAL" : "LINEAR")));
+
+                // Log sampler state if available (affects filtering/wrapping)
+                if (tex.sampler != nullptr) {
+                  auto& sampInfo = tex.sampler->info();
+                  Logger::warn(str::format("[TEX-SAMPLER] slot=", tex.slot,
+                    " minFilter=", (sampInfo.minFilter == VK_FILTER_LINEAR ? "LINEAR" : "NEAREST"),
+                    " magFilter=", (sampInfo.magFilter == VK_FILTER_LINEAR ? "LINEAR" : "NEAREST"),
+                    " addressU=", sampInfo.addressModeU,
+                    " addressV=", sampInfo.addressModeV,
+                    " compareToDepth=", sampInfo.compareToDepth ? "YES" : "NO"));
+                }
               }
             }
           }
@@ -849,30 +950,271 @@ namespace dxvk {
       ctx->setSpecConstant(VK_PIPELINE_BIND_POINT_GRAPHICS, D3D9SpecConstantId::AlphaCompareOp, 7);
       Logger::info("[SPEC-CONST-BATCH] Set SamplerDepthMode=0 and AlphaCompareOp=7 for batched capture");
 
-      // Bind the ORIGINAL vertex shader from the game
-      if (firstRequest.vertexShader != nullptr) {
-        ctx->bindShader(VK_SHADER_STAGE_VERTEX_BIT, firstRequest.vertexShader);
-        Logger::info("[SHADER-BIND] Bound ORIGINAL vertex shader from game");
-      } else {
-        Logger::warn("[SHADER-BIND] NO vertex shader in request - using fixed function?");
+      // USE ORIGINAL GAME SHADERS: The game's VS/PS know the correct:
+      // - UV transformation matrices (in VS constants)
+      // - Sampler slots (PS uses s0, s5, etc. not always s0)
+      // - Semantic mappings (TEXCOORD may be view-space position, not UVs)
+      //
+      // We explicitly bind the game shaders and their constant buffers.
+
+      // CRITICAL FIX: Choose VS based on vertex data source
+      // - If we have original D3D9 vertex data (originalVertexStreams): Use game's VS
+      //   The game's VS expects object-space positions and will apply world*viewProj
+      // - If we only have RasterGeometry (RTX-captured): Use passthrough VS
+      //   RTX captures positions in WORLD SPACE after the game's VS runs
+      //   Re-running the game's VS would double-transform! Use passthrough that just applies viewProj
+      const bool hasOriginalVertexData = !firstRequest.originalVertexStreams.empty();
+
+      // ====================== EXTENSIVE GEOMETRY/CONSTANT BUFFER DEBUG ======================
+      static uint32_t geomDebugCount = 0;
+      const bool doExtensiveDebug = (++geomDebugCount <= 200);
+
+      if (doExtensiveDebug) {
+        Logger::err("=============================================================================");
+        Logger::err(str::format("[GEOM-CB-DEBUG #", geomDebugCount, "] BEGIN SHADER CAPTURE EXECUTION"));
+        Logger::err(str::format("[GEOM-CB-DEBUG] hasOriginalVertexData=", hasOriginalVertexData ? "TRUE" : "FALSE"));
+        Logger::err(str::format("[GEOM-CB-DEBUG] originalVertexStreams.size()=", firstRequest.originalVertexStreams.size()));
+        Logger::err(str::format("[GEOM-CB-DEBUG] originalVertexElements.size()=", firstRequest.originalVertexElements.size()));
+        Logger::err(str::format("[GEOM-CB-DEBUG] useOriginalVertexLayout=", firstRequest.useOriginalVertexLayout ? "TRUE" : "FALSE"));
+        Logger::err(str::format("[GEOM-CB-DEBUG] vertexShader=", firstRequest.vertexShader != nullptr ? "VALID" : "NULL"));
+        Logger::err(str::format("[GEOM-CB-DEBUG] pixelShader=", firstRequest.pixelShader != nullptr ? "VALID" : "NULL"));
+        Logger::err(str::format("[GEOM-CB-DEBUG] VS constant count=", firstRequest.vertexShaderConstantData.size()));
+        Logger::err(str::format("[GEOM-CB-DEBUG] PS constant count=", firstRequest.pixelShaderConstantData.size()));
+        Logger::err(str::format("[GEOM-CB-DEBUG] vertexCount=", firstRequest.vertexCount, " indexCount=", firstRequest.indexCount));
+        Logger::err(str::format("[GEOM-CB-DEBUG] resolution=", group.resolution.width, "x", group.resolution.height));
+
+        // Debug each original vertex stream
+        for (size_t i = 0; i < firstRequest.originalVertexStreams.size(); i++) {
+          const auto& stream = firstRequest.originalVertexStreams[i];
+          Logger::err(str::format("[GEOM-CB-DEBUG] OriginalStream[", i, "]: streamIndex=", stream.streamIndex,
+            " stride=", stream.stride, " offset=", stream.offset,
+            " bufferPtr=", stream.buffer != nullptr ? "VALID" : "NULL",
+            " bufferSize=", stream.buffer != nullptr ? stream.buffer->info().size : 0));
+
+          // Dump first 3 vertices from each stream
+          if (stream.buffer != nullptr && stream.stride >= 12) {
+            void* mappedPtr = stream.buffer->mapPtr(0);
+            if (mappedPtr) {
+              const uint8_t* data = reinterpret_cast<const uint8_t*>(mappedPtr);
+              uint64_t bufSize = stream.buffer->info().size;
+              uint32_t numVerts = std::min(3u, static_cast<uint32_t>(bufSize / stream.stride));
+              for (uint32_t v = 0; v < numVerts; v++) {
+                const float* pos = reinterpret_cast<const float*>(data + v * stream.stride);
+                Logger::err(str::format("[GEOM-CB-DEBUG]   Stream[", i, "] Vertex[", v, "] pos=(",
+                  pos[0], ", ", pos[1], ", ", pos[2], ")"));
+              }
+            }
+          }
+        }
+
+        // Debug vertex elements
+        for (size_t i = 0; i < firstRequest.originalVertexElements.size(); i++) {
+          const auto& elem = firstRequest.originalVertexElements[i];
+          const char* usageName = "UNKNOWN";
+          switch (elem.usage) {
+            case 0: usageName = "POSITION"; break;
+            case 1: usageName = "BLENDWEIGHT"; break;
+            case 2: usageName = "BLENDINDICES"; break;
+            case 3: usageName = "NORMAL"; break;
+            case 4: usageName = "PSIZE"; break;
+            case 5: usageName = "TEXCOORD"; break;
+            case 6: usageName = "TANGENT"; break;
+            case 7: usageName = "BINORMAL"; break;
+            case 8: usageName = "TESSFACTOR"; break;
+            case 9: usageName = "POSITIONT"; break;
+            case 10: usageName = "COLOR"; break;
+            case 11: usageName = "FOG"; break;
+            case 12: usageName = "DEPTH"; break;
+            case 13: usageName = "SAMPLE"; break;
+          }
+          Logger::err(str::format("[GEOM-CB-DEBUG] VertexElement[", i, "]: stream=", elem.stream,
+            " offset=", elem.offset, " type=", (int)elem.type, " usage=", usageName, "(", (int)elem.usage, ")",
+            " usageIndex=", (int)elem.usageIndex));
+        }
       }
 
-      // Bind the ORIGINAL pixel/fragment shader from the game
+      if (hasOriginalVertexData && firstRequest.vertexShader != nullptr) {
+        // Use game's VS - we have original object-space vertices
+        ctx->bindShader(VK_SHADER_STAGE_VERTEX_BIT, firstRequest.vertexShader);
+
+        // GAME VS DEBUG - track camera via VS constants
+        static uint32_t gameVsCallCount = 0;
+        static Vector4 lastC0, lastC1, lastC2, lastC3;
+        static uint32_t gameVsSameCount = 0;
+        ++gameVsCallCount;
+
+        bool gameVsMatrixChanged = false;
+        if (firstRequest.vertexShaderConstantData.size() >= 4) {
+          const auto& c0 = firstRequest.vertexShaderConstantData[0];
+          const auto& c1 = firstRequest.vertexShaderConstantData[1];
+          const auto& c2 = firstRequest.vertexShaderConstantData[2];
+          const auto& c3 = firstRequest.vertexShaderConstantData[3];
+
+          if (std::abs(c0.x - lastC0.x) > 0.0001f || std::abs(c0.y - lastC0.y) > 0.0001f ||
+              std::abs(c1.x - lastC1.x) > 0.0001f || std::abs(c2.x - lastC2.x) > 0.0001f) {
+            gameVsMatrixChanged = true;
+            gameVsSameCount = 0;
+          } else {
+            gameVsSameCount++;
+          }
+
+          // Log periodically or on change
+          if ((gameVsCallCount <= 20) || gameVsMatrixChanged || (gameVsSameCount == 100)) {
+            Logger::err(str::format("[GAME-VS-DEBUG #", gameVsCallCount, "] GAME VS PATH - matrixChanged=",
+              gameVsMatrixChanged ? "YES" : "NO", " sameCount=", gameVsSameCount));
+            Logger::err(str::format("[GAME-VS-DEBUG] c0=[", c0.x, ", ", c0.y, ", ", c0.z, ", ", c0.w, "]"));
+            Logger::err(str::format("[GAME-VS-DEBUG] c1=[", c1.x, ", ", c1.y, ", ", c1.z, ", ", c1.w, "]"));
+            Logger::err(str::format("[GAME-VS-DEBUG] c2=[", c2.x, ", ", c2.y, ", ", c2.z, ", ", c2.w, "]"));
+            Logger::err(str::format("[GAME-VS-DEBUG] c3=[", c3.x, ", ", c3.y, ", ", c3.z, ", ", c3.w, "]"));
+            if (gameVsSameCount >= 50) {
+              Logger::err("[GAME-VS-DEBUG] !!! GAME VS CAMERA MAY BE STUCK !!!");
+            }
+          }
+
+          lastC0 = c0; lastC1 = c1; lastC2 = c2; lastC3 = c3;
+        }
+
+        Logger::warn(str::format("[SHADER-SELECT-BATCH] Using GAME VS: ", firstRequest.vertexShader->getShaderKey().toString()));
+
+        if (doExtensiveDebug) {
+          Logger::err("[GEOM-CB-DEBUG] >>> PATH: GAME VS with CONSTANT BUFFER BINDING <<<");
+          Logger::err("[GEOM-CB-DEBUG] This path uses original game vertex shader with VS/PS constant buffers");
+          Logger::err("[GEOM-CB-DEBUG] If geometry is broken, the constant buffer data may be incorrect");
+        }
+      } else if (m_passthroughVertexShader != nullptr) {
+        // Use passthrough VS - we have vertices from RasterGeometry (vertex capture output)
+        ctx->bindShader(VK_SHADER_STAGE_VERTEX_BIT, m_passthroughVertexShader);
+
+        // EXTENSIVE PASSTHROUGH DEBUG - track camera stuck issue
+        static uint32_t passthroughCallCount = 0;
+        static Matrix4 lastMatrix;
+        static Matrix4 lastChangedMatrix;  // Last matrix that was different
+        static uint32_t sameMatrixCount = 0;  // How many calls with same matrix
+        static uint32_t frameCounter = 0;
+        static auto lastLogTime = std::chrono::steady_clock::now();
+        ++passthroughCallCount;
+
+        Matrix4 matrixToUse = firstRequest.viewProj;
+
+        // Check if matrix changed since last call
+        bool matrixChanged = false;
+        for (int i = 0; i < 4 && !matrixChanged; i++) {
+          for (int j = 0; j < 4 && !matrixChanged; j++) {
+            if (std::abs(matrixToUse[i][j] - lastMatrix[i][j]) > 0.0001f) {
+              matrixChanged = true;
+            }
+          }
+        }
+
+        if (matrixChanged) {
+          sameMatrixCount = 0;
+          lastChangedMatrix = matrixToUse;
+        } else {
+          sameMatrixCount++;
+        }
+
+        // Check if matrix is identity (problematic)
+        bool isIdentity = (std::abs(matrixToUse[0][0] - 1.0f) < 0.0001f &&
+                          std::abs(matrixToUse[1][1] - 1.0f) < 0.0001f &&
+                          std::abs(matrixToUse[2][2] - 1.0f) < 0.0001f &&
+                          std::abs(matrixToUse[3][3] - 1.0f) < 0.0001f &&
+                          std::abs(matrixToUse[0][1]) < 0.0001f &&
+                          std::abs(matrixToUse[0][2]) < 0.0001f &&
+                          std::abs(matrixToUse[0][3]) < 0.0001f);
+
+        // Check if matrix is all zeros (very problematic)
+        bool isZero = true;
+        for (int i = 0; i < 4 && isZero; i++) {
+          for (int j = 0; j < 4 && isZero; j++) {
+            if (std::abs(matrixToUse[i][j]) > 0.0001f) isZero = false;
+          }
+        }
+
+        // Rate-limited logging - every 100ms or on important events
+        auto now = std::chrono::steady_clock::now();
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - lastLogTime).count();
+        bool timeToLog = (elapsed > 100);
+        bool importantEvent = matrixChanged || isIdentity || isZero || (sameMatrixCount == 100);
+
+        if (timeToLog || (passthroughCallCount <= 20) || importantEvent) {
+          lastLogTime = now;
+          Logger::err("##########################################################################");
+          Logger::err(str::format("[PASSTHROUGH-DEBUG #", passthroughCallCount, "] PASSTHROUGH VS - CAMERA TRACK"));
+          Logger::err(str::format("[PASSTHROUGH-DEBUG] matrixChanged=", matrixChanged ? "YES" : "NO",
+            " sameMatrixCount=", sameMatrixCount));
+          Logger::err(str::format("[PASSTHROUGH-DEBUG] isIdentity=", isIdentity ? "YES-BAD!" : "no",
+            " isZero=", isZero ? "YES-VERY-BAD!" : "no"));
+          Logger::err(str::format("[PASSTHROUGH-DEBUG] rtxTransformsAreIdentity=", firstRequest.rtxTransformsAreIdentity));
+          Logger::err(str::format("[PASSTHROUGH-DEBUG] VS constants size=", firstRequest.vertexShaderConstantData.size()));
+
+          // Full matrix dump
+          Logger::err(str::format("[PASSTHROUGH-DEBUG] viewProj[0]=[", matrixToUse[0][0], ", ", matrixToUse[0][1], ", ", matrixToUse[0][2], ", ", matrixToUse[0][3], "]"));
+          Logger::err(str::format("[PASSTHROUGH-DEBUG] viewProj[1]=[", matrixToUse[1][0], ", ", matrixToUse[1][1], ", ", matrixToUse[1][2], ", ", matrixToUse[1][3], "]"));
+          Logger::err(str::format("[PASSTHROUGH-DEBUG] viewProj[2]=[", matrixToUse[2][0], ", ", matrixToUse[2][1], ", ", matrixToUse[2][2], ", ", matrixToUse[2][3], "]"));
+          Logger::err(str::format("[PASSTHROUGH-DEBUG] viewProj[3]=[", matrixToUse[3][0], ", ", matrixToUse[3][1], ", ", matrixToUse[3][2], ", ", matrixToUse[3][3], "]"));
+
+          // Dump first 4 VS constants (should be WVP matrix)
+          if (firstRequest.vertexShaderConstantData.size() >= 4) {
+            Logger::err("[PASSTHROUGH-DEBUG] VS c0-c3 (should be WVP):");
+            for (int i = 0; i < 4; i++) {
+              const auto& c = firstRequest.vertexShaderConstantData[i];
+              Logger::err(str::format("[PASSTHROUGH-DEBUG]   c", i, "=[", c.x, ", ", c.y, ", ", c.z, ", ", c.w, "]"));
+            }
+          }
+
+          // Alert if stuck
+          if (sameMatrixCount >= 50) {
+            Logger::err(str::format("[PASSTHROUGH-DEBUG] !!! CAMERA APPEARS STUCK - same matrix for ", sameMatrixCount, " calls !!!"));
+          }
+          Logger::err("##########################################################################");
+        }
+
+        lastMatrix = matrixToUse;
+        ctx->pushConstants(0, sizeof(Matrix4), &matrixToUse);
+      } else {
+        Logger::err("[SHADER-SELECT-BATCH] NO VS available and passthrough not initialized!");
+      }
+
+      // Bind the original game pixel shader
       if (firstRequest.pixelShader != nullptr) {
         ctx->bindShader(VK_SHADER_STAGE_FRAGMENT_BIT, firstRequest.pixelShader);
-        Logger::info(str::format("[SHADER-BIND] Bound ORIGINAL pixel shader from game",
-          " - ConstantCount=", firstRequest.pixelShaderConstantData.size(),
-          " - TextureCount=", firstRequest.textures.size()));
+        Logger::warn(str::format("[GEOM-DEBUG] PS bound: hash=0x", std::hex,
+          firstRequest.pixelShaderBytecodeHash, std::dec));
       } else {
-        Logger::err("[SHADER-BIND] NO pixel shader in request! Will render incorrectly!");
+        Logger::err("[GEOM-DEBUG] NO PIXEL SHADER!");
+      }
+
+      // Debug: dump first few vertex positions to understand input data
+      if (firstRequest.vertexBuffer.defined()) {
+        // Log buffer properties to understand why mapPtr might fail
+        const auto& buffer = firstRequest.vertexBuffer.buffer();
+        const auto& info = buffer->info();
+        VkMemoryPropertyFlags memFlags = buffer->memFlags();
+        bool isHostVisible = (memFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0;
+        bool isDeviceLocal = (memFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0;
+        Logger::warn(str::format("[GEOM-DEBUG] VertexBuffer: size=", info.size,
+          " usage=0x", std::hex, info.usage, std::dec,
+          " hostVisible=", isHostVisible, " deviceLocal=", isDeviceLocal,
+          " stride=", firstRequest.vertexStride, " count=", firstRequest.vertexCount));
+
+        const uint8_t* vtxData = reinterpret_cast<const uint8_t*>(firstRequest.vertexBuffer.mapPtr(0));
+        if (vtxData) {
+          uint32_t stride = firstRequest.vertexStride;
+          // Dump first 4 vertices as floats
+          for (uint32_t i = 0; i < std::min(4u, firstRequest.vertexCount); i++) {
+            const float* pos = reinterpret_cast<const float*>(vtxData + i * stride);
+            Logger::warn(str::format("[GEOM-DEBUG] Vertex[", i, "]: x=", pos[0], " y=", pos[1], " z=", pos[2]));
+          }
+        } else {
+          Logger::warn("[GEOM-DEBUG] Vertex buffer mapPtr returned NULL - buffer is GPU-only (not host-visible)!");
+        }
+      } else {
+        Logger::warn("[GEOM-DEBUG] Vertex buffer NOT DEFINED!");
       }
 
       // Shader decompilation is now handled by ShaderCompatibilityManager in d3d9_shader.cpp
       // Decompiled shaders are saved to rtx-remix/decompiled_shaders/
 
-      // VS constants are bound below AFTER the createConstantBufferSlice lambda is defined
-
-      // CRITICAL: Bind shader constants (uniforms)
       // Helper to create constant buffer from Vector4 array
       auto createConstantBufferSlice = [&](const std::vector<Vector4>& constantData,
                                            VkPipelineStageFlags stages,
@@ -880,7 +1222,6 @@ namespace dxvk {
         if (constantData.empty())
           return DxvkBufferSlice();
 
-        // Convert Vector4 to bytes
         const uint8_t* dataBytes = reinterpret_cast<const uint8_t*>(constantData.data());
         const size_t dataSize = constantData.size() * sizeof(Vector4);
 
@@ -915,96 +1256,185 @@ namespace dxvk {
         return DxvkBufferSlice(uploadBuffer, 0, alignedSize);
       };
 
-      // Bind vertex shader constants - RESTORED since we're using original game VS now
-      // The original VS uses uniform buffers, not push constants
-      if (!firstRequest.vertexShaderConstantData.empty()) {
-        Logger::info(str::format("[SHADER-CONST-DEBUG] Vertex shader constant data size: ",
-          firstRequest.vertexShaderConstantData.size(), " Vector4s (",
-          firstRequest.vertexShaderConstantData.size() * sizeof(Vector4), " bytes)"));
+      // ========================================================================
+      // VS CONSTANT BUFFER BINDING - ENABLED (game shaders need constants)
+      // ========================================================================
+      // CRITICAL FIX: Int constants size - DXSO shaders expect int constants at offset 0
+      constexpr uint32_t kIntConstantsSize = 16 * sizeof(Vector4i);  // 16 vec4i = 256 bytes
 
-        // Log VS constants for debugging - show c[0]-c[7] which typically contain transformation matrices
-        if (firstRequest.vertexShaderConstantData.size() > 0) {
-          // Log first 8 constants (2 rows of a matrix or WVP rows)
-          static uint32_t vsConstLogCount = 0;
-          if (++vsConstLogCount <= 10) {
-            Logger::info("[SHADER-CONST-DEBUG] VS constants (c[0]-c[7]) - transformation matrices:");
-            for (int i = 0; i < 8 && i < (int)firstRequest.vertexShaderConstantData.size(); i++) {
-              const Vector4& v = firstRequest.vertexShaderConstantData[i];
-              Logger::info(str::format("  VS c[", i, "] = (", v.x, ", ", v.y, ", ", v.z, ", ", v.w, ")"));
-            }
-            // Find first non-zero constant to help debug
-            int firstNonZero = -1;
-            for (int i = 0; i < (int)firstRequest.vertexShaderConstantData.size(); i++) {
-              const Vector4& v = firstRequest.vertexShaderConstantData[i];
-              if (v.x != 0 || v.y != 0 || v.z != 0 || v.w != 0) {
-                firstNonZero = i;
-                break;
+#if 1  // --- BEGIN VS CONSTANT BUFFER BINDING ---
+      if (!firstRequest.vertexShaderConstantData.empty()) {
+        const auto& vsConst = firstRequest.vertexShaderConstantData;
+        Logger::warn(str::format("[GEOM-DEBUG] VS constants: ", vsConst.size(), " vec4s"));
+
+        // Log first 4 constants (usually viewProj matrix c0-c3)
+        if (vsConst.size() >= 4) {
+          Logger::warn(str::format("[GEOM-DEBUG] c0 (viewProj row0): ", vsConst[0].x, ", ", vsConst[0].y, ", ", vsConst[0].z, ", ", vsConst[0].w));
+          Logger::warn(str::format("[GEOM-DEBUG] c1 (viewProj row1): ", vsConst[1].x, ", ", vsConst[1].y, ", ", vsConst[1].z, ", ", vsConst[1].w));
+          Logger::warn(str::format("[GEOM-DEBUG] c2 (viewProj row2): ", vsConst[2].x, ", ", vsConst[2].y, ", ", vsConst[2].z, ", ", vsConst[2].w));
+          Logger::warn(str::format("[GEOM-DEBUG] c3 (viewProj row3): ", vsConst[3].x, ", ", vsConst[3].y, ", ", vsConst[3].z, ", ", vsConst[3].w));
+        }
+        // Log view matrix at c4-c7 if present
+        if (vsConst.size() >= 8) {
+          Logger::warn(str::format("[GEOM-DEBUG] c4 (view row0): ", vsConst[4].x, ", ", vsConst[4].y, ", ", vsConst[4].z, ", ", vsConst[4].w));
+          Logger::warn(str::format("[GEOM-DEBUG] c7 (view row3): ", vsConst[7].x, ", ", vsConst[7].y, ", ", vsConst[7].z, ", ", vsConst[7].w));
+        }
+        // Log world matrix at c48-c51 if present
+        if (vsConst.size() >= 52) {
+          Logger::warn(str::format("[GEOM-DEBUG] c48 (world row0): ", vsConst[48].x, ", ", vsConst[48].y, ", ", vsConst[48].z, ", ", vsConst[48].w));
+          Logger::warn(str::format("[GEOM-DEBUG] c49 (world row1): ", vsConst[49].x, ", ", vsConst[49].y, ", ", vsConst[49].z, ", ", vsConst[49].w));
+          Logger::warn(str::format("[GEOM-DEBUG] c50 (world row2): ", vsConst[50].x, ", ", vsConst[50].y, ", ", vsConst[50].z, ", ", vsConst[50].w));
+          Logger::warn(str::format("[GEOM-DEBUG] c51 (world row3): ", vsConst[51].x, ", ", vsConst[51].y, ", ", vsConst[51].z, ", ", vsConst[51].w));
+        }
+
+        // Use ORIGINAL constants - RT is now created at original viewport size
+        // so screenSize (c81) values match correctly
+        if (firstRequest.vertexShaderConstantData.size() >= 82) {
+          Logger::warn(str::format("[GEOM-DEBUG] c81 (screenSize): ",
+            firstRequest.vertexShaderConstantData[81].x, ", ", firstRequest.vertexShaderConstantData[81].y, ", ",
+            firstRequest.vertexShaderConstantData[81].z, ", ", firstRequest.vertexShaderConstantData[81].w,
+            " (RT matches at ", group.resolution.width, "x", group.resolution.height, ")"));
+        }
+
+        // ====================== EXTENSIVE CONSTANT BUFFER DEBUG ======================
+        // CRITICAL FIX: The DXSO shader expects constant buffer with this layout:
+        //   struct cBuffer_t {
+        //     int32_t i[16];    // Member 0: int constants (16 vec4i = 256 bytes)
+        //     float   f[256];   // Member 1: float constants (256 vec4 = 4096 bytes)
+        //   };
+        // The shader accesses float constants at structIdx=1 (offset 256 bytes)
+        // We must prepend 256 bytes of zeros for the int constants!
+
+        if (doExtensiveDebug) {
+          Logger::err("[GEOM-CB-DEBUG] ==================== VS CONSTANT BUFFER ANALYSIS ====================");
+          Logger::err(str::format("[GEOM-CB-DEBUG] !!! MEMORY LAYOUT FIX: Prepending ", kIntConstantsSize, " bytes for int constants !!!"));
+          Logger::err(str::format("[GEOM-CB-DEBUG] Float constants start at offset ", kIntConstantsSize, " (shader reads at member index 1)"));
+          Logger::err(str::format("[GEOM-CB-DEBUG] Total VS constants: ", vsConst.size(), " vec4s = ", vsConst.size() * 16, " bytes"));
+
+          // Check for all-zero matrices (indicates uninitialized/invalid state)
+          bool c0c3AllZero = (vsConst.size() >= 4) &&
+            (vsConst[0].x == 0 && vsConst[0].y == 0 && vsConst[0].z == 0 && vsConst[0].w == 0) &&
+            (vsConst[1].x == 0 && vsConst[1].y == 0 && vsConst[1].z == 0 && vsConst[1].w == 0) &&
+            (vsConst[2].x == 0 && vsConst[2].y == 0 && vsConst[2].z == 0 && vsConst[2].w == 0) &&
+            (vsConst[3].x == 0 && vsConst[3].y == 0 && vsConst[3].z == 0 && vsConst[3].w == 0);
+
+          if (c0c3AllZero) {
+            Logger::err("[GEOM-CB-DEBUG] WARNING: c0-c3 (viewProj matrix) is ALL ZEROS! Transform will collapse all geometry to origin!");
+          }
+
+          // Check if c0-c3 looks like a valid projection matrix
+          if (vsConst.size() >= 4) {
+            bool hasProjectionLook = (vsConst[0].w == 0.0f && vsConst[1].w == 0.0f &&
+                                       (vsConst[2].w == 1.0f || vsConst[2].w == -1.0f) && vsConst[3].w == 0.0f);
+            Logger::err(str::format("[GEOM-CB-DEBUG] c0-c3 looks like projection matrix: ", hasProjectionLook ? "YES" : "NO/UNKNOWN"));
+
+            // Check if diagonal is reasonable (non-zero scale factors)
+            float diagMag = std::abs(vsConst[0].x) + std::abs(vsConst[1].y) + std::abs(vsConst[2].z);
+            Logger::err(str::format("[GEOM-CB-DEBUG] c0-c3 diagonal magnitude: ", diagMag, " (should be > 0 for valid transform)"));
+          }
+
+          // Simulate transform of first vertex using c0-c3 as WVP matrix
+          if (vsConst.size() >= 4 && !firstRequest.originalVertexStreams.empty()) {
+            const auto& stream = firstRequest.originalVertexStreams[0];
+            if (stream.buffer != nullptr && stream.stride >= 12) {
+              void* mappedPtr = stream.buffer->mapPtr(0);
+              if (mappedPtr) {
+                const float* pos = reinterpret_cast<const float*>(mappedPtr);
+                float x = pos[0], y = pos[1], z = pos[2], w = 1.0f;
+
+                // Transform using c0-c3 as a 4x4 matrix (column-major in D3D9 constants)
+                // D3D9 stores matrices as c0=row0, c1=row1, c2=row2, c3=row3
+                // So output = pos * M where M is row-major
+                float clipX = x * vsConst[0].x + y * vsConst[1].x + z * vsConst[2].x + w * vsConst[3].x;
+                float clipY = x * vsConst[0].y + y * vsConst[1].y + z * vsConst[2].y + w * vsConst[3].y;
+                float clipZ = x * vsConst[0].z + y * vsConst[1].z + z * vsConst[2].z + w * vsConst[3].z;
+                float clipW = x * vsConst[0].w + y * vsConst[1].w + z * vsConst[2].w + w * vsConst[3].w;
+
+                Logger::err(str::format("[GEOM-CB-DEBUG] SIMULATED TRANSFORM (using c0-c3 as WVP):"));
+                Logger::err(str::format("[GEOM-CB-DEBUG]   Input pos: (", x, ", ", y, ", ", z, ", ", w, ")"));
+                Logger::err(str::format("[GEOM-CB-DEBUG]   Output clip: (", clipX, ", ", clipY, ", ", clipZ, ", ", clipW, ")"));
+
+                if (clipW != 0.0f) {
+                  float ndcX = clipX / clipW, ndcY = clipY / clipW, ndcZ = clipZ / clipW;
+                  Logger::err(str::format("[GEOM-CB-DEBUG]   Output NDC: (", ndcX, ", ", ndcY, ", ", ndcZ, ")"));
+
+                  bool inFrustum = (ndcX >= -1 && ndcX <= 1) && (ndcY >= -1 && ndcY <= 1) && (ndcZ >= 0 && ndcZ <= 1);
+                  Logger::err(str::format("[GEOM-CB-DEBUG]   In NDC frustum: ", inFrustum ? "YES" : "NO (CLIPPED!)"));
+
+                  if (!inFrustum) {
+                    Logger::err("[GEOM-CB-DEBUG] !!! VERTEX IS OUTSIDE CLIP FRUSTUM - WILL BE CULLED !!!");
+                  }
+                } else {
+                  Logger::err("[GEOM-CB-DEBUG]   clipW is 0! Division by zero, vertex at infinity!");
+                }
               }
             }
-            if (firstNonZero < 0) {
-              Logger::warn("[SHADER-CONST-DEBUG] WARNING: All VS constants are ZERO! Vertices will transform to origin!");
-            } else {
-              Logger::info(str::format("[SHADER-CONST-DEBUG] First non-zero VS constant at c[", firstNonZero, "]"));
+          }
+
+          // Dump ALL constants for comprehensive debugging
+          Logger::err("[GEOM-CB-DEBUG] Full VS constant dump (first 20 and key indices):");
+          for (size_t i = 0; i < std::min(vsConst.size(), size_t(20)); i++) {
+            Logger::err(str::format("[GEOM-CB-DEBUG]   c[", i, "] = (", vsConst[i].x, ", ", vsConst[i].y, ", ", vsConst[i].z, ", ", vsConst[i].w, ")"));
+          }
+          // Also dump indices that are commonly used for matrices
+          std::vector<size_t> keyIndices = {48, 49, 50, 51, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95};
+          for (size_t idx : keyIndices) {
+            if (idx < vsConst.size()) {
+              Logger::err(str::format("[GEOM-CB-DEBUG]   c[", idx, "] = (", vsConst[idx].x, ", ", vsConst[idx].y, ", ", vsConst[idx].z, ", ", vsConst[idx].w, ")"));
             }
-            // Check c[81] which Lego Batman 2 uses for viewport transform
-            if (firstRequest.vertexShaderConstantData.size() > 81) {
-              const Vector4& v81 = firstRequest.vertexShaderConstantData[81];
-              Logger::info(str::format("[SHADER-CONST-DEBUG] VS c[81] (viewport) = (", v81.x, ", ", v81.y, ", ", v81.z, ", ", v81.w, ")"));
-            } else {
-              Logger::warn("[SHADER-CONST-DEBUG] WARNING: VS constants too small - missing c[81] viewport data!");
-            }
           }
         }
 
-        // Copy constants
-        std::vector<Vector4> modifiedConstants = firstRequest.vertexShaderConstantData;
+        // OPTIMIZED: Use ring buffer allocation instead of createBuffer per draw
+        // CRITICAL: DXSO shaders expect int constants at offset 0, float constants at offset 256
+        // We allocate a slice with: [16 vec4i zeros][256 vec4 floats]
+        const uint32_t floatDataSize = static_cast<uint32_t>(firstRequest.vertexShaderConstantData.size() * sizeof(Vector4));
+        const uint32_t totalSize = kIntConstantsSize + floatDataSize;
+        const VkDeviceSize alignedSize = dxvk::align(VkDeviceSize(totalSize), 256);
 
-        // For RT replacement (view-dependent) draws: DON'T adjust c81
-        // We're rendering at original viewport resolution, so c81 should stay at original values
-        // For non-RT replacement draws: adjust c81 to match capture RT size
-        if (!firstRequest.isRTReplacement && modifiedConstants.size() > 81) {
-          const float rtWidth = static_cast<float>(group.resolution.width);
-          const float rtHeight = static_cast<float>(group.resolution.height);
-          Vector4 oldC81 = modifiedConstants[81];
-          modifiedConstants[81] = Vector4(rtWidth, rtHeight, 1.0f / rtWidth, 1.0f / rtHeight);
+        // Lazily initialize VS constant ring buffer
+        if (m_vsConstantRingBuffer == nullptr) {
+          DxvkBufferCreateInfo info;
+          info.size = kConstantBufferSliceSize;  // Fixed slice size for ring buffer
+          info.usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+          info.stages = VK_PIPELINE_STAGE_VERTEX_SHADER_BIT;
+          info.access = VK_ACCESS_UNIFORM_READ_BIT;
 
-          static uint32_t c81FixCount = 0;
-          if (++c81FixCount <= 20) {
-            Logger::info(str::format("[C81-FIX] Adjusted viewport constant: old=(", oldC81.x, ",", oldC81.y, ",", oldC81.z, ",", oldC81.w,
-              ") -> new=(", modifiedConstants[81].x, ",", modifiedConstants[81].y, ",", modifiedConstants[81].z, ",", modifiedConstants[81].w, ")"));
-          }
-        } else if (firstRequest.isRTReplacement) {
-          static uint32_t rtRepC81Log = 0;
-          if (++rtRepC81Log <= 10) {
-            const Vector4 c81 = (modifiedConstants.size() > 81) ? modifiedConstants[81] : Vector4(0,0,0,0);
-            Logger::info(str::format("[RT-REP-C81] Keeping original c81=(", c81.x, ",", c81.y, ",", c81.z, ",", c81.w,
-              ") for view-dependent draw, rtSize=", group.resolution.width, "x", group.resolution.height));
-          }
+          m_vsConstantRingBuffer = ctx->getDevice()->createBuffer(
+            info,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
+            DxvkMemoryStats::Category::AppBuffer,
+            "ShaderCapture VS Constants Ring");
+          Logger::info("[PERF] Created VS constant ring buffer (avoids per-draw allocation)");
         }
 
-        // DIAGNOSTIC: Log the constants we're using
-        static uint32_t ovalDiagCount = 0;
-        if (++ovalDiagCount <= 50) {
-          const Vector4 c81 = (modifiedConstants.size() > 81) ? modifiedConstants[81] : Vector4(0,0,0,0);
-          Logger::info(str::format("[OVAL-DIAG] texHash=0x", std::hex, group.textureHash, std::dec,
-            " c81=(", c81.x, ",", c81.y, ",", c81.z, ",", c81.w, ")",
-            " isRTRep=", firstRequest.isRTReplacement ? "YES" : "NO",
-            " rtSize=", group.resolution.width, "x", group.resolution.height));
+        // Allocate a slice from the ring buffer (MUCH faster than createBuffer!)
+        DxvkBufferSlice vsConstantSlice;
+        DxvkBufferSliceHandle vsSliceHandle = m_vsConstantRingBuffer->allocSlice();
+        if (vsSliceHandle.mapPtr != nullptr) {
+          void* dst = vsSliceHandle.mapPtr;
+          // Zero out int constants at offset 0
+          std::memset(dst, 0, kIntConstantsSize);
+          // Copy float constants at offset 256
+          std::memcpy(reinterpret_cast<char*>(dst) + kIntConstantsSize,
+                      firstRequest.vertexShaderConstantData.data(), floatDataSize);
+          // Zero rest of slice
+          if (kConstantBufferSliceSize > totalSize) {
+            std::memset(reinterpret_cast<char*>(dst) + totalSize, 0, size_t(kConstantBufferSliceSize - totalSize));
+          }
 
-          // Log first few VS constants (transform matrix)
-          if (modifiedConstants.size() >= 4) {
-            Logger::info(str::format("[OVAL-DIAG] c[0-3] transform: ",
-              "c0=(", modifiedConstants[0].x, ",", modifiedConstants[0].y, ",", modifiedConstants[0].z, ",", modifiedConstants[0].w, ") ",
-              "c1=(", modifiedConstants[1].x, ",", modifiedConstants[1].y, ",", modifiedConstants[1].z, ",", modifiedConstants[1].w, ") ",
-              "c2=(", modifiedConstants[2].x, ",", modifiedConstants[2].y, ",", modifiedConstants[2].z, ",", modifiedConstants[2].w, ") ",
-              "c3=(", modifiedConstants[3].x, ",", modifiedConstants[3].y, ",", modifiedConstants[3].z, ",", modifiedConstants[3].w, ")"));
+          // CRITICAL: Tell the context to use this new slice! Without this, getSliceHandle()
+          // returns the old slice and we bind stale/wrong data!
+          ctx->invalidateBuffer(m_vsConstantRingBuffer, vsSliceHandle);
+          vsConstantSlice = DxvkBufferSlice(m_vsConstantRingBuffer, 0, alignedSize);
+
+          if (doExtensiveDebug) {
+            Logger::err(str::format("[GEOM-CB-DEBUG] Allocated VS constant slice from ring buffer:"));
+            Logger::err(str::format("[GEOM-CB-DEBUG]   Int constants: offset 0, size ", kIntConstantsSize, " (zeroed)"));
+            Logger::err(str::format("[GEOM-CB-DEBUG]   Float constants: offset ", kIntConstantsSize, ", size ", floatDataSize));
+            Logger::err(str::format("[GEOM-CB-DEBUG]   Total size: ", totalSize, " aligned to ", alignedSize));
           }
         }
-
-        DxvkBufferSlice vsConstantSlice = createConstantBufferSlice(
-          modifiedConstants,
-          VK_PIPELINE_STAGE_VERTEX_SHADER_BIT,
-          "ShaderCapture VS Constants");
 
         if (vsConstantSlice.defined()) {
           const uint32_t vsConstantBufferSlot = computeResourceSlotId(
@@ -1012,41 +1442,81 @@ namespace dxvk {
             DxsoBindingType::ConstantBuffer,
             DxsoConstantBuffers::VSConstantBuffer);
           ctx->bindResourceBuffer(vsConstantBufferSlot, vsConstantSlice);
-          Logger::info(str::format("[SHADER-CONST] Bound vertex shader constants to slot ", vsConstantBufferSlot));
+          Logger::warn(str::format("[GEOM-DEBUG] VS constants bound to slot ", vsConstantBufferSlot,
+            " size=", vsConstantSlice.length(), " bytes"));
+
+          if (doExtensiveDebug) {
+            Logger::err(str::format("[GEOM-CB-DEBUG] VS constant buffer BOUND to slot ", vsConstantBufferSlot));
+            Logger::err(str::format("[GEOM-CB-DEBUG]   Buffer size: ", vsConstantSlice.length(), " bytes"));
+            Logger::err(str::format("[GEOM-CB-DEBUG]   Buffer offset: ", vsConstantSlice.offset()));
+            Logger::err(str::format("[GEOM-CB-DEBUG]   Buffer ptr: ", (void*)vsConstantSlice.buffer().ptr()));
+          }
         } else {
-          Logger::warn("[SHADER-CONST] Failed to create vertex shader constant buffer!");
+          Logger::err("[GEOM-DEBUG] Failed to create VS constant buffer slice!");
+          if (doExtensiveDebug) {
+            Logger::err("[GEOM-CB-DEBUG] !!! VS CONSTANT BUFFER CREATION FAILED !!!");
+          }
         }
       } else {
-        Logger::warn("[SHADER-CONST] NO vertex shader constant data! VS will read garbage!");
+        Logger::warn("[GEOM-DEBUG] NO VS CONSTANTS!");
+        if (doExtensiveDebug) {
+          Logger::err("[GEOM-CB-DEBUG] !!! NO VS CONSTANTS TO BIND - SHADER WILL USE UNINITIALIZED DATA !!!");
+        }
       }
+#endif // --- END VS CONSTANT BUFFER BINDING ---
 
-      // Bind pixel shader constants - CRITICAL for procedural textures and view-dependent UVs
-      // Now populated from D3D9 device state in d3d9_rtx.cpp!
+      // ========================================================================
+      // PS CONSTANT BUFFER BINDING - ENABLED (game shaders need constants)
+      // ========================================================================
+#if 1  // --- BEGIN PS CONSTANT BUFFER BINDING ---
       if (!firstRequest.pixelShaderConstantData.empty()) {
-        Logger::info(str::format("[SHADER-CONST-DEBUG] Pixel shader constant data size: ",
-          firstRequest.pixelShaderConstantData.size(), " Vector4s (",
-          firstRequest.pixelShaderConstantData.size() * sizeof(Vector4), " bytes)"));
+        const auto& psConst = firstRequest.pixelShaderConstantData;
+        Logger::warn(str::format("[GEOM-DEBUG] PS constants: ", psConst.size(), " vec4s"));
 
-        // Log ALL non-zero PS constants to see what the shader actually uses
-        static uint32_t psConstLogCount = 0;
-        if (psConstLogCount++ < 3) {
-          Logger::info("[PS-CONST-DUMP] ===== FULL PS CONSTANT DUMP (non-zero only) =====");
-          size_t nonZeroCount = 0;
-          for (size_t i = 0; i < firstRequest.pixelShaderConstantData.size(); i++) {
-            const Vector4& v = firstRequest.pixelShaderConstantData[i];
-            if (v.x != 0.0f || v.y != 0.0f || v.z != 0.0f || v.w != 0.0f) {
-              Logger::info(str::format("[PS-CONST-DUMP] c[", i, "] = (", v.x, ", ", v.y, ", ", v.z, ", ", v.w, ")"));
-              nonZeroCount++;
-            }
-          }
-          Logger::info(str::format("[PS-CONST-DUMP] Total non-zero constants: ", nonZeroCount, " / ", firstRequest.pixelShaderConstantData.size()));
-          Logger::info("[PS-CONST-DUMP] ===== END DUMP =====");
+        // OPTIMIZED: Use ring buffer allocation instead of createBuffer per draw
+        // CRITICAL: Same layout fix as VS - int constants at offset 0, float constants at offset 256
+        const uint32_t psFloatDataSize = static_cast<uint32_t>(firstRequest.pixelShaderConstantData.size() * sizeof(Vector4));
+        const uint32_t psTotalSize = kIntConstantsSize + psFloatDataSize;
+        const VkDeviceSize psAlignedSize = dxvk::align(VkDeviceSize(psTotalSize), 256);
+
+        // Lazily initialize PS constant ring buffer
+        if (m_psConstantRingBuffer == nullptr) {
+          DxvkBufferCreateInfo psInfo;
+          psInfo.size = kConstantBufferSliceSize;  // Fixed slice size for ring buffer
+          psInfo.usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+          psInfo.stages = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+          psInfo.access = VK_ACCESS_UNIFORM_READ_BIT;
+
+          m_psConstantRingBuffer = ctx->getDevice()->createBuffer(
+            psInfo,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
+            DxvkMemoryStats::Category::AppBuffer,
+            "ShaderCapture PS Constants Ring");
+          Logger::info("[PERF] Created PS constant ring buffer (avoids per-draw allocation)");
         }
 
-        DxvkBufferSlice psConstantSlice = createConstantBufferSlice(
-          firstRequest.pixelShaderConstantData,
-          VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-          "ShaderCapture PS Constants");
+        // Allocate a slice from the ring buffer (MUCH faster than createBuffer!)
+        DxvkBufferSlice psConstantSlice;
+        DxvkBufferSliceHandle psSliceHandle = m_psConstantRingBuffer->allocSlice();
+        if (psSliceHandle.mapPtr != nullptr) {
+          void* psDst = psSliceHandle.mapPtr;
+          std::memset(psDst, 0, kIntConstantsSize);
+          std::memcpy(reinterpret_cast<char*>(psDst) + kIntConstantsSize,
+                      firstRequest.pixelShaderConstantData.data(), psFloatDataSize);
+          if (kConstantBufferSliceSize > psTotalSize) {
+            std::memset(reinterpret_cast<char*>(psDst) + psTotalSize, 0, size_t(kConstantBufferSliceSize - psTotalSize));
+          }
+
+          // CRITICAL: Tell the context to use this new slice!
+          ctx->invalidateBuffer(m_psConstantRingBuffer, psSliceHandle);
+          psConstantSlice = DxvkBufferSlice(m_psConstantRingBuffer, 0, psAlignedSize);
+
+          if (doExtensiveDebug) {
+            Logger::err(str::format("[GEOM-CB-DEBUG] Allocated PS constant slice from ring buffer:"));
+            Logger::err(str::format("[GEOM-CB-DEBUG]   Int constants: offset 0, size ", kIntConstantsSize, " (zeroed)"));
+            Logger::err(str::format("[GEOM-CB-DEBUG]   Float constants: offset ", kIntConstantsSize, ", size ", psFloatDataSize));
+          }
+        }
 
         if (psConstantSlice.defined()) {
           const uint32_t psConstantBufferSlot = computeResourceSlotId(
@@ -1054,13 +1524,40 @@ namespace dxvk {
             DxsoBindingType::ConstantBuffer,
             DxsoConstantBuffers::PSConstantBuffer);
           ctx->bindResourceBuffer(psConstantBufferSlot, psConstantSlice);
-          Logger::info(str::format("[SHADER-CONST] Bound pixel shader constants to slot ", psConstantBufferSlot));
-        } else {
-          Logger::warn("[SHADER-CONST] Failed to create pixel shader constant buffer!");
+          Logger::warn(str::format("[GEOM-DEBUG] PS constants bound to slot ", psConstantBufferSlot,
+            " size=", psConstantSlice.length(), " bytes"));
+
+          static uint32_t psBindLog = 0;
+          if (++psBindLog <= 5) {
+            Logger::info(str::format("[SHADER-CONST] Bound pixel shader constants to slot ", psConstantBufferSlot,
+              " (", firstRequest.pixelShaderConstantData.size(), " constants)"));
+          }
+
+          // PS CONSTANT DIAGNOSTIC: Log first few PS constants to debug random color output
+          // These often contain material colors, tint values, or blending factors
+          static uint32_t psConstDiagLog = 0;
+          if (++psConstDiagLog <= 20) {
+            const auto& psConst = firstRequest.pixelShaderConstantData;
+            size_t numToLog = std::min(psConst.size(), size_t(8));
+            Logger::warn(str::format("[PS-CONST-DIAG] First ", numToLog, " PS constants (total ", psConst.size(), "):"));
+            for (size_t i = 0; i < numToLog; i++) {
+              const Vector4& c = psConst[i];
+              Logger::warn(str::format("  c[", i, "] = (", c.x, ", ", c.y, ", ", c.z, ", ", c.w, ")"));
+            }
+            // Also log if any constant looks like a color (all components 0-1 range)
+            for (size_t i = 0; i < psConst.size(); i++) {
+              const Vector4& c = psConst[i];
+              bool looksLikeColor = (c.x >= 0 && c.x <= 1) && (c.y >= 0 && c.y <= 1) &&
+                                    (c.z >= 0 && c.z <= 1) && (c.w >= 0 && c.w <= 1) &&
+                                    (c.x != 0 || c.y != 0 || c.z != 0);  // Not all zeros
+              if (looksLikeColor && i >= numToLog) {
+                Logger::warn(str::format("  c[", i, "] looks like COLOR: (", c.x, ", ", c.y, ", ", c.z, ", ", c.w, ")"));
+              }
+            }
+          }
         }
-      } else {
-        Logger::warn("[SHADER-CONST] NO pixel shader constant data! Shader will read garbage!");
       }
+#endif // --- END PS CONSTANT BUFFER BINDING ---
 
       // Bind textures and samplers - CRITICAL for textured shaders
       // ROBUST BINDING: Iterate shader slots to know exactly what the shader expects
@@ -1679,6 +2176,34 @@ namespace dxvk {
       }
     }
 
+    // CAPTURE OUTPUT DIAGNOSTIC SUMMARY: Log information about what was captured
+    // This helps debug issues like "random colors with gradients"
+    static uint32_t captureSummaryLog = 0;
+    if (++captureSummaryLog <= 30) {
+      Logger::warn("========== [CAPTURE-SUMMARY] ==========");
+      Logger::warn(str::format("[CAPTURE-SUMMARY] Total groups captured: ", captureGroups.size()));
+      Logger::warn(str::format("[CAPTURE-SUMMARY] Total draws: ", successCount));
+      Logger::warn(str::format("[CAPTURE-SUMMARY] Multi-draw groups: ", multiDrawCount));
+
+      // Log details about the first few captured outputs to check for issues
+      uint32_t outputsLogged = 0;
+      for (const auto& [cacheKey, output] : m_capturedOutputs) {
+        if (outputsLogged >= 5) break;
+        if (output.capturedTexture.isValid()) {
+          auto& imgInfo = output.capturedTexture.image->info();
+          Logger::warn(str::format("[CAPTURE-SUMMARY] Output #", outputsLogged,
+            " cacheKey=0x", std::hex, cacheKey, std::dec,
+            " size=", imgInfo.extent.width, "x", imgInfo.extent.height,
+            " format=", imgInfo.format,
+            " layers=", imgInfo.numLayers,
+            " isArrayLayer=", output.isArrayLayer ? "YES" : "NO",
+            " layer=", output.arrayLayer));
+          outputsLogged++;
+        }
+      }
+      Logger::warn("========================================");
+    }
+
     // CRITICAL FIX: Reset ALL GPU state to prevent corruption of subsequent RTX rendering
     // After capture, we've bound D3D9 shaders, vertex buffers, input layouts, etc.
     // RTX rendering expects clean state - we must invalidate everything
@@ -1771,14 +2296,38 @@ namespace dxvk {
 
   void ShaderOutputCapturer::setCommonPipelineState(Rc<RtxContext> ctx, const GpuCaptureRequest& request,
                                                     uint32_t rtWidth, uint32_t rtHeight) {
-    // CRITICAL FIX: Use viewport matching the render target size, NOT the original game viewport!
-    // The game's viewport (e.g. 1920x1080) doesn't match our render target (e.g. 256x256).
-    // If we use the game's viewport, geometry is mapped outside the render target bounds = black output.
+    // ====================== EXTENSIVE PIPELINE STATE DEBUG ======================
+    static uint32_t pipelineDebugCount = 0;
+    const bool doPipelineDebug = (++pipelineDebugCount <= 200);
+
+    if (doPipelineDebug) {
+      Logger::err("[GEOM-CB-DEBUG] ==================== PIPELINE STATE SETUP ====================");
+      Logger::err(str::format("[GEOM-CB-DEBUG] RT dimensions: ", rtWidth, "x", rtHeight));
+      Logger::err(str::format("[GEOM-CB-DEBUG] Original viewport: x=", request.viewport.x, " y=", request.viewport.y,
+        " w=", request.viewport.width, " h=", request.viewport.height,
+        " minD=", request.viewport.minDepth, " maxD=", request.viewport.maxDepth));
+      Logger::err(str::format("[GEOM-CB-DEBUG] Original scissor: x=", request.scissor.offset.x, " y=", request.scissor.offset.y,
+        " w=", request.scissor.extent.width, " h=", request.scissor.extent.height));
+      Logger::err(str::format("[GEOM-CB-DEBUG] vertexCount=", request.vertexCount, " indexCount=", request.indexCount));
+      Logger::err(str::format("[GEOM-CB-DEBUG] vertexOffset=", request.vertexOffset, " indexOffset=", request.indexOffset));
+      Logger::err(str::format("[GEOM-CB-DEBUG] vertexStride=", request.vertexStride, " texcoordStride=", request.texcoordStride));
+      Logger::err(str::format("[GEOM-CB-DEBUG] indexType=", request.indexType == VK_INDEX_TYPE_UINT16 ? "UINT16" :
+        (request.indexType == VK_INDEX_TYPE_UINT32 ? "UINT32" : "NONE")));
+      Logger::err(str::format("[GEOM-CB-DEBUG] useOriginalVertexLayout=", request.useOriginalVertexLayout ? "TRUE" : "FALSE"));
+      Logger::err(str::format("[GEOM-CB-DEBUG] originalVertexStreams.size=", request.originalVertexStreams.size()));
+      Logger::err(str::format("[GEOM-CB-DEBUG] originalVertexElements.size=", request.originalVertexElements.size()));
+    }
+
+    // RT is now created at original viewport resolution, so viewport matches RT
+    // CRITICAL: D3D9 to Vulkan requires Y-flip via negative viewport height!
+    // See D3D9DeviceEx::BindViewportAndScissor() for reference implementation
+    // D3D9's coordinate system has its origin in the bottom left, Vulkan's is top-left
+    float cf = 0.5f - (1.0f / 128.0f);  // Correctness factor for 1/2 texel offset
     VkViewport rtViewport = {};
-    rtViewport.x = 0.0f;
-    rtViewport.y = 0.0f;
+    rtViewport.x = 0.0f + cf;
+    rtViewport.y = static_cast<float>(rtHeight) + cf;  // Offset to bottom
     rtViewport.width = static_cast<float>(rtWidth);
-    rtViewport.height = static_cast<float>(rtHeight);
+    rtViewport.height = -static_cast<float>(rtHeight);  // NEGATIVE height for Y-flip!
     rtViewport.minDepth = 0.0f;
     rtViewport.maxDepth = 1.0f;
 
@@ -1786,8 +2335,17 @@ namespace dxvk {
     rtScissor.offset = { 0, 0 };
     rtScissor.extent = { rtWidth, rtHeight };
 
-    Logger::info(str::format("[VIEWPORT-DEBUG] USING RT SIZE: w=", rtWidth, " h=", rtHeight,
-      " (original game was w=", request.viewport.width, " h=", request.viewport.height, ")"));
+    if (doPipelineDebug) {
+      Logger::err(str::format("[GEOM-CB-DEBUG] VULKAN VIEWPORT: x=", rtViewport.x, " y=", rtViewport.y,
+        " w=", rtViewport.width, " h=", rtViewport.height, " (NEGATIVE for Y-flip!)"));
+      Logger::err(str::format("[GEOM-CB-DEBUG] VULKAN SCISSOR: x=", rtScissor.offset.x, " y=", rtScissor.offset.y,
+        " w=", rtScissor.extent.width, " h=", rtScissor.extent.height));
+    }
+
+    Logger::warn(str::format("[GEOM-DEBUG] VIEWPORT: ", rtWidth, "x", rtHeight,
+      " (matches RT, original request was ", request.viewport.width, "x", request.viewport.height, ")"));
+    Logger::warn(str::format("[GEOM-DEBUG] REQUEST: verts=", request.vertexCount, " idx=", request.indexCount,
+      " vOffset=", request.vertexOffset, " iOffset=", request.indexOffset));
     ctx->setViewports(1, &rtViewport, &rtScissor);
 
     DxvkDepthStencilState depthState = {};
@@ -1820,10 +2378,21 @@ namespace dxvk {
     iaState.patchVertexCount = 0;
     ctx->setInputAssemblyState(iaState);
 
-    // CRITICAL FIX: When using original vertex streams, build input layout from original elements
+    // ====================== EXTENSIVE INPUT LAYOUT DEBUG ======================
+    static uint32_t inputLayoutDebugCount = 0;
+    const bool doInputLayoutDebug = (++inputLayoutDebugCount <= 200);
+
+    // CRITICAL FIX: ALWAYS use original vertex elements when available since we use original game VS
     // Since we bind the ORIGINAL game vertex shader (not our custom one), we must use DXSO
     // attribute locations. The DXSO compiler maps D3D9 usages to specific Vulkan locations.
-    if (request.useOriginalVertexLayout && !request.originalVertexElements.empty()) {
+    if (!request.originalVertexElements.empty()) {
+      if (doInputLayoutDebug) {
+        Logger::err("[GEOM-CB-DEBUG] ==================== INPUT LAYOUT SETUP (ORIGINAL VERTEX ELEMENTS) ====================");
+        Logger::err(str::format("[GEOM-CB-DEBUG] Using ORIGINAL vertex elements for input layout"));
+        Logger::err(str::format("[GEOM-CB-DEBUG] originalVertexElements.size()=", request.originalVertexElements.size()));
+        Logger::err(str::format("[GEOM-CB-DEBUG] originalVertexStreams.size()=", request.originalVertexStreams.size()));
+      }
+
       // Map D3D9 usage to Vulkan attribute location (DXSO-compatible mapping)
       // This MUST match what the DXSO compiler uses for the original game's vertex shader
       auto mapUsageToLocation = [](uint8_t usage, uint8_t usageIdx) -> uint32_t {
@@ -1883,6 +2452,46 @@ namespace dxvk {
       ctx->setInputLayout(static_cast<uint32_t>(attributes.size()), attributes.data(),
                           static_cast<uint32_t>(bindings.size()), bindings.data());
 
+      if (doInputLayoutDebug) {
+        Logger::err(str::format("[GEOM-CB-DEBUG] INPUT LAYOUT COMPLETE: ", attributes.size(), " attributes, ", bindings.size(), " bindings"));
+        for (size_t i = 0; i < attributes.size(); i++) {
+          const char* fmtName = "UNKNOWN";
+          switch (attributes[i].format) {
+            case VK_FORMAT_R32_SFLOAT: fmtName = "R32_SFLOAT"; break;
+            case VK_FORMAT_R32G32_SFLOAT: fmtName = "R32G32_SFLOAT"; break;
+            case VK_FORMAT_R32G32B32_SFLOAT: fmtName = "R32G32B32_SFLOAT"; break;
+            case VK_FORMAT_R32G32B32A32_SFLOAT: fmtName = "R32G32B32A32_SFLOAT"; break;
+            case VK_FORMAT_R8G8B8A8_UNORM: fmtName = "R8G8B8A8_UNORM"; break;
+            case VK_FORMAT_B8G8R8A8_UNORM: fmtName = "B8G8R8A8_UNORM"; break;
+            case VK_FORMAT_R16G16_SFLOAT: fmtName = "R16G16_SFLOAT"; break;
+            case VK_FORMAT_R16G16B16A16_SFLOAT: fmtName = "R16G16B16A16_SFLOAT"; break;
+            case VK_FORMAT_R8G8B8A8_UINT: fmtName = "R8G8B8A8_UINT"; break;
+            default: fmtName = "OTHER"; break;
+          }
+          Logger::err(str::format("[GEOM-CB-DEBUG]   Attr[", i, "]: loc=", attributes[i].location,
+            " bind=", attributes[i].binding, " fmt=", fmtName, "(", (uint32_t)attributes[i].format, ")",
+            " off=", attributes[i].offset));
+        }
+        for (size_t i = 0; i < bindings.size(); i++) {
+          Logger::err(str::format("[GEOM-CB-DEBUG]   Binding[", i, "]: binding=", bindings[i].binding,
+            " stride=", bindings[i].fetchRate, " inputRate=VERTEX"));
+        }
+
+        // Check for potential issues
+        bool hasPosition = false;
+        bool hasTexcoord = false;
+        for (size_t i = 0; i < attributes.size(); i++) {
+          if (attributes[i].location == 0) hasPosition = true;
+          if (attributes[i].location >= 7 && attributes[i].location <= 15) hasTexcoord = true;
+        }
+        if (!hasPosition) {
+          Logger::err("[GEOM-CB-DEBUG] !!! WARNING: No POSITION attribute (location 0)! Geometry may not render!");
+        }
+        if (!hasTexcoord) {
+          Logger::err("[GEOM-CB-DEBUG] !!! WARNING: No TEXCOORD attribute! Texture sampling may fail!");
+        }
+      }
+
       static uint32_t origLayoutLogCount = 0;
       if (++origLayoutLogCount <= 20) {
         Logger::info(str::format("[DXSO-INPUT-LAYOUT] Using DXSO locations for ", attributes.size(),
@@ -1897,6 +2506,11 @@ namespace dxvk {
       return;
     }
 
+    if (doInputLayoutDebug) {
+      Logger::err("[GEOM-CB-DEBUG] ==================== INPUT LAYOUT SETUP (FALLBACK SEPARATED BUFFERS) ====================");
+      Logger::err("[GEOM-CB-DEBUG] No original vertex elements - using fallback separated buffer layout");
+    }
+
     // Fallback: legacy separated buffer layout (for custom VS or when original not available)
     std::array<DxvkVertexAttribute, 3> attributes;
     std::array<DxvkVertexBinding, 3> bindings;
@@ -1904,10 +2518,13 @@ namespace dxvk {
     uint32_t numBindings = 0;
 
     // Position: binding 0 -> location 0 (always first in D3D9)
+    // IMPORTANT: Use R32G32B32A32_SFLOAT (vec4) to read position.xyz + positionW
+    // The W component is needed for perspective-correct clip-space passthrough
+    // when RTX transforms are identity (game uses shader constants, not SetTransform)
     if (request.vertexBuffer.defined() || request.replacementVertexBuffer.defined()) {
       attributes[numAttributes].location = 0;
       attributes[numAttributes].binding = 0;
-      attributes[numAttributes].format = VK_FORMAT_R32G32B32_SFLOAT;
+      attributes[numAttributes].format = VK_FORMAT_R32G32B32A32_SFLOAT;
       attributes[numAttributes].offset = 0;
       numAttributes++;
 
@@ -2050,24 +2667,86 @@ namespace dxvk {
   }
 
   void ShaderOutputCapturer::bindGeometryBuffers(Rc<RtxContext> ctx, const GpuCaptureRequest& request) {
+    // ====================== EXTENSIVE GEOMETRY BUFFER BINDING DEBUG ======================
+    static uint32_t geomBufferDebugCount = 0;
+    const bool doGeomBufferDebug = (++geomBufferDebugCount <= 200);
+
+    if (doGeomBufferDebug) {
+      Logger::err("[GEOM-CB-DEBUG] ==================== GEOMETRY BUFFER BINDING ====================");
+    }
+
     // Use self-contained geometry buffer data from request - no DrawCallState needed!
     // CRITICAL: Some buffers may be staging buffers without VK_BUFFER_USAGE_VERTEX_BUFFER_BIT
     // We must ensure all bound buffers have the correct usage flags
 
-    // CRITICAL FIX: Use original vertex streams when available for correct D3D9 binding layout
-    if (request.useOriginalVertexLayout && !request.originalVertexStreams.empty()) {
+    // ALWAYS prefer original vertex layout since we use the original game VS
+    // The original game VS expects the original D3D9 vertex streams, not separated buffers
+    // Fall back to separated buffers only if original streams aren't available
+    bool useOriginalLayout = !request.originalVertexStreams.empty();
+
+    if (doGeomBufferDebug) {
+      Logger::err(str::format("[GEOM-CB-DEBUG] useOriginalLayout=", useOriginalLayout ? "TRUE" : "FALSE"));
+      Logger::err(str::format("[GEOM-CB-DEBUG] originalVertexStreams.size()=", request.originalVertexStreams.size()));
+      Logger::err(str::format("[GEOM-CB-DEBUG] vertexBuffer.defined()=", request.vertexBuffer.defined() ? "TRUE" : "FALSE"));
+      Logger::err(str::format("[GEOM-CB-DEBUG] texcoordBuffer.defined()=", request.texcoordBuffer.defined() ? "TRUE" : "FALSE"));
+      Logger::err(str::format("[GEOM-CB-DEBUG] indexBuffer.defined()=", request.indexBuffer.defined() ? "TRUE" : "FALSE"));
+      Logger::err(str::format("[GEOM-CB-DEBUG] replacementVertexBuffer.defined()=", request.replacementVertexBuffer.defined() ? "TRUE" : "FALSE"));
+    }
+
+    static uint32_t origLayoutLog = 0;
+    if (++origLayoutLog <= 5) {
+      Logger::info(str::format("[BIND-GEOM] useOriginalLayout=", useOriginalLayout ? "YES" : "NO (fallback to separated)",
+        " originalStreams=", request.originalVertexStreams.size()));
+    }
+
+    // Use original vertex streams when available for correct D3D9 binding layout
+    if (useOriginalLayout) {
       static uint32_t bindLogCount = 0;
       if (++bindLogCount <= 20) {
         Logger::info(str::format("[BIND-ORIG-STREAMS] Using ", request.originalVertexStreams.size(),
                                 " original streams instead of separated buffers"));
       }
 
+      if (doGeomBufferDebug) {
+        Logger::err(str::format("[GEOM-CB-DEBUG] BINDING ", request.originalVertexStreams.size(), " ORIGINAL VERTEX STREAMS"));
+      }
+
       // Bind each original stream to its D3D9 stream index
       for (const auto& stream : request.originalVertexStreams) {
-        if (stream.buffer == nullptr) continue;
+        if (stream.buffer == nullptr) {
+          if (doGeomBufferDebug) {
+            Logger::err(str::format("[GEOM-CB-DEBUG] !!! Stream ", stream.streamIndex, " has NULL buffer!"));
+          }
+          continue;
+        }
 
         DxvkBufferSlice bufferSlice(stream.buffer);
         ctx->bindVertexBuffer(stream.streamIndex, bufferSlice, stream.stride);
+
+        if (doGeomBufferDebug) {
+          VkBufferUsageFlags usage = stream.buffer->info().usage;
+          bool hasVertexBit = (usage & VK_BUFFER_USAGE_VERTEX_BUFFER_BIT) != 0;
+          Logger::err(str::format("[GEOM-CB-DEBUG] Bound stream ", stream.streamIndex,
+            ": stride=", stream.stride, " size=", stream.buffer->info().size,
+            " hasVertexBit=", hasVertexBit ? "YES" : "NO",
+            " usage=0x", std::hex, usage, std::dec));
+
+          // Dump first few vertices for debugging
+          if (stream.stride >= 12) {
+            void* mappedPtr = stream.buffer->mapPtr(0);
+            if (mappedPtr) {
+              const uint8_t* data = reinterpret_cast<const uint8_t*>(mappedPtr);
+              uint64_t bufSize = stream.buffer->info().size;
+              uint32_t numVerts = std::min(3u, static_cast<uint32_t>(bufSize / stream.stride));
+              for (uint32_t v = 0; v < numVerts; v++) {
+                const float* pos = reinterpret_cast<const float*>(data + v * stream.stride);
+                Logger::err(str::format("[GEOM-CB-DEBUG]   v[", v, "] pos=(", pos[0], ", ", pos[1], ", ", pos[2], ")"));
+              }
+            } else {
+              Logger::err("[GEOM-CB-DEBUG]   !!! Cannot map buffer - GPU only");
+            }
+          }
+        }
 
         if (bindLogCount <= 20) {
           Logger::info(str::format("  Stream[", stream.streamIndex, "]: stride=", stream.stride,
@@ -2125,9 +2804,51 @@ namespace dxvk {
     if (request.replacementTexcoordBuffer.defined()) {
       auto tb = ensureVertexBuffer(ctx, request.replacementTexcoordBuffer, request.replacementTexcoordStride, "ShaderCapture Texcoord (replacement)");
       ctx->bindVertexBuffer(1, tb, request.replacementTexcoordStride);
+
+      // TEXCOORD DIAGNOSTIC: Log the UV values from the separated texcoord buffer
+      static uint32_t uvDiagLog = 0;
+      if (++uvDiagLog <= 20) {
+        void* mappedPtr = request.replacementTexcoordBuffer.buffer()->mapPtr(request.replacementTexcoordBuffer.offset());
+        if (mappedPtr) {
+          const float* uvData = reinterpret_cast<const float*>(mappedPtr);
+          int numUVs = std::min(3u, (uint32_t)(request.replacementTexcoordBuffer.length() / request.replacementTexcoordStride));
+          Logger::warn(str::format("[UV-DIAG-REPL] Replacement texcoords (stride=", request.replacementTexcoordStride, "):"));
+          for (int i = 0; i < numUVs; i++) {
+            const float* uv = reinterpret_cast<const float*>(reinterpret_cast<const uint8_t*>(uvData) + i * request.replacementTexcoordStride);
+            Logger::warn(str::format("  uv[", i, "] = (", uv[0], ", ", uv[1], ")"));
+          }
+        }
+      }
     } else if (request.texcoordBuffer.defined()) {
       auto tb = ensureVertexBuffer(ctx, request.texcoordBuffer, request.texcoordStride, "ShaderCapture Texcoord");
       ctx->bindVertexBuffer(1, tb, request.texcoordStride);
+
+      // TEXCOORD DIAGNOSTIC: Log the UV values from the separated texcoord buffer
+      static uint32_t uvDiagLog2 = 0;
+      if (++uvDiagLog2 <= 20) {
+        void* mappedPtr = request.texcoordBuffer.buffer()->mapPtr(request.texcoordBuffer.offset());
+        if (mappedPtr) {
+          const float* uvData = reinterpret_cast<const float*>(mappedPtr);
+          int numUVs = std::min(3u, (uint32_t)(request.texcoordBuffer.length() / request.texcoordStride));
+          Logger::warn(str::format("[UV-DIAG] Texcoords (stride=", request.texcoordStride, "):"));
+          for (int i = 0; i < numUVs; i++) {
+            const float* uv = reinterpret_cast<const float*>(reinterpret_cast<const uint8_t*>(uvData) + i * request.texcoordStride);
+            Logger::warn(str::format("  uv[", i, "] = (", uv[0], ", ", uv[1], ")"));
+          }
+          // Check for suspicious UV values (gradients often caused by screen-space UVs)
+          bool suspiciousUVs = false;
+          for (int i = 0; i < numUVs; i++) {
+            const float* uv = reinterpret_cast<const float*>(reinterpret_cast<const uint8_t*>(uvData) + i * request.texcoordStride);
+            // Screen-space UVs often have values like (0,0), (1,0), (0,1), (1,1) or fractional screen coords
+            if ((uv[0] < 0 || uv[0] > 10 || uv[1] < 0 || uv[1] > 10) && (uv[0] != 0 && uv[1] != 0)) {
+              suspiciousUVs = true;
+            }
+          }
+          if (suspiciousUVs) {
+            Logger::warn("[UV-DIAG] WARNING: UV values look suspicious (out of 0-10 range) - possible screen-space or uninitialized!");
+          }
+        }
+      }
     }
 
     if (request.replacementNormalBuffer.defined()) {
@@ -2821,22 +3542,28 @@ namespace dxvk {
       request.vertexCount = geometryData.vertexCount;
       request.indexOffset = 0;
       request.indexCount = geometryData.indexCount;
-      // For RT replacement (view-dependent) draws, use original viewport resolution
-      // These shaders have view-dependent calculations that expect screen-space coordinates
-      if (isRTReplacementDraw) {
-        const uint32_t vpW = static_cast<uint32_t>(drawCallState.originalViewport.width);
-        const uint32_t vpH = static_cast<uint32_t>(drawCallState.originalViewport.height);
-        request.resolution = { vpW, vpH };
-        static uint32_t rtRepResLog = 0;
-        if (++rtRepResLog <= 10) {
-          Logger::info(str::format("[RT-REP-RESOLUTION] Using original viewport: ", vpW, "x", vpH));
-        }
-      } else {
-        request.resolution = calculateCaptureResolution(drawCallState);
+      // ALWAYS use original viewport resolution for RT
+      // The game's VS uses screenSize (c81) to compute clip positions from input vertex coordinates
+      // Input positions are designed for original viewport, so RT must match
+      // We can downsample later if needed
+      const uint32_t vpW = static_cast<uint32_t>(drawCallState.originalViewport.width);
+      const uint32_t vpH = static_cast<uint32_t>(drawCallState.originalViewport.height);
+      request.resolution = { vpW, vpH };
+      static uint32_t resLog = 0;
+      if (++resLog <= 10) {
+        Logger::info(str::format("[CAPTURE-RESOLUTION] Using original viewport: ", vpW, "x", vpH,
+          " (isRTRep=", isRTReplacementDraw, ")"));
       }
       request.flags = (geometryData.indexCount > 0) ? 0x1 : 0x0;
       request.isDynamic = isDynamicMaterial(matHash);
       request.isRTReplacement = isRTReplacementDraw;  // View-dependent, never cache
+
+      // Check if RTX transforms are identity - if so, vertex capture positions are in CLIP SPACE
+      // (because vertex capture can't invert identity matrices to get back to object space)
+      const Matrix4& viewToProj = drawCallState.transformData.viewToProjection;
+      request.rtxTransformsAreIdentity = (viewToProj[0][0] == 1.0f && viewToProj[1][1] == 1.0f &&
+                                          viewToProj[2][2] == 1.0f && viewToProj[3][3] == 1.0f &&
+                                          viewToProj[0][1] == 0.0f && viewToProj[0][2] == 0.0f);
 
       // COPY GEOMETRY BUFFERS (Rc-counted, cheap to copy)
       request.vertexBuffer = geometryData.positionBuffer;
@@ -2846,6 +3573,42 @@ namespace dxvk {
       request.texcoordBuffer = geometryData.texcoordBuffer;
       request.texcoordStride = geometryData.texcoordBuffer.stride();
       request.normalBuffer = geometryData.normalBuffer;
+
+      // STORE WVP for passthrough shader (object-space positions need World*View*Proj)
+      // Game stores viewProj in c0-c3 and world in c48-c51
+      // Full transform is: clipPos = position * world * viewProj
+      // So WVP = world * viewProj (matrix multiply order for row-vectors)
+      // NOTE: RTX transformData is identity for this game (uses shader constants, not SetTransform)
+      // We extract matrices from VS constants instead
+      if (drawCallState.vertexShaderConstantData.size() >= 4) {
+        // Extract WVP from c0-c3 VS constants
+        // For Lego Batman 2: c0-c3 contains the full WVP matrix (game bakes world*view*proj into c0-c3)
+        // D3D9 stores row-major (c[n] = row n), but our GLSL passthrough shader
+        // does `matrix * vec` which expects column-major. So we transpose while loading:
+        // D3D9 row i becomes GLSL column i
+        Matrix4 wvp;
+        for (int i = 0; i < 4; i++) {
+          wvp[0][i] = drawCallState.vertexShaderConstantData[i].x;
+          wvp[1][i] = drawCallState.vertexShaderConstantData[i].y;
+          wvp[2][i] = drawCallState.vertexShaderConstantData[i].z;
+          wvp[3][i] = drawCallState.vertexShaderConstantData[i].w;
+        }
+        request.viewProj = wvp;
+
+        // Debug logging
+        static uint32_t matrixLogCount = 0;
+        if (matrixLogCount < 10) {
+          matrixLogCount++;
+          Logger::warn(str::format("[MATRIX-DEBUG] WVP c0=[",
+            drawCallState.vertexShaderConstantData[0].x, ",",
+            drawCallState.vertexShaderConstantData[0].y, ",",
+            drawCallState.vertexShaderConstantData[0].z, ",",
+            drawCallState.vertexShaderConstantData[0].w, "]"));
+        }
+      } else {
+        // Fallback to identity
+        request.viewProj = Matrix4();
+      }
 
       // COPY TEXTURE (Rc-counted, cheap to copy)
       // DISABLED STAGING: Staging copies execute BEFORE the game draws to the RT, capturing empty content.
@@ -3691,15 +4454,64 @@ namespace dxvk {
     // Bind D3D9 shaders so they execute during the draw call
     // These shader objects were captured at Stage 2 when we had access to D3D9 state
 
-    if (drawCallState.usesVertexShader && drawCallState.vertexShader != nullptr) {
-      // Convert D3D9 vertex shader to DXVK shader
+    // CRITICAL FIX: Choose VS based on vertex data source
+    // - If we have original D3D9 vertex data (capturedVertexStreams): Use game's VS
+    //   The game's VS expects object-space positions and will apply world*viewProj
+    // - If we only have RasterGeometry (RTX-captured): Use passthrough VS
+    //   RTX captures positions in WORLD SPACE after the game's VS runs
+    //   Re-running the game's VS would double-transform! Use passthrough that just applies viewProj
+    const bool hasOriginalVertexData = !drawCallState.capturedVertexStreams.empty();
+
+    if (hasOriginalVertexData && drawCallState.usesVertexShader && drawCallState.vertexShader != nullptr) {
+      // Use game's VS - we have original object-space vertices
       const D3D9CommonShader* commonShader = drawCallState.vertexShader->GetCommonShader();
       if (commonShader != nullptr) {
         Rc<DxvkShader> dxvkShader = commonShader->GetShader(D3D9ShaderPermutations::None);
         if (dxvkShader != nullptr) {
           ctx->bindShader(VK_SHADER_STAGE_VERTEX_BIT, dxvkShader);
+          Logger::info("[SHADER-SELECT] Using GAME VS (have original D3D9 vertices)");
         }
       }
+    } else if (m_passthroughVertexShader != nullptr) {
+      // Use passthrough VS - we have vertices from RasterGeometry (vertex capture output)
+      ctx->bindShader(VK_SHADER_STAGE_VERTEX_BIT, m_passthroughVertexShader);
+
+      // CRITICAL: Vertex capture transforms clip→view→world→object using RTX inverse matrices.
+      // BUT if RTX transforms are identity (game uses shader constants, not SetTransform),
+      // then the vertex capture can't invert anything, and positions remain in CLIP SPACE!
+      //
+      // Check if viewToProjection is identity - if so, positions are already in clip space
+      // and we should NOT apply WVP (just use identity matrix to pass through)
+      const Matrix4& viewToProj = drawCallState.transformData.viewToProjection;
+      bool isIdentityTransform = (viewToProj[0][0] == 1.0f && viewToProj[1][1] == 1.0f &&
+                                  viewToProj[2][2] == 1.0f && viewToProj[3][3] == 1.0f &&
+                                  viewToProj[0][1] == 0.0f && viewToProj[0][2] == 0.0f);
+
+      Matrix4 matrixToUse;
+      if (isIdentityTransform) {
+        // RTX transforms are identity - positions are already in CLIP SPACE
+        // Pass identity matrix to let them through unchanged
+        matrixToUse = Matrix4(); // Identity
+        Logger::info("[SHADER-SELECT] Using PASSTHROUGH VS (CLIP SPACE - RTX transforms identity)");
+      } else {
+        // RTX transforms are valid - positions should be in object space
+        // Extract WVP from VS constants
+        if (drawCallState.vertexShaderConstantData.size() >= 4) {
+          for (int i = 0; i < 4; i++) {
+            matrixToUse[0][i] = drawCallState.vertexShaderConstantData[i].x;
+            matrixToUse[1][i] = drawCallState.vertexShaderConstantData[i].y;
+            matrixToUse[2][i] = drawCallState.vertexShaderConstantData[i].z;
+            matrixToUse[3][i] = drawCallState.vertexShaderConstantData[i].w;
+          }
+        } else {
+          matrixToUse = drawCallState.transformData.worldToView * drawCallState.transformData.viewToProjection;
+        }
+        Logger::info("[SHADER-SELECT] Using PASSTHROUGH VS (object space - applying WVP)");
+      }
+      ctx->pushConstants(0, sizeof(Matrix4), &matrixToUse);
+      Logger::info(str::format("[PASSTHROUGH-VS] Matrix row0=[", matrixToUse[0][0], ",", matrixToUse[0][1], ",", matrixToUse[0][2], ",", matrixToUse[0][3], "]"));
+    } else {
+      Logger::err("[SHADER-SELECT] NO VS available and passthrough not initialized!");
     }
 
     if (drawCallState.usesPixelShader && drawCallState.pixelShader != nullptr) {
