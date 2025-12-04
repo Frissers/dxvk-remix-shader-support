@@ -999,6 +999,19 @@ namespace dxvk {
       // the VS constants are actually populated. By this point, the View and
       // Projection matrices have already been injected into transformData.
 
+      // Log camera data BEFORE processCameraData
+      static uint32_t preProcessLog = 0;
+      static Vector3 s_lastPreCamPos = Vector3(0,0,0);
+      Vector3 preCamPos(
+        drawCallState.transformData.worldToView[3][0],
+        drawCallState.transformData.worldToView[3][1],
+        drawCallState.transformData.worldToView[3][2]);
+      float preDelta = length(preCamPos - s_lastPreCamPos);
+      if (preDelta > 0.1f && ++preProcessLog <= 50) {
+        Logger::info(str::format("[CAM-PRE-PROCESS] worldToView[3]=(", preCamPos.x, ",", preCamPos.y, ",", preCamPos.z, ") delta=", preDelta));
+        s_lastPreCamPos = preCamPos;
+      }
+
       drawCallState.cameraType = cameraManager.processCameraData(drawCallState);
 
       if (drawCallState.cameraType == CameraType::Unknown) {

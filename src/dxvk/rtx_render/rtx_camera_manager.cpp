@@ -28,6 +28,15 @@ namespace {
   constexpr float kFovToleranceRadians = 0.001f;
 }
 
+// Global storage for extracted camera data (set by d3d9_rtx.cpp, used here for ALL draws)
+namespace dxvk {
+  Matrix4 g_extractedWorldToView = Matrix4();
+  Matrix4 g_extractedViewToProjection = Matrix4();
+  bool g_hasExtractedCamera = false;
+  float g_extractedFov = 0.77f;  // ~44 degrees default
+  float g_extractedAspect = 16.0f / 9.0f;
+  Vector3 g_extractedCameraPosition = Vector3(0, 0, 0);  // Camera position from c8
+}
 
 namespace dxvk {
   // Forward declaration from rtx_camera.cpp
@@ -135,17 +144,57 @@ namespace dxvk {
           rotationMatrix[2] = Vector4(-rotationMatrix[2].x, -rotationMatrix[2].y, -rotationMatrix[2].z, -rotationMatrix[2].w); // Flip Z-axis (forward vector)
         }
         
-        // Build view-to-world matrix with rotation and translation
-        Matrix4 fakeViewToWorld = rotationMatrix;
-        fakeViewToWorld[3] = Vector4(position, 1.0f);
-        
-        // Invert to get world-to-view matrix
-        Matrix4 fakeWorldToView = inverse(fakeViewToWorld);
-        
-        // Set the fake camera with correct parameters
-        mainCam.update(frameId, fakeWorldToView, fakeProjection,
-                      fov,
-                      aspectRatio,
+        // Use global extracted camera if available (set by d3d9_rtx.cpp)
+        Matrix4 finalWorldToView;
+        Matrix4 finalProjection;
+        float finalFov;
+        float finalAspect;
+
+        if (g_hasExtractedCamera) {
+          // Use extracted camera POSITION from c8, keep config rotation
+          // Build view-to-world: rotation from config, position from c8
+          Matrix4 fakeViewToWorld = rotationMatrix;
+          fakeViewToWorld[3] = Vector4(g_extractedCameraPosition, 1.0f);  // Use c8 position!
+          finalWorldToView = inverse(fakeViewToWorld);
+
+          finalProjection = fakeProjection;
+          finalFov = fov;
+          finalAspect = aspectRatio;
+
+          // Log when injected position changes significantly
+          static Vector3 s_lastInjectedPos = Vector3(0,0,0);
+          float injDelta = std::abs(g_extractedCameraPosition.x - s_lastInjectedPos.x) +
+                          std::abs(g_extractedCameraPosition.y - s_lastInjectedPos.y) +
+                          std::abs(g_extractedCameraPosition.z - s_lastInjectedPos.z);
+          if (injDelta > 1.0f) {
+            Logger::info(str::format("[CAM-INJECT-MOVE] using c8=(",
+              g_extractedCameraPosition.x, ",", g_extractedCameraPosition.y, ",", g_extractedCameraPosition.z,
+              ") delta=", injDelta));
+            s_lastInjectedPos = g_extractedCameraPosition;
+          }
+        } else {
+          // Fallback: check if input has valid worldToView
+          const Matrix4& inputWorldToView = input.getTransformData().worldToView;
+          bool hasValidInputView = (std::abs(inputWorldToView[3][0]) > 0.1f ||
+                                    std::abs(inputWorldToView[3][1]) > 0.1f ||
+                                    std::abs(inputWorldToView[3][2]) > 0.1f);
+          if (hasValidInputView) {
+            finalWorldToView = inputWorldToView;
+          } else {
+            // Build view-to-world matrix with rotation and translation from config
+            Matrix4 fakeViewToWorld = rotationMatrix;
+            fakeViewToWorld[3] = Vector4(position, 1.0f);
+            finalWorldToView = inverse(fakeViewToWorld);
+          }
+          finalProjection = fakeProjection;
+          finalFov = fov;
+          finalAspect = aspectRatio;
+        }
+
+        // Set the camera with correct parameters
+        mainCam.update(frameId, finalWorldToView, finalProjection,
+                      finalFov,
+                      finalAspect,
                       nearPlane,
                       farPlane,
                       false);  // not left-handed

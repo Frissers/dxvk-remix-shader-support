@@ -23,6 +23,14 @@
 #include <unordered_map>
 
 namespace dxvk {
+  // External globals for extracted camera (defined in rtx_camera_manager.cpp)
+  extern Matrix4 g_extractedWorldToView;
+  extern Matrix4 g_extractedViewToProjection;
+  extern bool g_hasExtractedCamera;
+  extern float g_extractedFov;
+  extern float g_extractedAspect;
+  extern Vector3 g_extractedCameraPosition;
+
   // Global matrix cache from SetVertexShaderConstantF
   // Stores matrices by their starting register number (e.g., c4 -> index 4)
   // Used by processRenderState to get view/proj matrices based on shader analysis
@@ -2365,30 +2373,16 @@ namespace dxvk {
     m_activeDrawCallState.pixelShader = state.pixelShader.ptr();
     m_activeDrawCallState.vertexDecl = state.vertexDecl.ptr();
 
+    // CAMERA: Current frame camera storage (updated by VS-constant draws, applied to all draws)
+    static Matrix4 s_currentFrameView;
+    static Matrix4 s_currentFrameProj;
+    static bool s_hasCurrentFrameCamera = false;
+
     // Capture shader constants
     // Vertex shader constants (D3D9 supports up to 256 float4 constants for VS software, 256 for hardware)
     if (state.vertexShader != nullptr) {
       const uint32_t vsConstantCount = caps::MaxFloatConstantsVS; // 256 constants
       m_activeDrawCallState.vertexShaderConstantData.resize(vsConstantCount);
-
-      // DEBUG: Scan ALL VS constants to find non-zero values (game may use unexpected registers)
-      static uint32_t vsConstLogCount = 0;
-      if (++vsConstLogCount <= 5) {
-        Logger::info(str::format("[VS-CONST-CAPTURE] #", vsConstLogCount, " Scanning ALL ", vsConstantCount, " VS constants for non-zero values:"));
-        uint32_t nonZeroCount = 0;
-        for (uint32_t i = 0; i < vsConstantCount; i++) {
-          const auto& c = state.vsConsts.fConsts[i];
-          if (c.x != 0.0f || c.y != 0.0f || c.z != 0.0f || c.w != 0.0f) {
-            nonZeroCount++;
-            Logger::info(str::format("[VS-CONST-CAPTURE]   c[", i, "] = (", c.x, ", ", c.y, ", ", c.z, ", ", c.w, ") <-- NON-ZERO!"));
-          }
-        }
-        if (nonZeroCount == 0) {
-          Logger::warn("[VS-CONST-CAPTURE]   ALL 256 VS CONSTANTS ARE ZERO! Game may use fixed-function transforms.");
-        } else {
-          Logger::info(str::format("[VS-CONST-CAPTURE]   Found ", nonZeroCount, " non-zero constants"));
-        }
-      }
 
       // Copy from fConsts array (float constants)
       memcpy(m_activeDrawCallState.vertexShaderConstantData.data(), state.vsConsts.fConsts, vsConstantCount * sizeof(Vector4));
@@ -2396,18 +2390,17 @@ namespace dxvk {
       // CAMERA EXTRACTION: Extract camera from VS constants HERE where they're populated
       // Game layout: c0-c3=WVP, c4-c7=View matrix, c8=Camera position
       if (vsConstantCount >= 9) {
+        const auto& c0 = state.vsConsts.fConsts[0];
+        const auto& c1 = state.vsConsts.fConsts[1];
         const auto& c3 = state.vsConsts.fConsts[3];
-        const auto& c8 = state.vsConsts.fConsts[8];
+        const auto& c7 = state.vsConsts.fConsts[7];
 
-        // Check if c8 looks like camera position (w=1, large world coords)
-        bool c8HasPosition = (c8.w == 1.0f &&
-          (std::abs(c8.x) > 10.0f || std::abs(c8.y) > 10.0f || std::abs(c8.z) > 10.0f));
+        // Check if this looks like a 3D draw with camera data
+        bool has3DCamera = (std::abs(c3.x) > 0.1f || std::abs(c3.y) > 0.1f || std::abs(c3.z) > 0.1f ||
+                           std::abs(c7.x) > 0.1f || std::abs(c7.y) > 0.1f || std::abs(c7.z) > 0.1f);
 
-        // Check if c3 has translation (WVP with camera)
-        bool c3HasTranslation = (std::abs(c3.x) > 10.0f || std::abs(c3.y) > 10.0f || std::abs(c3.z) > 10.0f);
-
-        if (c8HasPosition && c3HasTranslation) {
-          // Extract View matrix from c4-c7 (keep row-major so row 3 = translation)
+        if (has3DCamera) {
+          // Extract View matrix directly from c4-c7 - use it AS-IS
           Matrix4 extractedView;
           for (int i = 0; i < 4; i++) {
             const auto& ci = state.vsConsts.fConsts[4 + i];
@@ -2417,66 +2410,96 @@ namespace dxvk {
             extractedView[i][3] = ci.w;
           }
 
-          // Inject View matrix into worldToView
-          m_activeDrawCallState.transformData.worldToView = extractedView;
+          // c8 is logged for reference but we use the full view matrix from c4-c7
+          const auto& c8 = state.vsConsts.fConsts[8];
+          Vector3 camPos(c8.x, c8.y, c8.z);
 
-          // Create perspective projection to bypass fake camera path
-          if (m_activeDrawCallState.transformData.viewToProjection[0][0] == 1.0f &&
-              m_activeDrawCallState.transformData.viewToProjection[1][1] == 1.0f &&
-              m_activeDrawCallState.transformData.viewToProjection[2][2] == 1.0f) {
-            // viewToProjection is identity - inject perspective
-            const float fovY = 1.0472f; // ~60 degrees
-            const float aspect = 16.0f / 9.0f;
-            const float nearZ = 0.1f;
-            const float farZ = 10000.0f;
-            const float tanHalfFov = std::tan(fovY / 2.0f);
+          // Use the game's view matrix directly - don't rebuild it
+          s_currentFrameView = extractedView;
 
-            Matrix4 proj;
-            proj[0][0] = 1.0f / (aspect * tanHalfFov);
-            proj[0][1] = 0.0f; proj[0][2] = 0.0f; proj[0][3] = 0.0f;
-            proj[1][0] = 0.0f;
-            proj[1][1] = 1.0f / tanHalfFov;
-            proj[1][2] = 0.0f; proj[1][3] = 0.0f;
-            proj[2][0] = 0.0f; proj[2][1] = 0.0f;
-            proj[2][2] = farZ / (nearZ - farZ);
-            proj[2][3] = -1.0f;
-            proj[3][0] = 0.0f; proj[3][1] = 0.0f;
-            proj[3][2] = (nearZ * farZ) / (nearZ - farZ);
-            proj[3][3] = 0.0f;
+          // Extract projection info from WVP matrix c0-c3
+          // WVP[2][3] and WVP[3][2] contain projection depth info
+          float wvp_00 = c0.x;
+          float wvp_11 = c1.y;
+          float wvp_22 = state.vsConsts.fConsts[2].z;
+          float wvp_23 = state.vsConsts.fConsts[2].w;
+          float wvp_32 = state.vsConsts.fConsts[3].z;
+          float wvp_33 = state.vsConsts.fConsts[3].w;
 
-            m_activeDrawCallState.transformData.viewToProjection = proj;
-          }
+          // For perspective projection, [2][3] is typically 1 or -1 (handedness indicator)
+          // and [3][3] is typically 0
+          // The scale factors in WVP are affected by View rotation but magnitude is preserved
+          float projScaleX = std::sqrt(c0.x*c0.x + c0.y*c0.y + c0.z*c0.z);
+          float projScaleY = std::sqrt(c1.x*c1.x + c1.y*c1.y + c1.z*c1.z);
 
-          static uint32_t camInjectLog = 0;
-          if (++camInjectLog <= 20) {
-            Logger::info(str::format("[D3D9-CAM-INJECT] Injected View+Proj from VS constants"));
-            Logger::info(str::format("[D3D9-CAM-INJECT]   camPos=(", c8.x, ",", c8.y, ",", c8.z, ")"));
-            Logger::info(str::format("[D3D9-CAM-INJECT]   viewRow3=(", extractedView[3][0], ",", extractedView[3][1], ",", extractedView[3][2], ",", extractedView[3][3], ")"));
+          // Clamp to reasonable values
+          if (projScaleX < 0.1f) projScaleX = 1.5f;
+          if (projScaleY < 0.1f) projScaleY = 2.0f;
+
+          float tanHalfFov = (projScaleY > 0.01f) ? (1.0f / projScaleY) : 0.577f;
+          float aspect = (projScaleX > 0.01f) ? (projScaleY / projScaleX) : (16.0f / 9.0f);
+
+          // Build projection matrix using extracted values
+          const float nearZ = 1.0f;
+          const float farZ = 10000.0f;
+          Matrix4 proj;
+          proj[0][0] = projScaleX;
+          proj[0][1] = 0.0f; proj[0][2] = 0.0f; proj[0][3] = 0.0f;
+          proj[1][0] = 0.0f;
+          proj[1][1] = projScaleY;
+          proj[1][2] = 0.0f; proj[1][3] = 0.0f;
+          proj[2][0] = 0.0f; proj[2][1] = 0.0f;
+          proj[2][2] = farZ / (farZ - nearZ);
+          proj[2][3] = 1.0f;
+          proj[3][0] = 0.0f; proj[3][1] = 0.0f;
+          proj[3][2] = (-nearZ * farZ) / (farZ - nearZ);
+          proj[3][3] = 0.0f;
+
+          s_currentFrameProj = proj;
+          s_hasCurrentFrameCamera = true;
+
+          // Set global camera for rtx_camera_manager.cpp
+          float fovRad = 2.0f * std::atan(tanHalfFov);
+          g_extractedWorldToView = extractedView;
+          g_extractedFov = fovRad;
+          g_extractedAspect = aspect;
+          g_extractedCameraPosition = camPos;  // c8 camera position
+          g_hasExtractedCamera = true;
+
+          // Log extracted camera - log when position changes significantly
+          static Vector3 s_lastLoggedPos = Vector3(0,0,0);
+          float posDelta = std::abs(camPos.x - s_lastLoggedPos.x) +
+                          std::abs(camPos.y - s_lastLoggedPos.y) +
+                          std::abs(camPos.z - s_lastLoggedPos.z);
+          if (posDelta > 1.0f) {  // Log when moved more than 1 unit total
+            float fovDeg = fovRad * 57.2958f;
+            Logger::info(str::format("[CAM-EXTRACT-MOVE] c8=(",
+              camPos.x, ",", camPos.y, ",", camPos.z,
+              ") delta=", posDelta));
+            s_lastLoggedPos = camPos;
           }
         }
       }
-
-      // DEBUG: Also log fixed-function transforms for comparison
-      if (vsConstLogCount <= 5) {
-        const Matrix4& world = d3d9State().transforms[GetTransformIndex(D3DTS_WORLD)];
-        const Matrix4& view = d3d9State().transforms[GetTransformIndex(D3DTS_VIEW)];
-        const Matrix4& proj = d3d9State().transforms[GetTransformIndex(D3DTS_PROJECTION)];
-
-        bool worldNonZero = world[0][0] != 0.0f || world[1][1] != 0.0f || world[2][2] != 0.0f;
-        bool viewNonZero = view[0][0] != 0.0f || view[1][1] != 0.0f || view[2][2] != 0.0f;
-        bool projNonZero = proj[0][0] != 0.0f || proj[1][1] != 0.0f || proj[2][2] != 0.0f;
-
-        Logger::info(str::format("[VS-CONST-CAPTURE] Fixed-function transforms:"));
-        Logger::info(str::format("[VS-CONST-CAPTURE]   D3DTS_WORLD non-zero: ", worldNonZero ? "YES" : "NO",
-                                " diagonal=(", world[0][0], ",", world[1][1], ",", world[2][2], ")"));
-        Logger::info(str::format("[VS-CONST-CAPTURE]   D3DTS_VIEW non-zero: ", viewNonZero ? "YES" : "NO",
-                                " diagonal=(", view[0][0], ",", view[1][1], ",", view[2][2], ")"));
-        Logger::info(str::format("[VS-CONST-CAPTURE]   D3DTS_PROJECTION non-zero: ", projNonZero ? "YES" : "NO",
-                                " diagonal=(", proj[0][0], ",", proj[1][1], ",", proj[2][2], ")"));
-      }
-
     } else {
       m_activeDrawCallState.vertexShaderConstantData.clear();
+    }
+
+    // Apply current frame camera to ALL draws (including fixed-function) - as early as possible
+    // Only override View matrix, keep original projection to avoid breaking it
+    if (s_hasCurrentFrameCamera) {
+      // Log original projection before override
+      static uint32_t projLog = 0;
+      const auto& origProj = m_activeDrawCallState.transformData.viewToProjection;
+      bool isIdentity = (origProj[0][0] == 1.0f && origProj[1][1] == 1.0f &&
+                         origProj[2][2] == 1.0f && origProj[3][3] == 1.0f);
+      if (++projLog <= 100) {
+        Logger::info(str::format("[PROJ-CHECK] origProj[0][0]=", origProj[0][0],
+          " [1][1]=", origProj[1][1], " [2][2]=", origProj[2][2], " [2][3]=", origProj[2][3],
+          " [3][2]=", origProj[3][2], " [3][3]=", origProj[3][3], " isIdentity=", isIdentity ? "YES" : "NO"));
+      }
+
+      // DON'T inject per-draw worldToView - only use global camera in rtx_camera_manager
+      // m_activeDrawCallState.transformData.worldToView = s_currentFrameView;
     }
 
     // Pixel shader constants (D3D9 supports up to 224 float4 constants)
