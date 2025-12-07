@@ -1053,6 +1053,8 @@ namespace dxvk {
     // Notify geometry identity manager of frame begin on first draw
     if (m_drawCallID == 0 && m_geometryIdentityManager) {
       m_geometryIdentityManager->onFrameBegin(m_frameIndex);
+      // Don't reset g_hasExtractedCamera - keep last good extraction
+      // since fallback inputWorldToView is identity in this game
     }
 
     // Track the drawcall index so we can use it in rtx_context
@@ -2399,16 +2401,48 @@ namespace dxvk {
         bool has3DCamera = (std::abs(c3.x) > 0.1f || std::abs(c3.y) > 0.1f || std::abs(c3.z) > 0.1f ||
                            std::abs(c7.x) > 0.1f || std::abs(c7.y) > 0.1f || std::abs(c7.z) > 0.1f);
 
+        // DEBUG: Log VS constants when has3DCamera fails (throttled)
+        static uint32_t s_failCount = 0;
+        static uint32_t s_lastLogFrame = 0;
+        if (!has3DCamera && vsConstantCount >= 9) {
+          s_failCount++;
+          if (s_failCount % 1000 == 1 || m_frameIndex != s_lastLogFrame) {
+            const auto& c4 = state.vsConsts.fConsts[4];
+            const auto& c5 = state.vsConsts.fConsts[5];
+            const auto& c6 = state.vsConsts.fConsts[6];
+            const auto& c8 = state.vsConsts.fConsts[8];
+            Logger::info(str::format("[CAM-FAIL] c3=(", c3.x, ",", c3.y, ",", c3.z, ",", c3.w,
+              ") c7=(", c7.x, ",", c7.y, ",", c7.z, ",", c7.w, ")"));
+            Logger::info(str::format("[CAM-FAIL] c4=(", c4.x, ",", c4.y, ",", c4.z, ",", c4.w,
+              ") c5=(", c5.x, ",", c5.y, ",", c5.z, ",", c5.w, ")"));
+            Logger::info(str::format("[CAM-FAIL] c6=(", c6.x, ",", c6.y, ",", c6.z, ",", c6.w,
+              ") c8=(", c8.x, ",", c8.y, ",", c8.z, ",", c8.w, ")"));
+            Logger::info(str::format("[CAM-FAIL] vsConstCount=", vsConstantCount, " failCount=", s_failCount));
+            s_lastLogFrame = m_frameIndex;
+          }
+        }
+
         if (has3DCamera) {
-          // Extract View matrix directly from c4-c7 - use it AS-IS
+          // Extract View matrix from c4-c7
+          // D3D9 shader constants are row-major (ci = row i), DXVK Matrix4 is column-major
+          // To transpose: put D3D9 row i into DXVK column i
+          // extractedView[col][row], so ci goes into extractedView[i][*]
           Matrix4 extractedView;
           for (int i = 0; i < 4; i++) {
             const auto& ci = state.vsConsts.fConsts[4 + i];
+            // D3D9 row i (ci) becomes DXVK column i
             extractedView[i][0] = ci.x;
             extractedView[i][1] = ci.y;
             extractedView[i][2] = ci.z;
             extractedView[i][3] = ci.w;
           }
+
+          // Fix handedness: D3D9 is left-handed, RTX Remix expects right-handed
+          // Negate the Z axis (column 2) to flip handedness - forward vector
+          extractedView[2][0] = -extractedView[2][0];
+          extractedView[2][1] = -extractedView[2][1];
+          extractedView[2][2] = -extractedView[2][2];
+          extractedView[2][3] = -extractedView[2][3];
 
           // c8 is logged for reference but we use the full view matrix from c4-c7
           const auto& c8 = state.vsConsts.fConsts[8];
@@ -2465,6 +2499,23 @@ namespace dxvk {
           g_extractedAspect = aspect;
           g_extractedCameraPosition = camPos;  // c8 camera position
           g_hasExtractedCamera = true;
+
+          // Log RAW shader constants c4-c7 to debug matrix extraction
+          static uint32_t s_rawConstLogCount = 0;
+          if (s_rawConstLogCount++ < 50) {
+            const auto& c4 = state.vsConsts.fConsts[4];
+            const auto& c5 = state.vsConsts.fConsts[5];
+            const auto& c6 = state.vsConsts.fConsts[6];
+            Logger::info(str::format("[RAW-VS-CONST] c4=(", c4.x, ",", c4.y, ",", c4.z, ",", c4.w, ")"
+              " c5=(", c5.x, ",", c5.y, ",", c5.z, ",", c5.w, ")"
+              " c6=(", c6.x, ",", c6.y, ",", c6.z, ",", c6.w, ")"
+              " c7=(", c7.x, ",", c7.y, ",", c7.z, ",", c7.w, ")"));
+            Logger::info(str::format("[RAW-VS-CONST] c8=(", c8.x, ",", c8.y, ",", c8.z, ",", c8.w, ")"
+              " extractedView[0]=(", extractedView[0][0], ",", extractedView[0][1], ",", extractedView[0][2], ",", extractedView[0][3], ")"
+              " extractedView[1]=(", extractedView[1][0], ",", extractedView[1][1], ",", extractedView[1][2], ",", extractedView[1][3], ")"));
+            Logger::info(str::format("[RAW-VS-CONST] extractedView[2]=(", extractedView[2][0], ",", extractedView[2][1], ",", extractedView[2][2], ",", extractedView[2][3], ")"
+              " extractedView[3]=(", extractedView[3][0], ",", extractedView[3][1], ",", extractedView[3][2], ",", extractedView[3][3], ")"));
+          }
 
           // Log extracted camera - log when position changes significantly
           static Vector3 s_lastLoggedPos = Vector3(0,0,0);

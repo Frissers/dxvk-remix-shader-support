@@ -151,26 +151,25 @@ namespace dxvk {
         float finalAspect;
 
         if (g_hasExtractedCamera) {
-          // Use extracted camera POSITION from c8, keep config rotation
-          // Build view-to-world: rotation from config, position from c8
-          Matrix4 fakeViewToWorld = rotationMatrix;
-          fakeViewToWorld[3] = Vector4(g_extractedCameraPosition, 1.0f);  // Use c8 position!
-          finalWorldToView = inverse(fakeViewToWorld);
+          // Use extracted view matrix directly (handedness already fixed in d3d9_rtx.cpp)
+          finalWorldToView = g_extractedWorldToView;
 
           finalProjection = fakeProjection;
           finalFov = fov;
           finalAspect = aspectRatio;
 
-          // Log when injected position changes significantly
-          static Vector3 s_lastInjectedPos = Vector3(0,0,0);
-          float injDelta = std::abs(g_extractedCameraPosition.x - s_lastInjectedPos.x) +
-                          std::abs(g_extractedCameraPosition.y - s_lastInjectedPos.y) +
-                          std::abs(g_extractedCameraPosition.z - s_lastInjectedPos.z);
-          if (injDelta > 1.0f) {
-            Logger::info(str::format("[CAM-INJECT-MOVE] using c8=(",
-              g_extractedCameraPosition.x, ",", g_extractedCameraPosition.y, ",", g_extractedCameraPosition.z,
-              ") delta=", injDelta));
-            s_lastInjectedPos = g_extractedCameraPosition;
+          // Log for debugging
+          static uint32_t s_matrixLogCount = 0;
+          if (s_matrixLogCount++ < 30) {
+            Matrix4 extractedViewToWorld = inverse(g_extractedWorldToView);
+            Vector3 extRight(extractedViewToWorld[0][0], extractedViewToWorld[0][1], extractedViewToWorld[0][2]);
+            Vector3 extFwd(extractedViewToWorld[2][0], extractedViewToWorld[2][1], extractedViewToWorld[2][2]);
+            Vector3 extractedPos(extractedViewToWorld[3][0], extractedViewToWorld[3][1], extractedViewToWorld[3][2]);
+
+            Logger::info(str::format("[CAM-EXTRACTED] Using extracted view with handedness fix"
+              " R=(", extRight.x, ",", extRight.y, ",", extRight.z, ")"
+              " F=(", extFwd.x, ",", extFwd.y, ",", extFwd.z, ")"
+              " pos=(", extractedPos.x, ",", extractedPos.y, ",", extractedPos.z, ")"));
           }
         } else {
           // Fallback: check if input has valid worldToView

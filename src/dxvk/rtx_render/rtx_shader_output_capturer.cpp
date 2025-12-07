@@ -3106,7 +3106,10 @@ namespace dxvk {
     auto tCacheLookup1End = std::chrono::high_resolution_clock::now();
     double cacheLookup1TimeUs = std::chrono::duration<double, std::micro>(tCacheLookup1End - tCacheLookup1Start).count();
 
-    if (it != m_capturedOutputs.end() && it->second.capturedTexture.isValid()) {
+    // TEMP DEBUG: Disable cache to test if cache is causing rotation freeze
+    constexpr bool kDisableCacheForDebug = false;
+
+    if (!kDisableCacheForDebug && it != m_capturedOutputs.end() && it->second.capturedTexture.isValid()) {
       // Get the captured image's hash to check if capture succeeded
       XXH64_hash_t capturedHash = (it->second.capturedTexture.image != nullptr) ? it->second.capturedTexture.image->getHash() : 0;
 
